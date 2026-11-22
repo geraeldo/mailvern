@@ -2,7 +2,7 @@ import { api, type Account, type Detail, type Folder, type Summary, type View } 
 
 export type ComposeMode = "new" | "reply" | "replyAll" | "forward";
 export type ComposeInit = { mode: ComposeMode; source?: Detail; accountId?: number; to?: string[]; key: number };
-export type SettingsTarget = number | "new" | "shortcuts" | null;
+export type SettingsSection = "shortcuts";
 export type SyncStatus = { state: "syncing" | "idle" | "error"; message: string | null };
 
 const PAGE = 200;
@@ -21,16 +21,24 @@ export const ui = $state({
   detailError: null as string | null,
   query: "",
   compose: null as ComposeInit | null,
-  settings: false,
-  settingsTarget: null as SettingsTarget,
+  /** App settings (shortcuts and, later, other preferences). */
+  settings: null as SettingsSection | null,
+  /** Account settings: the account being edited, or "new". */
+  accountSettings: null as number | "new" | null,
   status: {} as Record<number, SyncStatus>,
   toast: null as { text: string; undo?: () => void } | null,
   trustedSenders: [] as string[],
 });
 
-export function openSettings(target: SettingsTarget = null) {
-  ui.settingsTarget = target;
-  ui.settings = true;
+export function openSettings(section: SettingsSection = "shortcuts") {
+  ui.accountSettings = null;
+  ui.settings = section;
+}
+
+/** Opens account settings on the given account, "new" for the add form, or the first account. */
+export function openAccountSettings(target: number | "new" | null = null) {
+  ui.settings = null;
+  ui.accountSettings = target ?? ui.accounts[0]?.id ?? "new";
 }
 
 export function accountLabel(a: Account): string {
@@ -259,7 +267,7 @@ export function toggleFlag() {
 let composeKey = 0;
 export function compose(mode: ComposeMode = "new", extra: Partial<ComposeInit> = {}) {
   if (!ui.accounts.length) {
-    openSettings("new");
+    openAccountSettings("new");
     return;
   }
   const source = mode === "new" ? undefined : (ui.detail ?? undefined);

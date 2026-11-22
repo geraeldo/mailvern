@@ -1,7 +1,7 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import Icon from "./Icon.svelte";
-  import { ui, openMessage, loadMore, viewTitle, setQuery, openSettings } from "../state.svelte";
+  import { ui, openMessage, loadMore, viewTitle, setQuery, openAccountSettings } from "../state.svelte";
   import { hint } from "../shortcuts.svelte";
   import { messageMenu } from "../menus";
   import { shortDate, displayName } from "../format";
@@ -103,7 +103,7 @@
         {#if ui.query}
           No results
         {:else if !ui.accounts.length}
-          <button class="btn primary" onclick={() => openSettings("new")}>Add your first account</button>
+          <button class="btn primary" onclick={() => openAccountSettings("new")}>Add your first account</button>
         {:else}
           <Icon name="check" size={22} />
         {/if}

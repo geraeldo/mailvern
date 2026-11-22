@@ -2,7 +2,7 @@ import { Menu } from "@tauri-apps/api/menu";
 import type { Account, Summary } from "./api";
 import { api } from "./api";
 import {
-  ui, openSettings, openMessage, compose, archiveSelected, trashSelected, toggleSeen, toggleFlag,
+  ui, openAccountSettings, openMessage, compose, archiveSelected, trashSelected, toggleSeen, toggleFlag,
 } from "./state.svelte";
 
 type Item = { text: string; action: () => void; enabled?: boolean } | "-";
@@ -18,7 +18,8 @@ async function popup(items: Item[]) {
 
 export function accountMenu(acc: Account, collapsed: boolean, toggle: () => void) {
   return popup([
-    { text: "Account Settings…", action: () => openSettings(acc.id) },
+    { text: "Account Settings…", action: () => openAccountSettings(acc.id) },
+    { text: "Add Account…", action: () => openAccountSettings("new") },
     { text: "Check for Mail", action: () => api.syncNow() },
     "-",
     { text: collapsed ? "Expand" : "Collapse", action: toggle },

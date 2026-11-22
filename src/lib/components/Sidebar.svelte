@@ -1,6 +1,6 @@
 <script lang="ts">
   import Icon from "./Icon.svelte";
-  import { ui, setView, compose, openSettings, accountLabel, reorderAccounts, reorderFolders } from "../state.svelte";
+  import { ui, setView, compose, openSettings, openAccountSettings, accountLabel, reorderAccounts, reorderFolders } from "../state.svelte";
   import { sortable } from "../sortable";
   import { accountMenu } from "../menus";
   import { hint } from "../shortcuts.svelte";
@@ -91,7 +91,7 @@
     </div>
 
     {#if !ui.accounts.length}
-      <button class="add" onclick={() => openSettings("new")}>
+      <button class="add" onclick={() => openAccountSettings("new")}>
         <Icon name="plus" /> Add account
       </button>
     {/if}
@@ -100,6 +100,9 @@
   <footer>
     <button class="icon-btn" title={hint("Settings", "settings")} onclick={() => openSettings()}>
       <Icon name="settings" />
+    </button>
+    <button class="icon-btn" title="Accounts" onclick={() => openAccountSettings()}>
+      <Icon name="at" />
     </button>
     <span class="sync" title={errors.length ? `${errors.length} account(s) can't connect` : ""}>
       {#if syncing}

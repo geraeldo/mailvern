@@ -8,11 +8,12 @@
   import Reader from "./lib/components/Reader.svelte";
   import Composer from "./lib/components/Composer.svelte";
   import Settings from "./lib/components/Settings.svelte";
+  import AccountSettings from "./lib/components/AccountSettings.svelte";
   import { api, type MailEvent } from "./lib/api";
   import { allowNativeMenu } from "./lib/menus";
   import {
     ui, loadAccounts, loadFolders, loadList, loadTrusted, move, compose,
-    archiveSelected, trashSelected, toggleSeen, toggleFlag, accountById, openSettings,
+    archiveSelected, trashSelected, toggleSeen, toggleFlag, accountById, openSettings, openAccountSettings,
   } from "./lib/state.svelte";
   import { keymap, comboOf, match, canFireWhileTyping, usesModifier, loadShortcuts, type Action } from "./lib/shortcuts.svelte";
 
@@ -40,7 +41,7 @@
       await loadAccounts();
       await Promise.all([loadFolders(), loadList(true), loadTrusted(), loadShortcuts()]);
       refreshBadge();
-      if (!ui.accounts.length) openSettings("new");
+      if (!ui.accounts.length) openAccountSettings("new");
       notify = (await isPermissionGranted()) || (await requestPermission()) === "granted";
     })();
 
@@ -88,8 +89,8 @@
     const combo = comboOf(e);
     if (!combo) return;
     const action = match(combo);
-    // Composer and Settings handle their own keys.
-    if (!action || action === "send" || ui.compose || ui.settings) return;
+    // Composer and the settings popups handle their own keys.
+    if (!action || action === "send" || ui.compose || ui.settings || ui.accountSettings) return;
     if (typing(e) && !(canFireWhileTyping(action) && usesModifier(combo))) return;
     e.preventDefault();
     run[action]();
@@ -112,6 +113,10 @@
 
 {#if ui.settings}
   <Settings />
+{/if}
+
+{#if ui.accountSettings}
+  <AccountSettings />
 {/if}
 
 {#if ui.toast}
