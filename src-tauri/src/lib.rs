@@ -199,7 +199,18 @@ pub fn run() {
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
-            let engine = Arc::new(Engine::open(&dir.join("mailvern.db"))?);
+            let engine = match Engine::open(&dir.join("mailvern.db")) {
+                Ok(e) => Arc::new(e),
+                Err(e) => {
+                    use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+                    app.dialog()
+                        .message(format!("{e:#}"))
+                        .title("Mailvern can't open its data")
+                        .kind(MessageDialogKind::Error)
+                        .show(|_| std::process::exit(1));
+                    return Ok(());
+                }
+            };
             app.manage(engine.clone());
 
             let handle = app.handle().clone();

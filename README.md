@@ -23,6 +23,17 @@ npm run tauri build
 
 The app ends up in `target/release/bundle/macos/Mailvern.app`.
 
+## Your data
+
+- Accounts, signatures and the mail cache live in `~/Library/Application Support/app.mailvern/mailvern.db`. Passwords are in the Keychain. Replacing the app never touches either.
+- The database is versioned with `PRAGMA user_version`. On launch, any pending upgrades run in order, each in its own transaction. Before upgrading, a backup is written next to the database as `mailvern.v<old>.bak`.
+- A database from a newer Mailvern is refused, not modified.
+- Never change the bundle identifier `app.mailvern`. It decides where the data lives.
+
+### Changing the schema
+
+Append a new entry to `MIGRATIONS` in `crates/mail-core/src/db.rs`, for example `ALTER TABLE ... ADD COLUMN ...`. Never edit or reorder an entry that has shipped. Run `cargo test -p mail-core`.
+
 ## How it stays fast
 
 - The UI reads only from local SQLite. It never waits on the network to show a list.

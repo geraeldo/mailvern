@@ -1,5 +1,5 @@
 use crate::model::*;
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
@@ -34,11 +34,17 @@ pub struct BodyInfo {
     pub has_attachments: bool,
 }
 
-const SCHEMA: &str = r#"
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
-PRAGMA foreign_keys = ON;
+/// Per-connection settings. Not part of the schema; applied on every open.
+const PRAGMAS: &str = "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;";
 
+/// Schema history. `PRAGMA user_version` records how many of these have run.
+///
+/// Rules: never edit or reorder a shipped entry. To change the schema, append a new
+/// entry (e.g. `ALTER TABLE messages ADD COLUMN ...`). Each one runs once, in a
+/// transaction, and the database is backed up before any upgrade.
+const MIGRATIONS: &[&str] = &[V1];
+
+const V1: &str = r#"
 CREATE TABLE IF NOT EXISTS accounts (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL,
@@ -154,10 +160,46 @@ fn fts_query(q: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
+const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
+
+fn migrate(conn: &mut Connection, path: &Path) -> Result<()> {
+    migrate_with(conn, path, MIGRATIONS)
+}
+
+fn migrate_with(conn: &mut Connection, path: &Path, migrations: &[&str]) -> Result<()> {
+    let latest = migrations.len() as i64;
+    let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if current > latest {
+        return Err(anyhow!(
+            "This database was created by a newer version of Mailvern (schema {current}, this app supports {latest}). Update Mailvern to open it."
+        ));
+    }
+    if current == latest {
+        return Ok(());
+    }
+    // Back up an existing database before changing it. A brand-new file has no tables yet.
+    let has_tables: bool =
+        conn.query_row("SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table'", [], |r| r.get(0))?;
+    if has_tables {
+        let backup = path.with_extension(format!("v{current}.bak"));
+        let _ = std::fs::remove_file(&backup);
+        conn.execute("VACUUM INTO ?", [backup.to_string_lossy()])?;
+    }
+    for (i, sql) in migrations.iter().enumerate().skip(current as usize) {
+        let tx = conn.transaction()?;
+        tx.execute_batch(sql).with_context(|| format!("Database upgrade to version {} failed", i + 1))?;
+        tx.pragma_update(None, "user_version", (i + 1) as i64)?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        conn.execute_batch(SCHEMA)?;
+        let mut conn = Connection::open(path)?;
+        conn.execute_batch(PRAGMAS)?;
+        migrate(&mut conn, path)?;
         Ok(Db { conn: Mutex::new(conn) })
     }
 
@@ -573,5 +615,111 @@ impl Db {
             params![key, value],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mailvern-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("mailvern.db")
+    }
+
+    fn version(path: &Path) -> i64 {
+        Connection::open(path).unwrap().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap()
+    }
+
+    fn account() -> Account {
+        Account {
+            id: 0,
+            name: "Me".into(),
+            email: "me@example.com".into(),
+            imap_host: "imap.example.com".into(),
+            imap_port: 993,
+            smtp_host: "smtp.example.com".into(),
+            smtp_port: 465,
+            color: String::new(),
+            signature: "<b>Me</b>".into(),
+            position: 0,
+        }
+    }
+
+    #[test]
+    fn fresh_database_is_current_and_not_backed_up() {
+        let path = temp_db();
+        Db::open(&path).unwrap();
+        assert_eq!(version(&path), SCHEMA_VERSION);
+        assert!(!path.with_extension("v0.bak").exists());
+    }
+
+    #[test]
+    fn reopening_keeps_data() {
+        let path = temp_db();
+        Db::open(&path).unwrap().save_account(&account()).unwrap();
+        let db = Db::open(&path).unwrap();
+        let accs = db.accounts().unwrap();
+        assert_eq!(accs.len(), 1);
+        assert_eq!(accs[0].signature, "<b>Me</b>");
+    }
+
+    #[test]
+    fn unversioned_database_from_first_build_is_adopted_with_backup() {
+        let path = temp_db();
+        Db::open(&path).unwrap().save_account(&account()).unwrap();
+        // Simulate a database written before versioning existed.
+        Connection::open(&path).unwrap().pragma_update(None, "user_version", 0).unwrap();
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(version(&path), SCHEMA_VERSION);
+        assert_eq!(db.accounts().unwrap().len(), 1);
+        assert!(path.with_extension("v0.bak").exists());
+    }
+
+    #[test]
+    fn future_migration_upgrades_existing_data_after_backup() {
+        let path = temp_db();
+        Db::open(&path).unwrap().save_account(&account()).unwrap();
+
+        let v2 = "ALTER TABLE accounts ADD COLUMN nickname TEXT NOT NULL DEFAULT 'none';";
+        let mut conn = Connection::open(&path).unwrap();
+        migrate_with(&mut conn, &path, &[V1, v2]).unwrap();
+
+        assert_eq!(version(&path), 2);
+        let nick: String = conn.query_row("SELECT nickname FROM accounts", [], |r| r.get(0)).unwrap();
+        assert_eq!(nick, "none");
+        let email: String = conn.query_row("SELECT email FROM accounts", [], |r| r.get(0)).unwrap();
+        assert_eq!(email, "me@example.com");
+        // The pre-upgrade backup holds the old schema and the data.
+        let bak = Connection::open(path.with_extension("v1.bak")).unwrap();
+        let v: i64 = bak.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 1);
+        let n: i64 = bak.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn failed_migration_rolls_back() {
+        let path = temp_db();
+        Db::open(&path).unwrap().save_account(&account()).unwrap();
+        let bad = "ALTER TABLE accounts ADD COLUMN x TEXT; THIS IS NOT SQL;";
+        let mut conn = Connection::open(&path).unwrap();
+        assert!(migrate_with(&mut conn, &path, &[V1, bad]).is_err());
+        assert_eq!(version(&path), 1);
+        let cols: i64 = conn.query_row("SELECT COUNT(*) FROM pragma_table_info('accounts') WHERE name = 'x'", [], |r| r.get(0)).unwrap();
+        assert_eq!(cols, 0);
+    }
+
+    #[test]
+    fn newer_database_is_refused_untouched() {
+        let path = temp_db();
+        Db::open(&path).unwrap().save_account(&account()).unwrap();
+        Connection::open(&path).unwrap().pragma_update(None, "user_version", SCHEMA_VERSION + 1).unwrap();
+
+        let err = Db::open(&path).err().expect("should refuse").to_string();
+        assert!(err.contains("newer version"));
+        assert_eq!(version(&path), SCHEMA_VERSION + 1);
     }
 }
