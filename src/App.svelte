@@ -1,0 +1,143 @@
+<script lang="ts">
+  import { onMount } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
+  import Sidebar from "./lib/components/Sidebar.svelte";
+  import MessageList from "./lib/components/MessageList.svelte";
+  import Reader from "./lib/components/Reader.svelte";
+  import Composer from "./lib/components/Composer.svelte";
+  import Settings from "./lib/components/Settings.svelte";
+  import { api, type MailEvent } from "./lib/api";
+  import {
+    ui, loadAccounts, loadFolders, loadList, loadTrusted, move, compose,
+    archiveSelected, trashSelected, toggleSeen, toggleFlag, accountById,
+  } from "./lib/state.svelte";
+
+  let list: MessageList;
+  let notify = false;
+
+  async function refreshBadge() {
+    try {
+      const n = await api.unreadCount();
+      await getCurrentWindow().setBadgeCount(n > 0 ? n : undefined);
+    } catch {}
+  }
+
+  let pending: ReturnType<typeof setTimeout> | undefined;
+  function scheduleRefresh() {
+    clearTimeout(pending);
+    pending = setTimeout(async () => {
+      await Promise.all([loadFolders(), loadList(true)]);
+      refreshBadge();
+    }, 150);
+  }
+
+  onMount(() => {
+    (async () => {
+      await loadAccounts();
+      await Promise.all([loadFolders(), loadList(true), loadTrusted()]);
+      refreshBadge();
+      if (!ui.accounts.length) ui.settings = true;
+      notify = (await isPermissionGranted()) || (await requestPermission()) === "granted";
+    })();
+
+    const un = listen<MailEvent>("mail-event", ({ payload: e }) => {
+      if (e.kind === "changed") scheduleRefresh();
+      else if (e.kind === "status") ui.status[e.accountId] = { state: e.state, message: e.message };
+      else if (e.kind === "newMail" && notify) {
+        const acc = accountById(e.accountId);
+        sendNotification({
+          title: e.count > 1 ? `${e.count} new messages` : e.from,
+          body: e.count > 1 ? `${e.from} · ${e.subject}` : e.subject || "(no subject)",
+          ...(acc && ui.accounts.length > 1 ? { subtitle: acc.email } : {}),
+        } as any);
+      }
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
+  function typing(e: KeyboardEvent) {
+    const t = e.target as HTMLElement;
+    return t.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(t.tagName);
+  }
+
+  function onKey(e: KeyboardEvent) {
+    const k = e.key;
+    if (e.metaKey) {
+      if (k === "n") { e.preventDefault(); compose(); }
+      else if (k === ",") { e.preventDefault(); ui.settings = true; }
+      else if (k === "f" && !ui.compose && !ui.settings) { e.preventDefault(); list?.focusSearch(); }
+      else if (k === "r" && !e.shiftKey) { e.preventDefault(); api.syncNow(); }
+      else if (k === "Backspace" && !typing(e) && !ui.compose) { e.preventDefault(); trashSelected(); }
+      return;
+    }
+    if (ui.compose || ui.settings || typing(e) || e.ctrlKey || e.altKey) return;
+    switch (k) {
+      case "j": case "ArrowDown": e.preventDefault(); move(1); break;
+      case "k": case "ArrowUp": e.preventDefault(); move(-1); break;
+      case "r": compose("reply"); e.preventDefault(); break;
+      case "a": compose("replyAll"); e.preventDefault(); break;
+      case "f": compose("forward"); e.preventDefault(); break;
+      case "c": compose(); e.preventDefault(); break;
+      case "e": archiveSelected(); break;
+      case "#": case "Backspace": case "Delete": e.preventDefault(); trashSelected(); break;
+      case "u": toggleSeen(); break;
+      case "s": toggleFlag(); break;
+      case "/": e.preventDefault(); list?.focusSearch(); break;
+    }
+  }
+</script>
+
+<svelte:window onkeydown={onKey} />
+
+<div class="app">
+  <Sidebar />
+  <MessageList bind:this={list} />
+  <Reader />
+</div>
+
+{#if ui.compose}
+  {#key ui.compose.key}
+    <Composer init={ui.compose} />
+  {/key}
+{/if}
+
+{#if ui.settings}
+  <Settings />
+{/if}
+
+{#if ui.toast}
+  <div class="toast" role="status">{ui.toast.text}</div>
+{/if}
+
+<style>
+  .app {
+    display: grid;
+    grid-template-columns: 236px minmax(320px, 390px) minmax(0, 1fr);
+    height: 100vh;
+  }
+  .toast {
+    position: fixed;
+    left: 50%;
+    bottom: 22px;
+    transform: translateX(-50%);
+    z-index: 100;
+    max-width: min(560px, calc(100vw - 48px));
+    padding: 9px 16px;
+    border-radius: 10px;
+    background: #1d1c1a;
+    color: #fff;
+    font-size: 13px;
+    font-weight: 500;
+    box-shadow: var(--shadow);
+    animation: rise 0.16s ease-out;
+    -webkit-user-select: text;
+    user-select: text;
+  }
+  @media (prefers-color-scheme: dark) {
+    .toast { background: #3a3936; }
+  }
+</style>

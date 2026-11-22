@@ -1,0 +1,577 @@
+use crate::model::*;
+use anyhow::Result;
+use rusqlite::{params, Connection, OptionalExtension};
+use std::path::Path;
+use std::sync::Mutex;
+
+pub struct Db {
+    conn: Mutex<Connection>,
+}
+
+/// Header-level data for a message, as stored after a sync.
+pub struct NewMessage {
+    pub uid: u32,
+    pub message_id: Option<String>,
+    pub in_reply_to: Option<String>,
+    pub refs: Option<String>,
+    pub subject: String,
+    pub from_name: String,
+    pub from_addr: String,
+    pub to: Vec<Addr>,
+    pub cc: Vec<Addr>,
+    pub reply_to: Vec<Addr>,
+    pub date: i64,
+    pub seen: bool,
+    pub flagged: bool,
+    pub has_attachments: bool,
+    pub size: u32,
+}
+
+/// Summary fields computed from a full message body.
+pub struct BodyInfo {
+    pub snippet: String,
+    pub search_text: String,
+    pub has_attachments: bool,
+}
+
+const SCHEMA: &str = r#"
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS accounts (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  email TEXT NOT NULL UNIQUE,
+  imap_host TEXT NOT NULL,
+  imap_port INTEGER NOT NULL,
+  smtp_host TEXT NOT NULL,
+  smtp_port INTEGER NOT NULL,
+  color TEXT NOT NULL DEFAULT '',
+  signature TEXT NOT NULL DEFAULT '',
+  position INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS folders (
+  id INTEGER PRIMARY KEY,
+  account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  path TEXT NOT NULL,
+  name TEXT NOT NULL,
+  role TEXT,
+  uidvalidity INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(account_id, path)
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY,
+  account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  folder_id INTEGER NOT NULL REFERENCES folders(id) ON DELETE CASCADE,
+  uid INTEGER NOT NULL,
+  message_id TEXT,
+  in_reply_to TEXT,
+  refs TEXT,
+  subject TEXT NOT NULL DEFAULT '',
+  from_name TEXT NOT NULL DEFAULT '',
+  from_addr TEXT NOT NULL DEFAULT '',
+  to_json TEXT NOT NULL DEFAULT '[]',
+  cc_json TEXT NOT NULL DEFAULT '[]',
+  reply_to_json TEXT NOT NULL DEFAULT '[]',
+  date INTEGER NOT NULL DEFAULT 0,
+  snippet TEXT NOT NULL DEFAULT '',
+  seen INTEGER NOT NULL DEFAULT 0,
+  flagged INTEGER NOT NULL DEFAULT 0,
+  has_attachments INTEGER NOT NULL DEFAULT 0,
+  size INTEGER NOT NULL DEFAULT 0,
+  has_body INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(folder_id, uid)
+);
+CREATE INDEX IF NOT EXISTS idx_messages_folder_date ON messages(folder_id, date DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_msgid ON messages(message_id);
+
+CREATE TABLE IF NOT EXISTS bodies (
+  message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+  raw BLOB NOT NULL
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(subject, sender, body, tokenize = 'unicode61 remove_diacritics 2');
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+  DELETE FROM messages_fts WHERE rowid = old.id;
+END;
+
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+"#;
+
+const SUMMARY_COLS: &str =
+    "m.id, m.account_id, m.folder_id, m.from_name, m.from_addr, m.subject, m.snippet, m.date, m.seen, m.flagged, m.has_attachments";
+
+fn row_to_summary(r: &rusqlite::Row) -> rusqlite::Result<MessageSummary> {
+    Ok(MessageSummary {
+        id: r.get(0)?,
+        account_id: r.get(1)?,
+        folder_id: r.get(2)?,
+        from_name: r.get(3)?,
+        from_addr: r.get(4)?,
+        subject: r.get(5)?,
+        snippet: r.get(6)?,
+        date: r.get(7)?,
+        seen: r.get(8)?,
+        flagged: r.get(9)?,
+        has_attachments: r.get(10)?,
+    })
+}
+
+fn row_to_account(r: &rusqlite::Row) -> rusqlite::Result<Account> {
+    Ok(Account {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        email: r.get(2)?,
+        imap_host: r.get(3)?,
+        imap_port: r.get(4)?,
+        smtp_host: r.get(5)?,
+        smtp_port: r.get(6)?,
+        color: r.get(7)?,
+        signature: r.get(8)?,
+        position: r.get(9)?,
+    })
+}
+
+/// Turns free text into a safe FTS5 prefix query.
+fn fts_query(q: &str) -> Option<String> {
+    let terms: Vec<String> = q
+        .split_whitespace()
+        .map(|t| t.replace('"', ""))
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("\"{}\"*", t))
+        .collect();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" "))
+    }
+}
+
+impl Db {
+    pub fn open(path: &Path) -> Result<Self> {
+        let conn = Connection::open(path)?;
+        conn.execute_batch(SCHEMA)?;
+        Ok(Db { conn: Mutex::new(conn) })
+    }
+
+    fn c(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    // ---------- accounts ----------
+
+    pub fn accounts(&self) -> Result<Vec<Account>> {
+        let c = self.c();
+        let mut st = c.prepare(
+            "SELECT id, name, email, imap_host, imap_port, smtp_host, smtp_port, color, signature, position
+             FROM accounts ORDER BY position, id",
+        )?;
+        let rows = st.query_map([], row_to_account)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn account(&self, id: i64) -> Result<Account> {
+        let c = self.c();
+        Ok(c.query_row(
+            "SELECT id, name, email, imap_host, imap_port, smtp_host, smtp_port, color, signature, position
+             FROM accounts WHERE id = ?",
+            [id],
+            row_to_account,
+        )?)
+    }
+
+    pub fn save_account(&self, a: &Account) -> Result<i64> {
+        let c = self.c();
+        if a.id > 0 {
+            c.execute(
+                "UPDATE accounts SET name=?, email=?, imap_host=?, imap_port=?, smtp_host=?, smtp_port=?, color=?, signature=? WHERE id=?",
+                params![a.name, a.email, a.imap_host, a.imap_port, a.smtp_host, a.smtp_port, a.color, a.signature, a.id],
+            )?;
+            Ok(a.id)
+        } else {
+            let pos: i64 = c.query_row("SELECT COALESCE(MAX(position), 0) + 1 FROM accounts", [], |r| r.get(0))?;
+            c.execute(
+                "INSERT INTO accounts (name, email, imap_host, imap_port, smtp_host, smtp_port, color, signature, position)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![a.name, a.email, a.imap_host, a.imap_port, a.smtp_host, a.smtp_port, a.color, a.signature, pos],
+            )?;
+            Ok(c.last_insert_rowid())
+        }
+    }
+
+    pub fn reorder_accounts(&self, ids: &[i64]) -> Result<()> {
+        let c = self.c();
+        for (i, id) in ids.iter().enumerate() {
+            c.execute("UPDATE accounts SET position = ? WHERE id = ?", params![i as i64, id])?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_account(&self, id: i64) -> Result<()> {
+        let c = self.c();
+        c.execute(
+            "DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE account_id = ?)",
+            [id],
+        )?;
+        c.execute("DELETE FROM accounts WHERE id = ?", [id])?;
+        Ok(())
+    }
+
+    // ---------- folders ----------
+
+    pub fn upsert_folder(&self, account_id: i64, path: &str, name: &str, role: Option<&str>) -> Result<i64> {
+        let c = self.c();
+        c.execute(
+            "INSERT INTO folders (account_id, path, name, role) VALUES (?, ?, ?, ?)
+             ON CONFLICT(account_id, path) DO UPDATE SET name = excluded.name, role = excluded.role",
+            params![account_id, path, name, role],
+        )?;
+        Ok(c.query_row(
+            "SELECT id FROM folders WHERE account_id = ? AND path = ?",
+            params![account_id, path],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn remove_folders_except(&self, account_id: i64, keep: &[i64]) -> Result<()> {
+        let c = self.c();
+        let existing: Vec<i64> = c
+            .prepare("SELECT id FROM folders WHERE account_id = ?")?
+            .query_map([account_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for id in existing.into_iter().filter(|id| !keep.contains(id)) {
+            c.execute("DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE folder_id = ?)", [id])?;
+            c.execute("DELETE FROM folders WHERE id = ?", [id])?;
+        }
+        Ok(())
+    }
+
+    pub fn folders(&self) -> Result<Vec<Folder>> {
+        let c = self.c();
+        let mut st = c.prepare(
+            "SELECT f.id, f.account_id, f.path, f.name, f.role,
+                    (SELECT COUNT(*) FROM messages m WHERE m.folder_id = f.id AND m.seen = 0)
+             FROM folders f ORDER BY f.account_id, f.name COLLATE NOCASE",
+        )?;
+        let rows = st
+            .query_map([], |r| {
+                Ok(Folder {
+                    id: r.get(0)?,
+                    account_id: r.get(1)?,
+                    path: r.get(2)?,
+                    name: r.get(3)?,
+                    role: r.get(4)?,
+                    unread: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn folder(&self, id: i64) -> Result<(i64, String, Option<String>)> {
+        let c = self.c();
+        Ok(c.query_row("SELECT account_id, path, role FROM folders WHERE id = ?", [id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?)
+    }
+
+    pub fn folder_by_role(&self, account_id: i64, role: &str) -> Result<Option<(i64, String)>> {
+        let c = self.c();
+        Ok(c.query_row(
+            "SELECT id, path FROM folders WHERE account_id = ? AND role = ?",
+            params![account_id, role],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?)
+    }
+
+    pub fn folder_uidvalidity(&self, folder_id: i64) -> Result<u32> {
+        let c = self.c();
+        let v: i64 = c.query_row("SELECT uidvalidity FROM folders WHERE id = ?", [folder_id], |r| r.get(0))?;
+        Ok(v as u32)
+    }
+
+    pub fn reset_folder(&self, folder_id: i64, uidvalidity: u32) -> Result<()> {
+        let c = self.c();
+        c.execute("DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE folder_id = ?)", [folder_id])?;
+        c.execute("DELETE FROM messages WHERE folder_id = ?", [folder_id])?;
+        c.execute("UPDATE folders SET uidvalidity = ? WHERE id = ?", params![uidvalidity as i64, folder_id])?;
+        Ok(())
+    }
+
+    // ---------- messages ----------
+
+    pub fn uid_range(&self, folder_id: i64) -> Result<(u32, u32)> {
+        let c = self.c();
+        let (min, max): (Option<i64>, Option<i64>) = c.query_row(
+            "SELECT MIN(uid), MAX(uid) FROM messages WHERE folder_id = ?",
+            [folder_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok((min.unwrap_or(0) as u32, max.unwrap_or(0) as u32))
+    }
+
+    pub fn insert_messages(&self, account_id: i64, folder_id: i64, msgs: &[NewMessage]) -> Result<()> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        {
+            let mut ins = tx.prepare(
+                "INSERT OR IGNORE INTO messages (account_id, folder_id, uid, message_id, in_reply_to, refs, subject,
+                    from_name, from_addr, to_json, cc_json, reply_to_json, date, seen, flagged, has_attachments, size)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )?;
+            let mut fts = tx.prepare("INSERT INTO messages_fts (rowid, subject, sender, body) VALUES (?, ?, ?, '')")?;
+            for m in msgs {
+                let n = ins.execute(params![
+                    account_id,
+                    folder_id,
+                    m.uid,
+                    m.message_id,
+                    m.in_reply_to,
+                    m.refs,
+                    m.subject,
+                    m.from_name,
+                    m.from_addr,
+                    serde_json::to_string(&m.to)?,
+                    serde_json::to_string(&m.cc)?,
+                    serde_json::to_string(&m.reply_to)?,
+                    m.date,
+                    m.seen,
+                    m.flagged,
+                    m.has_attachments,
+                    m.size,
+                ])?;
+                if n > 0 {
+                    let id = tx.last_insert_rowid();
+                    fts.execute(params![id, m.subject, format!("{} {}", m.from_name, m.from_addr)])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Applies server flags for every uid >= `from_uid` and deletes rows the server no longer has.
+    pub fn reconcile_flags(&self, folder_id: i64, from_uid: u32, flags: &[(u32, bool, bool)]) -> Result<bool> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let mut changed = false;
+        {
+            let local: Vec<(i64, u32, bool, bool)> = tx
+                .prepare("SELECT id, uid, seen, flagged FROM messages WHERE folder_id = ? AND uid >= ?")?
+                .query_map(params![folder_id, from_uid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            let server: std::collections::HashMap<u32, (bool, bool)> =
+                flags.iter().map(|(u, s, f)| (*u, (*s, *f))).collect();
+            for (id, uid, seen, flagged) in local {
+                match server.get(&uid) {
+                    None => {
+                        tx.execute("DELETE FROM messages_fts WHERE rowid = ?", [id])?;
+                        tx.execute("DELETE FROM messages WHERE id = ?", [id])?;
+                        changed = true;
+                    }
+                    Some(&(s, f)) if s != seen || f != flagged => {
+                        tx.execute("UPDATE messages SET seen = ?, flagged = ? WHERE id = ?", params![s, f, id])?;
+                        changed = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    pub fn missing_bodies(&self, folder_id: i64, limit: usize, max_size: u32) -> Result<Vec<u32>> {
+        let c = self.c();
+        let mut st = c.prepare(
+            "SELECT uid FROM messages WHERE folder_id = ? AND has_body = 0 AND size <= ? ORDER BY date DESC LIMIT ?",
+        )?;
+        let rows = st
+            .query_map(params![folder_id, max_size, limit as i64], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<u32>>>()?;
+        Ok(rows)
+    }
+
+    pub fn store_body(&self, folder_id: i64, uid: u32, raw: &[u8], info: &BodyInfo) -> Result<()> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let id: Option<i64> = tx
+            .query_row("SELECT id FROM messages WHERE folder_id = ? AND uid = ?", params![folder_id, uid], |r| r.get(0))
+            .optional()?;
+        if let Some(id) = id {
+            tx.execute("INSERT OR REPLACE INTO bodies (message_id, raw) VALUES (?, ?)", params![id, raw])?;
+            tx.execute(
+                "UPDATE messages SET has_body = 1, snippet = ?, has_attachments = ? WHERE id = ?",
+                params![info.snippet, info.has_attachments, id],
+            )?;
+            tx.execute("UPDATE messages_fts SET body = ? WHERE rowid = ?", params![info.search_text, id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn body(&self, id: i64) -> Result<Option<Vec<u8>>> {
+        let c = self.c();
+        Ok(c.query_row("SELECT raw FROM bodies WHERE message_id = ?", [id], |r| r.get(0)).optional()?)
+    }
+
+    /// (account_id, folder_id, folder_path, uid)
+    pub fn locate(&self, id: i64) -> Result<(i64, i64, String, u32)> {
+        let c = self.c();
+        Ok(c.query_row(
+            "SELECT m.account_id, m.folder_id, f.path, m.uid FROM messages m JOIN folders f ON f.id = m.folder_id WHERE m.id = ?",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?)
+    }
+
+    pub fn list(&self, view: &View, query: Option<&str>, offset: i64, limit: i64) -> Result<Vec<MessageSummary>> {
+        let c = self.c();
+        let scope = match view {
+            View::Unified => "m.folder_id IN (SELECT id FROM folders WHERE role = 'inbox')".to_string(),
+            View::Folder { folder_id } => format!("m.folder_id = {}", folder_id),
+        };
+        let fts = query.and_then(fts_query);
+        let sql = match fts {
+            Some(_) => format!(
+                "SELECT {SUMMARY_COLS} FROM messages m JOIN messages_fts ON messages_fts.rowid = m.id
+                 WHERE {scope} AND messages_fts MATCH ?1 ORDER BY m.date DESC LIMIT ?2 OFFSET ?3"
+            ),
+            None => format!(
+                "SELECT {SUMMARY_COLS} FROM messages m WHERE {scope} AND ?1 IS NULL ORDER BY m.date DESC LIMIT ?2 OFFSET ?3"
+            ),
+        };
+        let mut st = c.prepare(&sql)?;
+        let rows = st
+            .query_map(params![fts, limit, offset], row_to_summary)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Searches every folder of every account.
+    pub fn search_all(&self, query: &str, limit: i64) -> Result<Vec<MessageSummary>> {
+        let Some(fts) = fts_query(query) else { return Ok(vec![]) };
+        let c = self.c();
+        let sql = format!(
+            "SELECT {SUMMARY_COLS} FROM messages m JOIN messages_fts ON messages_fts.rowid = m.id
+             WHERE messages_fts MATCH ?1 ORDER BY m.date DESC LIMIT ?2"
+        );
+        let mut st = c.prepare(&sql)?;
+        let rows = st.query_map(params![fts, limit], row_to_summary)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn summary(&self, id: i64) -> Result<(MessageSummary, Vec<Addr>, Vec<Addr>, Vec<Addr>, Option<String>, Option<String>, Option<String>)> {
+        let c = self.c();
+        let sql = format!(
+            "SELECT {SUMMARY_COLS}, m.to_json, m.cc_json, m.reply_to_json, m.message_id, m.refs, m.in_reply_to FROM messages m WHERE m.id = ?"
+        );
+        Ok(c.query_row(&sql, [id], |r| {
+            let s = row_to_summary(r)?;
+            let to: String = r.get(11)?;
+            let cc: String = r.get(12)?;
+            let rt: String = r.get(13)?;
+            Ok((
+                s,
+                serde_json::from_str(&to).unwrap_or_default(),
+                serde_json::from_str(&cc).unwrap_or_default(),
+                serde_json::from_str(&rt).unwrap_or_default(),
+                r.get(14)?,
+                r.get(15)?,
+                r.get(16)?,
+            ))
+        })?)
+    }
+
+    pub fn set_seen(&self, ids: &[i64], seen: bool) -> Result<()> {
+        let c = self.c();
+        for id in ids {
+            c.execute("UPDATE messages SET seen = ? WHERE id = ?", params![seen, id])?;
+        }
+        Ok(())
+    }
+
+    pub fn set_flagged(&self, ids: &[i64], flagged: bool) -> Result<()> {
+        let c = self.c();
+        for id in ids {
+            c.execute("UPDATE messages SET flagged = ? WHERE id = ?", params![flagged, id])?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_messages(&self, ids: &[i64]) -> Result<()> {
+        let c = self.c();
+        for id in ids {
+            c.execute("DELETE FROM messages_fts WHERE rowid = ?", [id])?;
+            c.execute("DELETE FROM messages WHERE id = ?", [id])?;
+        }
+        Ok(())
+    }
+
+    pub fn has_message_id(&self, folder_id: i64, message_id: &str) -> Result<bool> {
+        let c = self.c();
+        let n: i64 = c.query_row(
+            "SELECT COUNT(*) FROM messages WHERE folder_id = ? AND message_id = ?",
+            params![folder_id, message_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn unified_unread(&self) -> Result<i64> {
+        let c = self.c();
+        Ok(c.query_row(
+            "SELECT COUNT(*) FROM messages WHERE seen = 0 AND folder_id IN (SELECT id FROM folders WHERE role = 'inbox')",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Address suggestions, ranked by how often you write to / hear from them.
+    pub fn contacts(&self, q: &str) -> Result<Vec<Addr>> {
+        let c = self.c();
+        let like = format!("%{}%", q.trim().replace('%', "").replace('_', ""));
+        let mut st = c.prepare(
+            "SELECT COALESCE(MAX(NULLIF(name, '')), ''), email, SUM(w) AS score FROM (
+               SELECT from_name AS name, from_addr AS email, 1 AS w FROM messages
+               UNION ALL
+               SELECT json_extract(j.value, '$.name'), json_extract(j.value, '$.email'), 4
+               FROM messages m, json_each(m.to_json) j
+               WHERE m.folder_id IN (SELECT id FROM folders WHERE role = 'sent')
+             )
+             WHERE email != '' AND (email LIKE ?1 OR name LIKE ?1)
+             GROUP BY lower(email) ORDER BY score DESC LIMIT 8",
+        )?;
+        let rows = st
+            .query_map([like], |r| {
+                let name: String = r.get(0)?;
+                Ok(Addr { name: if name.is_empty() { None } else { Some(name) }, email: r.get(1)? })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    // ---------- settings ----------
+
+    pub fn setting(&self, key: &str) -> Result<Option<String>> {
+        let c = self.c();
+        Ok(c.query_row("SELECT value FROM settings WHERE key = ?", [key], |r| r.get(0)).optional()?)
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        let c = self.c();
+        c.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+}
