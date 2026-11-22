@@ -47,7 +47,7 @@
       class:active={ui.view.kind === "unified" && !ui.query}
       onclick={() => setView({ kind: "unified" })}>
       <Icon name="inboxes" />
-      <span class="label">Inbox</span>
+      <span class="label">All Inbox</span>
       {#if totalUnread}<span class="count">{totalUnread}</span>{/if}
     </button>
 

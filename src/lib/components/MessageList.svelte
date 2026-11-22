@@ -1,7 +1,7 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import Icon from "./Icon.svelte";
-  import { ui, openMessage, loadMore, viewTitle, setQuery, accountById, openSettings } from "../state.svelte";
+  import { ui, openMessage, loadMore, viewTitle, setQuery, openSettings } from "../state.svelte";
   import { hint } from "../shortcuts.svelte";
   import { messageMenu } from "../menus";
   import { shortDate, displayName } from "../format";
@@ -20,7 +20,6 @@
   const start = $derived(Math.max(0, Math.floor(scrollTop / ROW) - OVERSCAN));
   const end = $derived(Math.min(ui.list.length, Math.ceil((scrollTop + height) / ROW) + OVERSCAN));
   const visible = $derived(ui.list.slice(start, end));
-  const multiAccount = $derived(ui.accounts.length > 1 && (ui.view.kind === "unified" || !!ui.query));
 
   async function onScroll() {
     scrollTop = scroller.scrollTop;
@@ -115,7 +114,6 @@
         <div class="older" style:top="{ui.list.length * ROW}px"><span class="spinner"></span></div>
       {/if}
       {#each visible as m, i (m.id)}
-        {@const acc = multiAccount ? accountById(m.accountId) : undefined}
         <button
           class="row"
           class:unread={!m.seen}
@@ -135,7 +133,6 @@
             </span>
             <span class="subject">{m.subject || "(no subject)"}</span>
             <span class="snippet">
-              {#if acc}<span class="acc" style:background={acc.color || "var(--muted)"}></span>{/if}
               <span class="snip">{m.snippet}</span>
             </span>
           </span>
@@ -235,7 +232,6 @@
   .unread .subject { color: var(--text); font-weight: 500; }
   .snippet { font-size: 12.5px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
   .snip { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .acc { width: 6px; height: 6px; border-radius: 50%; flex: none; }
   .older { position: absolute; left: 0; right: 0; height: 56px; display: grid; place-items: center; }
   .spinner {
     width: 16px;

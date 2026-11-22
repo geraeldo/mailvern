@@ -47,7 +47,7 @@ export function folderById(id: number): Folder | undefined {
 
 export function viewTitle(): string {
   if (ui.query.trim()) return "Search";
-  if (ui.view.kind === "unified") return "Inbox";
+  if (ui.view.kind === "unified") return "All Inbox";
   if (ui.view.kind === "folder") {
     const id = ui.view.folderId;
     return folderById(id)?.name ?? "";
