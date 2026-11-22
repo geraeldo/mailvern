@@ -42,7 +42,13 @@ const PRAGMAS: &str = "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; P
 /// Rules: never edit or reorder a shipped entry. To change the schema, append a new
 /// entry (e.g. `ALTER TABLE messages ADD COLUMN ...`). Each one runs once, in a
 /// transaction, and the database is backed up before any upgrade.
-const MIGRATIONS: &[&str] = &[V1];
+const MIGRATIONS: &[&str] = &[V1, V2, V3];
+
+/// v3: a user-chosen folder order. NULL means "not placed yet": default order applies.
+const V3: &str = "ALTER TABLE folders ADD COLUMN position INTEGER;";
+
+/// v2: a sidebar label separate from the sender name.
+const V2: &str = "ALTER TABLE accounts ADD COLUMN label TEXT NOT NULL DEFAULT '';";
 
 const V1: &str = r#"
 CREATE TABLE IF NOT EXISTS accounts (
@@ -142,6 +148,7 @@ fn row_to_account(r: &rusqlite::Row) -> rusqlite::Result<Account> {
         color: r.get(7)?,
         signature: r.get(8)?,
         position: r.get(9)?,
+        label: r.get(10)?,
     })
 }
 
@@ -212,7 +219,7 @@ impl Db {
     pub fn accounts(&self) -> Result<Vec<Account>> {
         let c = self.c();
         let mut st = c.prepare(
-            "SELECT id, name, email, imap_host, imap_port, smtp_host, smtp_port, color, signature, position
+            "SELECT id, name, email, imap_host, imap_port, smtp_host, smtp_port, color, signature, position, label
              FROM accounts ORDER BY position, id",
         )?;
         let rows = st.query_map([], row_to_account)?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -222,7 +229,7 @@ impl Db {
     pub fn account(&self, id: i64) -> Result<Account> {
         let c = self.c();
         Ok(c.query_row(
-            "SELECT id, name, email, imap_host, imap_port, smtp_host, smtp_port, color, signature, position
+            "SELECT id, name, email, imap_host, imap_port, smtp_host, smtp_port, color, signature, position, label
              FROM accounts WHERE id = ?",
             [id],
             row_to_account,
@@ -233,16 +240,16 @@ impl Db {
         let c = self.c();
         if a.id > 0 {
             c.execute(
-                "UPDATE accounts SET name=?, email=?, imap_host=?, imap_port=?, smtp_host=?, smtp_port=?, color=?, signature=? WHERE id=?",
-                params![a.name, a.email, a.imap_host, a.imap_port, a.smtp_host, a.smtp_port, a.color, a.signature, a.id],
+                "UPDATE accounts SET name=?, email=?, imap_host=?, imap_port=?, smtp_host=?, smtp_port=?, color=?, signature=?, label=? WHERE id=?",
+                params![a.name, a.email, a.imap_host, a.imap_port, a.smtp_host, a.smtp_port, a.color, a.signature, a.label, a.id],
             )?;
             Ok(a.id)
         } else {
             let pos: i64 = c.query_row("SELECT COALESCE(MAX(position), 0) + 1 FROM accounts", [], |r| r.get(0))?;
             c.execute(
-                "INSERT INTO accounts (name, email, imap_host, imap_port, smtp_host, smtp_port, color, signature, position)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                params![a.name, a.email, a.imap_host, a.imap_port, a.smtp_host, a.smtp_port, a.color, a.signature, pos],
+                "INSERT INTO accounts (name, email, imap_host, imap_port, smtp_host, smtp_port, color, signature, position, label)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![a.name, a.email, a.imap_host, a.imap_port, a.smtp_host, a.smtp_port, a.color, a.signature, pos, a.label],
             )?;
             Ok(c.last_insert_rowid())
         }
@@ -295,12 +302,21 @@ impl Db {
         Ok(())
     }
 
+    /// Folders in display order: accounts in their order, then each account's
+    /// folders by user position, falling back to a sensible default.
     pub fn folders(&self) -> Result<Vec<Folder>> {
         let c = self.c();
         let mut st = c.prepare(
             "SELECT f.id, f.account_id, f.path, f.name, f.role,
-                    (SELECT COUNT(*) FROM messages m WHERE m.folder_id = f.id AND m.seen = 0)
-             FROM folders f ORDER BY f.account_id, f.name COLLATE NOCASE",
+                    (SELECT COUNT(*) FROM messages m WHERE m.folder_id = f.id AND m.seen = 0),
+                    f.position
+             FROM folders f JOIN accounts a ON a.id = f.account_id
+             ORDER BY a.position, a.id,
+                      f.position IS NULL, f.position,
+                      CASE f.role WHEN 'inbox' THEN 0 WHEN 'drafts' THEN 1 WHEN 'sent' THEN 2
+                                  WHEN 'archive' THEN 3 WHEN 'junk' THEN 4 WHEN 'trash' THEN 5
+                                  WHEN 'all' THEN 7 ELSE 6 END,
+                      f.name COLLATE NOCASE",
         )?;
         let rows = st
             .query_map([], |r| {
@@ -311,10 +327,25 @@ impl Db {
                     name: r.get(3)?,
                     role: r.get(4)?,
                     unread: r.get(5)?,
+                    position: r.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Saves the order of one account's folders. Folders not listed keep their place after these.
+    pub fn reorder_folders(&self, account_id: i64, ids: &[i64]) -> Result<()> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        for (i, id) in ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE folders SET position = ? WHERE id = ? AND account_id = ?",
+                params![i as i64, id, account_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn folder(&self, id: i64) -> Result<(i64, String, Option<String>)> {
@@ -644,6 +675,7 @@ mod tests {
             color: String::new(),
             signature: "<b>Me</b>".into(),
             position: 0,
+            label: "Work".into(),
         }
     }
 
@@ -663,14 +695,22 @@ mod tests {
         let accs = db.accounts().unwrap();
         assert_eq!(accs.len(), 1);
         assert_eq!(accs[0].signature, "<b>Me</b>");
+        assert_eq!(accs[0].label, "Work");
     }
 
     #[test]
     fn unversioned_database_from_first_build_is_adopted_with_backup() {
         let path = temp_db();
-        Db::open(&path).unwrap().save_account(&account()).unwrap();
-        // Simulate a database written before versioning existed.
-        Connection::open(&path).unwrap().pragma_update(None, "user_version", 0).unwrap();
+        // A database written before versioning existed: v1 tables, user_version 0.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(V1).unwrap();
+            conn.execute(
+                "INSERT INTO accounts (name, email, imap_host, imap_port, smtp_host, smtp_port) VALUES ('Me', 'me@example.com', 'i', 993, 's', 465)",
+                [],
+            )
+            .unwrap();
+        }
 
         let db = Db::open(&path).unwrap();
         assert_eq!(version(&path), SCHEMA_VERSION);
@@ -683,21 +723,68 @@ mod tests {
         let path = temp_db();
         Db::open(&path).unwrap().save_account(&account()).unwrap();
 
-        let v2 = "ALTER TABLE accounts ADD COLUMN nickname TEXT NOT NULL DEFAULT 'none';";
+        let next = "ALTER TABLE accounts ADD COLUMN nickname TEXT NOT NULL DEFAULT 'none';";
         let mut conn = Connection::open(&path).unwrap();
-        migrate_with(&mut conn, &path, &[V1, v2]).unwrap();
+        migrate_with(&mut conn, &path, &[V1, V2, V3, next]).unwrap();
 
-        assert_eq!(version(&path), 2);
+        assert_eq!(version(&path), 4);
         let nick: String = conn.query_row("SELECT nickname FROM accounts", [], |r| r.get(0)).unwrap();
         assert_eq!(nick, "none");
         let email: String = conn.query_row("SELECT email FROM accounts", [], |r| r.get(0)).unwrap();
         assert_eq!(email, "me@example.com");
         // The pre-upgrade backup holds the old schema and the data.
-        let bak = Connection::open(path.with_extension("v1.bak")).unwrap();
+        let bak = Connection::open(path.with_extension("v3.bak")).unwrap();
         let v: i64 = bak.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 1);
+        assert_eq!(v, 3);
         let n: i64 = bak.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn v1_database_gains_label_and_keeps_accounts() {
+        let path = temp_db();
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            migrate_with(&mut conn, &path, &[V1]).unwrap();
+            conn.execute(
+                "INSERT INTO accounts (name, email, imap_host, imap_port, smtp_host, smtp_port) VALUES ('Me', 'me@example.com', 'i', 993, 's', 465)",
+                [],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let accs = db.accounts().unwrap();
+        assert_eq!(accs.len(), 1);
+        assert_eq!(accs[0].label, "");
+        assert_eq!(version(&path), SCHEMA_VERSION);
+        assert!(path.with_extension("v1.bak").exists());
+    }
+
+    #[test]
+    fn folder_and_account_order_persist() {
+        let path = temp_db();
+        let db = Db::open(&path).unwrap();
+        let a1 = db.save_account(&account()).unwrap();
+        let a2 = db.save_account(&Account { email: "two@example.com".into(), ..account() }).unwrap();
+        let inbox = db.upsert_folder(a1, "INBOX", "Inbox", Some("inbox")).unwrap();
+        let sent = db.upsert_folder(a1, "Sent", "Sent", Some("sent")).unwrap();
+        let news = db.upsert_folder(a1, "News", "News", None).unwrap();
+        let b_inbox = db.upsert_folder(a2, "INBOX", "Inbox", Some("inbox")).unwrap();
+
+        // Default: role order, accounts in creation order.
+        let ids: Vec<i64> = db.folders().unwrap().iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![inbox, sent, news, b_inbox]);
+
+        db.reorder_folders(a1, &[news, inbox, sent]).unwrap();
+        db.reorder_accounts(&[a2, a1]).unwrap();
+        // A re-sync upserts folders again; the order must survive it.
+        db.upsert_folder(a1, "News", "News", None).unwrap();
+
+        let ids: Vec<i64> = Db::open(&path).unwrap().folders().unwrap().iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![b_inbox, news, inbox, sent]);
+        // Another account's ids are ignored.
+        db.reorder_folders(a2, &[b_inbox, news]).unwrap();
+        assert_eq!(db.folders().unwrap().iter().find(|f| f.id == news).unwrap().position, Some(0));
     }
 
     #[test]
@@ -706,8 +793,8 @@ mod tests {
         Db::open(&path).unwrap().save_account(&account()).unwrap();
         let bad = "ALTER TABLE accounts ADD COLUMN x TEXT; THIS IS NOT SQL;";
         let mut conn = Connection::open(&path).unwrap();
-        assert!(migrate_with(&mut conn, &path, &[V1, bad]).is_err());
-        assert_eq!(version(&path), 1);
+        assert!(migrate_with(&mut conn, &path, &[V1, V2, V3, bad]).is_err());
+        assert_eq!(version(&path), 3);
         let cols: i64 = conn.query_row("SELECT COUNT(*) FROM pragma_table_info('accounts') WHERE name = 'x'", [], |r| r.get(0)).unwrap();
         assert_eq!(cols, 0);
     }

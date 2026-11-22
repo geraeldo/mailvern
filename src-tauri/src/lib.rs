@@ -33,6 +33,11 @@ fn reorder_accounts(engine: E, ids: Vec<i64>) -> R<()> {
 }
 
 #[tauri::command]
+fn reorder_folders(engine: E, account_id: i64, ids: Vec<i64>) -> R<()> {
+    engine.reorder_folders(account_id, &ids).map_err(err)
+}
+
+#[tauri::command]
 fn folders(engine: E) -> R<Vec<Folder>> {
     engine.folders().map_err(err)
 }
@@ -177,6 +182,26 @@ async fn attachment_files(engine: E<'_>, id: i64) -> R<Vec<FileInfo>> {
     Ok(out)
 }
 
+/// Reads an image file as a data: URL for inserting into the editor.
+#[tauri::command]
+fn read_image(path: String) -> R<String> {
+    use base64::Engine as _;
+    let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+    if meta.len() > 15 * 1024 * 1024 {
+        return Err("Image is larger than 15 MB".into());
+    }
+    let mime = match PathBuf::from(&path).extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("heic") => "image/heic",
+        _ => return Err("Not a supported image".into()),
+    };
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    Ok(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)))
+}
+
 #[tauri::command]
 fn contacts(engine: E, query: String) -> R<Vec<mail_core::model::Addr>> {
     engine.contacts(&query).map_err(err)
@@ -236,6 +261,7 @@ pub fn run() {
             save_account,
             delete_account,
             reorder_accounts,
+            reorder_folders,
             folders,
             messages,
             search,
@@ -254,6 +280,7 @@ pub fn run() {
             file_info,
             attachment_files,
             contacts,
+            read_image,
             open_url,
         ])
         .run(tauri::generate_context!())

@@ -1,6 +1,7 @@
 <script lang="ts">
   import Icon from "./Icon.svelte";
-  import { ui, openMessage, loadList, viewTitle, setQuery, accountById } from "../state.svelte";
+  import { ui, openMessage, loadList, viewTitle, setQuery, accountById, openSettings } from "../state.svelte";
+  import { hint } from "../shortcuts.svelte";
   import { shortDate, displayName } from "../format";
 
   const ROW = 76;
@@ -84,7 +85,7 @@
       </div>
     {:else}
       <h1 data-tauri-drag-region>{viewTitle()}</h1>
-      <button class="icon-btn" title="Search  ⌘F" onclick={focusSearch}><Icon name="search" /></button>
+      <button class="icon-btn" title={hint("Search", "search")} onclick={focusSearch}><Icon name="search" /></button>
     {/if}
   </header>
 
@@ -94,7 +95,7 @@
         {#if ui.query}
           No results
         {:else if !ui.accounts.length}
-          <button class="btn primary" onclick={() => (ui.settings = true)}>Add your first account</button>
+          <button class="btn primary" onclick={() => openSettings("new")}>Add your first account</button>
         {:else}
           <Icon name="check" size={22} />
         {/if}

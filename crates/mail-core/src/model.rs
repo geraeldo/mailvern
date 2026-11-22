@@ -17,6 +17,9 @@ pub struct Account {
     pub signature: String,
     #[serde(default)]
     pub position: i64,
+    /// Short name for the sidebar. Falls back to `name`, then `email`.
+    #[serde(default)]
+    pub label: String,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -28,6 +31,7 @@ pub struct Folder {
     pub name: String,
     pub role: Option<String>,
     pub unread: i64,
+    pub position: Option<i64>,
 }
 
 #[derive(Serialize, Clone, Debug)]

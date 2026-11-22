@@ -89,17 +89,29 @@ impl Engine {
 
     /// Saves settings, stores a new password if given, and restarts that account's sync.
     pub async fn save_account(&self, acc: Account, password: Option<String>) -> Result<Account> {
-        let password = password.filter(|p| !p.is_empty());
+        let mut password = password.filter(|p| !p.is_empty());
         let is_new = acc.id == 0;
         if is_new && password.is_none() {
             return Err(anyhow!("Password required"));
         }
-        let connection_changed = if is_new {
-            true
-        } else {
-            let old = self.db.account(acc.id)?;
-            old.email != acc.email || old.imap_host != acc.imap_host || old.imap_port != acc.imap_port
+        let old = if is_new { None } else { Some(self.db.account(acc.id)?) };
+        let old_email = old.as_ref().map(|o| o.email.clone()).filter(|e| *e != acc.email);
+        let connection_changed = match &old {
+            None => true,
+            Some(o) => {
+                o.email != acc.email
+                    || o.imap_host != acc.imap_host
+                    || o.imap_port != acc.imap_port
+                    || o.smtp_host != acc.smtp_host
+                    || o.smtp_port != acc.smtp_port
+            }
         };
+        // The Keychain entry is keyed by email; carry it over when the address changes.
+        if password.is_none() {
+            if let Some(prev) = &old_email {
+                password = Some(secrets::get(prev)?);
+            }
+        }
         if password.is_some() || connection_changed {
             self.test_account(&acc, password.clone()).await?;
         }
@@ -107,6 +119,9 @@ impl Engine {
             secrets::set(&acc.email, pw)?;
         }
         let id = self.db.save_account(&acc)?;
+        if let Some(prev) = old_email {
+            secrets::delete(&prev);
+        }
         let saved = self.db.account(id)?;
         if password.is_some() || connection_changed {
             self.workers.lock().unwrap().remove(&id);
@@ -117,6 +132,10 @@ impl Engine {
 
     pub fn reorder_accounts(&self, ids: &[i64]) -> Result<()> {
         self.db.reorder_accounts(ids)
+    }
+
+    pub fn reorder_folders(&self, account_id: i64, ids: &[i64]) -> Result<()> {
+        self.db.reorder_folders(account_id, ids)
     }
 
     pub fn delete_account(&self, id: i64) -> Result<()> {

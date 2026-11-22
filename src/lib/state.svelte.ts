@@ -2,6 +2,7 @@ import { api, type Account, type Detail, type Folder, type Summary, type View } 
 
 export type ComposeMode = "new" | "reply" | "replyAll" | "forward";
 export type ComposeInit = { mode: ComposeMode; source?: Detail; accountId?: number; to?: string[]; key: number };
+export type SettingsTarget = number | "new" | "shortcuts" | null;
 export type SyncStatus = { state: "syncing" | "idle" | "error"; message: string | null };
 
 const PAGE = 200;
@@ -20,10 +21,20 @@ export const ui = $state({
   query: "",
   compose: null as ComposeInit | null,
   settings: false,
+  settingsTarget: null as SettingsTarget,
   status: {} as Record<number, SyncStatus>,
   toast: null as { text: string; undo?: () => void } | null,
   trustedSenders: [] as string[],
 });
+
+export function openSettings(target: SettingsTarget = null) {
+  ui.settingsTarget = target;
+  ui.settings = true;
+}
+
+export function accountLabel(a: Account): string {
+  return a.label?.trim() || a.name?.trim() || a.email;
+}
 
 export function accountById(id: number): Account | undefined {
   return ui.accounts.find((a) => a.id === id);
@@ -45,6 +56,34 @@ export function viewTitle(): string {
 
 export async function loadAccounts() {
   ui.accounts = await api.accounts();
+}
+
+export async function reorderAccounts(ids: number[]) {
+  const byId = new Map(ui.accounts.map((a) => [a.id, a]));
+  ui.accounts = ids.map((id) => byId.get(id)).filter((a): a is Account => !!a);
+  try {
+    await api.reorderAccounts(ids);
+  } catch (e) {
+    toast(String(e));
+  }
+  await loadAccounts();
+}
+
+/** `visibleIds` is the new order of the folders on screen; hidden ones keep their slots. */
+export async function reorderFolders(accountId: number, visibleIds: number[]) {
+  const all = ui.folders.filter((f) => f.accountId === accountId);
+  const shown = new Set(visibleIds);
+  const queue = [...visibleIds];
+  const full = all.map((f) => (shown.has(f.id) ? queue.shift()! : f.id));
+  const byId = new Map(all.map((f) => [f.id, f]));
+  const reordered = full.map((id, i) => ({ ...byId.get(id)!, position: i }));
+  ui.folders = [...ui.folders.filter((f) => f.accountId !== accountId), ...reordered];
+  try {
+    await api.reorderFolders(accountId, full);
+  } catch (e) {
+    toast(String(e));
+  }
+  await loadFolders();
 }
 
 export async function loadFolders() {
@@ -188,7 +227,7 @@ export function toggleFlag() {
 let composeKey = 0;
 export function compose(mode: ComposeMode = "new", extra: Partial<ComposeInit> = {}) {
   if (!ui.accounts.length) {
-    ui.settings = true;
+    openSettings("new");
     return;
   }
   const source = mode === "new" ? undefined : (ui.detail ?? undefined);

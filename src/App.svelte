@@ -11,8 +11,9 @@
   import { api, type MailEvent } from "./lib/api";
   import {
     ui, loadAccounts, loadFolders, loadList, loadTrusted, move, compose,
-    archiveSelected, trashSelected, toggleSeen, toggleFlag, accountById,
+    archiveSelected, trashSelected, toggleSeen, toggleFlag, accountById, openSettings,
   } from "./lib/state.svelte";
+  import { keymap, comboOf, match, canFireWhileTyping, usesModifier, loadShortcuts, type Action } from "./lib/shortcuts.svelte";
 
   let list: MessageList;
   let notify = false;
@@ -36,9 +37,9 @@
   onMount(() => {
     (async () => {
       await loadAccounts();
-      await Promise.all([loadFolders(), loadList(true), loadTrusted()]);
+      await Promise.all([loadFolders(), loadList(true), loadTrusted(), loadShortcuts()]);
       refreshBadge();
-      if (!ui.accounts.length) ui.settings = true;
+      if (!ui.accounts.length) openSettings("new");
       notify = (await isPermissionGranted()) || (await requestPermission()) === "granted";
     })();
 
@@ -64,30 +65,33 @@
     return t.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(t.tagName);
   }
 
+  const run: Record<Action, () => void> = {
+    next: () => move(1),
+    prev: () => move(-1),
+    reply: () => compose("reply"),
+    replyAll: () => compose("replyAll"),
+    forward: () => compose("forward"),
+    compose: () => compose(),
+    archive: archiveSelected,
+    delete: trashSelected,
+    toggleUnread: toggleSeen,
+    toggleFlag: toggleFlag,
+    search: () => list?.focusSearch(),
+    sync: () => api.syncNow(),
+    settings: () => openSettings(),
+    send: () => {},
+  };
+
   function onKey(e: KeyboardEvent) {
-    const k = e.key;
-    if (e.metaKey) {
-      if (k === "n") { e.preventDefault(); compose(); }
-      else if (k === ",") { e.preventDefault(); ui.settings = true; }
-      else if (k === "f" && !ui.compose && !ui.settings) { e.preventDefault(); list?.focusSearch(); }
-      else if (k === "r" && !e.shiftKey) { e.preventDefault(); api.syncNow(); }
-      else if (k === "Backspace" && !typing(e) && !ui.compose) { e.preventDefault(); trashSelected(); }
-      return;
-    }
-    if (ui.compose || ui.settings || typing(e) || e.ctrlKey || e.altKey) return;
-    switch (k) {
-      case "j": case "ArrowDown": e.preventDefault(); move(1); break;
-      case "k": case "ArrowUp": e.preventDefault(); move(-1); break;
-      case "r": compose("reply"); e.preventDefault(); break;
-      case "a": compose("replyAll"); e.preventDefault(); break;
-      case "f": compose("forward"); e.preventDefault(); break;
-      case "c": compose(); e.preventDefault(); break;
-      case "e": archiveSelected(); break;
-      case "#": case "Backspace": case "Delete": e.preventDefault(); trashSelected(); break;
-      case "u": toggleSeen(); break;
-      case "s": toggleFlag(); break;
-      case "/": e.preventDefault(); list?.focusSearch(); break;
-    }
+    if (keymap.recording) return;
+    const combo = comboOf(e);
+    if (!combo) return;
+    const action = match(combo);
+    // Composer and Settings handle their own keys.
+    if (!action || action === "send" || ui.compose || ui.settings) return;
+    if (typing(e) && !(canFireWhileTyping(action) && usesModifier(combo))) return;
+    e.preventDefault();
+    run[action]();
   }
 </script>
 

@@ -11,6 +11,7 @@ export type Account = {
   color: string;
   signature: string;
   position: number;
+  label: string;
 };
 
 export type Folder = {
@@ -20,6 +21,7 @@ export type Folder = {
   name: string;
   role: string | null;
   unread: number;
+  position: number | null;
 };
 
 export type Summary = {
@@ -79,6 +81,7 @@ export const api = {
   deleteAccount: (id: number) => invoke<void>("delete_account", { id }),
   reorderAccounts: (ids: number[]) => invoke<void>("reorder_accounts", { ids }),
   folders: () => invoke<Folder[]>("folders"),
+  reorderFolders: (accountId: number, ids: number[]) => invoke<void>("reorder_folders", { accountId, ids }),
   messages: (view: View, query: string | null, offset: number, limit: number) =>
     invoke<Summary[]>("messages", { view, query, offset, limit }),
   search: (query: string) => invoke<Summary[]>("search", { query }),
@@ -98,4 +101,5 @@ export const api = {
   attachmentFiles: (id: number) => invoke<FileInfo[]>("attachment_files", { id }),
   contacts: (query: string) => invoke<Addr[]>("contacts", { query }),
   openUrl: (url: string) => invoke<void>("open_url", { url }),
+  readImage: (path: string) => invoke<string>("read_image", { path }),
 };

@@ -3,15 +3,17 @@
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 
 const accounts = [
-  { id: 1, name: "Work", email: "hello@acme.co", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465, color: "#2F6BFF", signature: "<b>Alex Rivera</b><br>Acme Co.", position: 0 },
-  { id: 2, name: "Personal", email: "alex@rivera.me", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465, color: "#4FA05A", signature: "— Alex", position: 1 },
-  { id: 3, name: "Billing", email: "billing@acme.co", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465, color: "#D9A21B", signature: "", position: 2 },
+  { id: 1, label: "Acme", name: "Alex Rivera", email: "hello@acme.co", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465, color: "#2F6BFF", signature: "<b>Alex Rivera</b><br>Acme Co.", position: 0 },
+  { id: 2, label: "Personal", name: "Alex Rivera", email: "alex@rivera.me", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465, color: "#4FA05A", signature: "— Alex", position: 1 },
+  { id: 3, label: "", name: "Acme Billing", email: "billing@acme.co", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465, color: "#D9A21B", signature: "", position: 2 },
 ];
 
 const roles = ["inbox", "drafts", "sent", "archive", "junk", "trash"];
 const names: Record<string, string> = { inbox: "Inbox", drafts: "Drafts", sent: "Sent", archive: "Archive", junk: "Spam", trash: "Trash" };
 const folders = accounts.flatMap((a) =>
-  roles.map((r, i) => ({ id: a.id * 10 + i, accountId: a.id, path: names[r], name: names[r], role: r, unread: 0 })),
+  [...roles.map((r, i) => ({ id: a.id * 10 + i, accountId: a.id, path: names[r], name: names[r], role: r as string | null, unread: 0, position: null as number | null })),
+    { id: a.id * 10 + 7, accountId: a.id, path: "Clients", name: "Clients", role: null, unread: 0, position: null },
+    { id: a.id * 10 + 8, accountId: a.id, path: "Receipts", name: "Receipts", role: null, unread: 0, position: null }],
 );
 
 const people = [
@@ -64,12 +66,25 @@ const html = `<div style="font-family:-apple-system,Helvetica,sans-serif">
 <img src="https://example.com/pixel.gif" width="1" height="1">
 </div>`;
 
+const settings: Record<string, string> = {};
+
 export function installMock() {
   mockWindows("main");
   mockIPC((cmd, args: any) => {
     switch (cmd) {
       case "accounts": return accounts;
-      case "folders": return folders;
+      case "folders": {
+        const order = (id: number) => accounts.findIndex((a) => a.id === id);
+        return [...folders].sort((x, y) => order(x.accountId) - order(y.accountId) || (x.position ?? 99) - (y.position ?? 99));
+      }
+      case "reorder_accounts": {
+        const ids: number[] = args.ids;
+        accounts.sort((x, y) => ids.indexOf(x.id) - ids.indexOf(y.id));
+        return null;
+      }
+      case "reorder_folders":
+        (args.ids as number[]).forEach((id, i) => { const f = folders.find((x) => x.id === id); if (f) f.position = i; });
+        return null;
       case "messages": {
         const v = args.view;
         const rows = messages.filter((m) => (v.kind === "unified" ? m.folderId % 10 === 0 : m.folderId === v.folderId));
@@ -96,7 +111,13 @@ export function installMock() {
         refreshCounts();
         return null;
       case "contacts": return people.filter((p) => (p[0] + p[1]).toLowerCase().includes(args.query.toLowerCase())).slice(0, 6).map(([name, email]) => ({ name, email }));
-      case "get_setting": return null;
+      case "get_setting": return settings[args.key] ?? null;
+      case "set_setting": settings[args.key] = args.value; return null;
+      case "save_account": {
+        const i = accounts.findIndex((a) => a.id === args.account.id);
+        if (i >= 0) accounts[i] = { ...args.account };
+        return args.account;
+      }
       case "plugin:notification|is_permission_granted": return false;
       case "plugin:notification|request_permission": return "denied";
       case "plugin:event|listen": return 1;

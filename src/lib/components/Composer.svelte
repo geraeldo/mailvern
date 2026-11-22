@@ -8,7 +8,8 @@
   import { ui, toast, folderById, type ComposeInit } from "../state.svelte";
   import { api, type FileInfo } from "../api";
   import { formatAddr, fileSize } from "../format";
-  import { htmlToText, prefixed, quoteForward, quoteReply } from "../html";
+  import { htmlToText, prefixed, quoteForward, quoteReply, emailWrap } from "../html";
+  import { comboOf, match, hint } from "../shortcuts.svelte";
 
   let props: { init: ComposeInit } = $props();
   // The composer is keyed per open, so its setup is read once.
@@ -140,7 +141,7 @@
       return;
     }
     if (!subject.trim() && !(await ask("Send without a subject?", { title: "Mailvern", okLabel: "Send", cancelLabel: "Cancel" }))) return;
-    const html = editorEl?.innerHTML ?? "";
+    const html = emailWrap(editorEl?.innerHTML ?? "");
     const total = files.reduce((n, f) => n + f.size, 0);
     if (total > 24 * 1024 * 1024) {
       toast("Attachments are over 24 MB");
@@ -170,10 +171,11 @@
   }
 
   function onKey(e: KeyboardEvent) {
-    if (e.metaKey && e.key === "Enter") {
+    const combo = comboOf(e);
+    if (combo && match(combo) === "send") {
       e.preventDefault();
       send();
-    } else if (e.key === "Escape") {
+    } else if (e.key === "Escape" && !e.defaultPrevented) {
       e.preventDefault();
       close();
     }
@@ -184,7 +186,7 @@
 <div class="scrim" onkeydown={onKey}>
   <div class="sheet" class:dropping role="dialog" aria-label="New message">
     <header>
-      <span class="title">{init.mode === "new" ? "New message" : init.mode === "forward" ? "Forward" : "Reply"}</span>
+      <span class="title">{({ new: "New message", reply: "Reply", replyAll: "Reply all", forward: "Forward" } as const)[init.mode]}</span>
       <button class="icon-btn" title="Close  Esc" onclick={close}><Icon name="x" /></button>
     </header>
 
@@ -217,7 +219,7 @@
     <div class="body">
       <Editor bind:el={editorEl} html={initialHtml} oninput={() => (dirty = true)}>
         <button class="icon-btn" title="Attach files" onclick={pickFiles}><Icon name="clip" size={16} /></button>
-        <button class="btn primary send" disabled={sending} onclick={send} title="Send  ⌘↩">
+        <button class="btn primary send" disabled={sending} onclick={send} title={hint("Send", "send")}>
           {#if sending}<span class="spinner"></span>{/if}
           {sending ? "Sending" : "Send"}
         </button>

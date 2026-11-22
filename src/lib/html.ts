@@ -28,7 +28,7 @@ export function frameDoc(body: string, allowRemote: boolean): string {
 <meta name="color-scheme" content="light">
 <style>
   html,body{margin:0;padding:0;background:#fff;overflow:hidden}
-  body{padding:4px 2px 24px;font:14px/1.55 -apple-system,BlinkMacSystemFont,"Helvetica Neue",sans-serif;color:#1d1c1a;word-wrap:break-word;overflow-wrap:anywhere}
+  body{padding:4px 2px 12px;display:flow-root;font:14px/1.55 -apple-system,BlinkMacSystemFont,"Helvetica Neue",sans-serif;color:#1d1c1a;word-wrap:break-word;overflow-wrap:anywhere}
   img{max-width:100%;height:auto}
   table{max-width:100%}
   pre{white-space:pre-wrap}
@@ -70,9 +70,29 @@ function originalBody(d: Detail): string {
 
 const addrList = (a: Addr[]) => a.map((x) => escapeHtml(formatAddr(x))).join(", ");
 
+const QUOTE_STYLE = "margin:0 0 0 2px;padding-left:12px;border-left:2px solid #d9d6cf;color:#55524c";
+
 export function quoteReply(d: Detail): string {
   const who = escapeHtml(d.fromName ? `${d.fromName} <${d.fromAddr}>` : d.fromAddr);
-  return `<div class="mv-quote-head">On ${escapeHtml(longDate(d.date))}, ${who} wrote:</div><blockquote>${originalBody(d)}</blockquote>`;
+  return `<div class="mv-quote-head">On ${escapeHtml(longDate(d.date))}, ${who} wrote:</div><blockquote type="cite" style="${QUOTE_STYLE}">${originalBody(d)}</blockquote>`;
+}
+
+/**
+ * Prepares composer HTML for sending. Mail clients ignore the app's stylesheet,
+ * so the few styles that matter are inlined.
+ */
+export function emailWrap(inner: string): string {
+  const doc = new DOMParser().parseFromString(`<div>${inner}</div>`, "text/html");
+  const root = doc.body.firstElementChild as HTMLElement;
+  root.querySelectorAll<HTMLElement>("blockquote:not([style])").forEach((b) => b.setAttribute("style", QUOTE_STYLE));
+  root.querySelectorAll<HTMLElement>(".mv-quote-head").forEach((h) => {
+    h.removeAttribute("class");
+    h.setAttribute("style", "color:#8f8b83;font-size:13px;margin-bottom:6px");
+  });
+  root.querySelectorAll<HTMLElement>("[data-signature]").forEach((s) => s.removeAttribute("data-signature"));
+  root.querySelectorAll<HTMLElement>("h2:not([style])").forEach((h) => h.setAttribute("style", "font-size:19px;line-height:1.3;margin:10px 0 4px"));
+  root.querySelectorAll<HTMLElement>("h3:not([style])").forEach((h) => h.setAttribute("style", "font-size:16px;line-height:1.35;margin:8px 0 2px"));
+  return `<div style="font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',Helvetica,Arial,sans-serif;font-size:14px;line-height:1.55;color:#1d1c1a">${root.innerHTML}</div>`;
 }
 
 export function quoteForward(d: Detail): string {

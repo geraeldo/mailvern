@@ -1,7 +1,8 @@
 <script lang="ts">
   import Icon from "./Icon.svelte";
   import MailFrame from "./MailFrame.svelte";
-  import { ui, compose, archiveSelected, trashSelected, toggleSeen, toggleFlag, accountById, trustSender, toast } from "../state.svelte";
+  import { ui, compose, archiveSelected, trashSelected, toggleSeen, toggleFlag, accountById, accountLabel, trustSender, toast } from "../state.svelte";
+  import { hint } from "../shortcuts.svelte";
   import { api, type Addr } from "../api";
   import { longDate, displayName, initials, colorFor, fileSize } from "../format";
   import { hasRemoteContent, textToHtml } from "../html";
@@ -43,15 +44,15 @@
   <header data-tauri-drag-region>
     {#if d}
       <div class="tools">
-        <button class="icon-btn" title="Reply  R" onclick={() => compose("reply")}><Icon name="reply" size={17} /></button>
-        <button class="icon-btn" title="Reply all  A" onclick={() => compose("replyAll")}><Icon name="replyAll" size={17} /></button>
-        <button class="icon-btn" title="Forward  F" onclick={() => compose("forward")}><Icon name="forward" size={17} /></button>
+        <button class="icon-btn" title={hint("Reply", "reply")} onclick={() => compose("reply")}><Icon name="reply" size={17} /></button>
+        <button class="icon-btn" title={hint("Reply all", "replyAll")} onclick={() => compose("replyAll")}><Icon name="replyAll" size={17} /></button>
+        <button class="icon-btn" title={hint("Forward", "forward")} onclick={() => compose("forward")}><Icon name="forward" size={17} /></button>
         <span class="sep"></span>
-        <button class="icon-btn" title="Archive  E" onclick={archiveSelected}><Icon name="archive" size={17} /></button>
-        <button class="icon-btn" title="Delete  ⌫" onclick={trashSelected}><Icon name="trash" size={17} /></button>
+        <button class="icon-btn" title={hint("Archive", "archive")} onclick={archiveSelected}><Icon name="archive" size={17} /></button>
+        <button class="icon-btn" title={hint("Delete", "delete")} onclick={trashSelected}><Icon name="trash" size={17} /></button>
         <span class="sep"></span>
-        <button class="icon-btn" class:on={row && !row.seen} title="Mark as unread  U" onclick={toggleSeen}><Icon name="unread" size={17} /></button>
-        <button class="icon-btn" class:flagged={row?.flagged} title="Flag  S" onclick={toggleFlag}><Icon name="flag" size={17} /></button>
+        <button class="icon-btn" class:on={row && !row.seen} title={hint("Mark as unread", "toggleUnread")} onclick={toggleSeen}><Icon name="unread" size={17} /></button>
+        <button class="icon-btn" class:flagged={row?.flagged} title={hint("Flag", "toggleFlag")} onclick={toggleFlag}><Icon name="flag" size={17} /></button>
       </div>
     {/if}
   </header>
@@ -75,7 +76,7 @@
           <div class="when">
             <div>{longDate(d.date)}</div>
             {#if acc && ui.accounts.length > 1}
-              <div class="acc"><span class="dot" style:background={acc.color || "var(--muted)"}></span>{acc.email}</div>
+              <div class="acc" title={acc.email}><span class="dot" style:background={acc.color || "var(--muted)"}></span>{accountLabel(acc)}</div>
             {/if}
           </div>
         </div>
