@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import Icon from "./Icon.svelte";
   import { ui, openMessage, loadList, viewTitle, setQuery, accountById, openSettings } from "../state.svelte";
   import { hint } from "../shortcuts.svelte";
@@ -29,13 +30,20 @@
     }
   }
 
-  // Keep the selected row in view during keyboard navigation.
+  // Bring the selected row into view when the selection changes (keyboard navigation).
+  // Only the selection is tracked: list refreshes from sync must not move your scroll.
+  let lastSelected: number | null = null;
   $effect(() => {
-    const i = ui.list.findIndex((m) => m.id === ui.selectedId);
-    if (i < 0 || !scroller) return;
-    const top = i * ROW;
-    if (top < scroller.scrollTop) scroller.scrollTop = top;
-    else if (top + ROW > scroller.scrollTop + height) scroller.scrollTop = top + ROW - height;
+    const id = ui.selectedId;
+    if (id === lastSelected) return;
+    lastSelected = id;
+    untrack(() => {
+      const i = ui.list.findIndex((m) => m.id === id);
+      if (i < 0 || !scroller) return;
+      const top = i * ROW;
+      if (top < scroller.scrollTop) scroller.scrollTop = top;
+      else if (top + ROW > scroller.scrollTop + height) scroller.scrollTop = top + ROW - height;
+    });
   });
 
   // Reset scroll when the view changes.

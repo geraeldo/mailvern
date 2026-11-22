@@ -121,8 +121,11 @@
   .app {
     display: grid;
     grid-template-columns: 236px minmax(320px, 390px) minmax(0, 1fr);
-    height: 100vh;
+    /* One row exactly the window's height, so each column scrolls on its own. */
+    grid-template-rows: minmax(0, 100%);
+    height: 100%;
   }
+  .app > :global(*) { min-height: 0; }
   .toast {
     position: fixed;
     left: 50%;
