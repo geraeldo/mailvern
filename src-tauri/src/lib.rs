@@ -289,6 +289,33 @@ pub fn run() {
             read_image,
             open_url,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Mailvern");
+        // Like other Mac mail apps: closing the window (⌘W, red button) only hides it,
+        // so sync and notifications keep running. ⌘Q still quits.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
+        .build(tauri::generate_context!())
+        .expect("error while building Mailvern")
+        .run(|app, event| {
+            // Clicking the Dock icon brings the hidden window back.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                show_main(app);
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+        });
+}
+
+fn show_main(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.unminimize();
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
 }
