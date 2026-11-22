@@ -1,8 +1,9 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import Icon from "./Icon.svelte";
-  import { ui, openMessage, loadList, viewTitle, setQuery, accountById, openSettings } from "../state.svelte";
+  import { ui, openMessage, loadMore, viewTitle, setQuery, accountById, openSettings } from "../state.svelte";
   import { hint } from "../shortcuts.svelte";
+  import { messageMenu } from "../menus";
   import { shortDate, displayName } from "../format";
 
   const ROW = 76;
@@ -23,9 +24,9 @@
 
   async function onScroll() {
     scrollTop = scroller.scrollTop;
-    if (ui.hasMore && !loadingMore && scrollTop + height > ui.list.length * ROW - ROW * 20) {
+    if (!loadingMore && scrollTop + height > ui.list.length * ROW - ROW * 20) {
       loadingMore = true;
-      await loadList(false);
+      await loadMore();
       loadingMore = false;
     }
   }
@@ -109,7 +110,10 @@
         {/if}
       </div>
     {/if}
-    <div style:height="{ui.list.length * ROW}px" style:position="relative">
+    <div style:height="{ui.list.length * ROW + (ui.loadingOlder ? 56 : 0)}px" style:position="relative">
+      {#if ui.loadingOlder}
+        <div class="older" style:top="{ui.list.length * ROW}px"><span class="spinner"></span></div>
+      {/if}
       {#each visible as m, i (m.id)}
         {@const acc = multiAccount ? accountById(m.accountId) : undefined}
         <button
@@ -117,7 +121,8 @@
           class:unread={!m.seen}
           class:selected={m.id === ui.selectedId}
           style:transform="translateY({(start + i) * ROW}px)"
-          onclick={() => openMessage(m.id)}>
+          onclick={() => openMessage(m.id)}
+          oncontextmenu={(e) => { e.preventDefault(); messageMenu(m); }}>
           <span class="mark">
             {#if !m.seen}<span class="unread-dot"></span>{/if}
           </span>
@@ -231,6 +236,15 @@
   .snippet { font-size: 12.5px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
   .snip { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .acc { width: 6px; height: 6px; border-radius: 50%; flex: none; }
+  .older { position: absolute; left: 0; right: 0; height: 56px; display: grid; place-items: center; }
+  .spinner {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    border: 2px solid var(--line-strong);
+    border-top-color: var(--muted);
+    animation: spin 0.8s linear infinite;
+  }
   .empty {
     position: absolute;
     inset: 0;

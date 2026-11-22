@@ -67,10 +67,11 @@ const html = `<div style="font-family:-apple-system,Helvetica,sans-serif">
 </div>`;
 
 const settings: Record<string, string> = {};
+let olderCalls = 0;
 
 export function installMock() {
   mockWindows("main");
-  mockIPC((cmd, args: any) => {
+  mockIPC(async (cmd, args: any) => {
     switch (cmd) {
       case "accounts": return accounts;
       case "folders": {
@@ -89,6 +90,19 @@ export function installMock() {
         const v = args.view;
         const rows = messages.filter((m) => (v.kind === "unified" ? m.folderId % 10 === 0 : m.folderId === v.folderId));
         return rows.slice(args.offset, args.offset + args.limit);
+      }
+      case "load_older": {
+        // Simulate the server returning 30 older messages, twice, then nothing.
+        olderCalls++;
+        if (olderCalls > 2) return 0;
+        await new Promise((r) => setTimeout(r, 600));
+        const base = messages.length;
+        const oldest = Math.min(...messages.map((m) => m.date));
+        for (let i = 0; i < 30; i++) {
+          const p = people[i % people.length], s = subjects[i % subjects.length];
+          messages.push({ id: base + i + 1, accountId: 1, folderId: 10, fromName: p[0], fromAddr: p[1], subject: `${s[0]} (older)`, snippet: s[1], date: oldest - (i + 1) * 86400, seen: true, flagged: false, hasAttachments: false });
+        }
+        return 30;
       }
       case "search": return messages.filter((m) => (m.subject + m.fromName + m.snippet).toLowerCase().includes(args.query.toLowerCase()));
       case "unread_count": return messages.filter((m) => !m.seen).length;
@@ -121,6 +135,8 @@ export function installMock() {
       case "plugin:notification|is_permission_granted": return false;
       case "plugin:notification|request_permission": return "denied";
       case "plugin:event|listen": return 1;
+      case "plugin:menu|new": return [1, "menu"];
+      case "plugin:menu|popup": (window as any).__lastMenu = args; return null;
       default: return null;
     }
   });

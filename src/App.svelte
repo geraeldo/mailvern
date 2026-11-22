@@ -9,6 +9,7 @@
   import Composer from "./lib/components/Composer.svelte";
   import Settings from "./lib/components/Settings.svelte";
   import { api, type MailEvent } from "./lib/api";
+  import { allowNativeMenu } from "./lib/menus";
   import {
     ui, loadAccounts, loadFolders, loadList, loadTrusted, move, compose,
     archiveSelected, trashSelected, toggleSeen, toggleFlag, accountById, openSettings,
@@ -95,7 +96,7 @@
   }
 </script>
 
-<svelte:window onkeydown={onKey} />
+<svelte:window onkeydown={onKey} oncontextmenu={(e) => { if (!allowNativeMenu(e)) e.preventDefault(); }} />
 
 <div class="app">
   <Sidebar />

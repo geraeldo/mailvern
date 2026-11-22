@@ -14,6 +14,7 @@ export const ui = $state({
   list: [] as Summary[],
   hasMore: false,
   listReady: false,
+  loadingOlder: false,
   selectedId: null as number | null,
   detail: null as Detail | null,
   detailLoading: false,
@@ -109,7 +110,38 @@ export async function loadList(reset = true) {
   if (q) ui.hasMore = false;
 }
 
+/** Views whose folders have no older mail left on the server. */
+const reachedStart = new Set<string>();
+const viewKey = (v: View) => (v.kind === "folder" ? `f${v.folderId}` : v.kind);
+
+/** Next page from the local cache; past its end, older mail from the server. */
+export async function loadMore() {
+  if (ui.query.trim() || ui.loadingOlder) return;
+  if (ui.hasMore) {
+    await loadList(false);
+    return;
+  }
+  const view = ui.view;
+  const key = viewKey(view);
+  if (reachedStart.has(key)) return;
+  ui.loadingOlder = true;
+  try {
+    const n = await api.loadOlder(view);
+    if (n === 0) reachedStart.add(key);
+    else if (viewKey(ui.view) === key) {
+      ui.hasMore = true;
+      await loadList(false);
+    }
+  } catch (e) {
+    toast(String(e));
+    reachedStart.add(key); // don't retry on every scroll; a view change resets this
+  } finally {
+    ui.loadingOlder = false;
+  }
+}
+
 export function setView(v: View) {
+  reachedStart.delete(viewKey(v));
   ui.view = v;
   ui.query = "";
   ui.list = [];

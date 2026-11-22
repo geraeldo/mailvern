@@ -85,6 +85,7 @@ export const api = {
   messages: (view: View, query: string | null, offset: number, limit: number) =>
     invoke<Summary[]>("messages", { view, query, offset, limit }),
   search: (query: string) => invoke<Summary[]>("search", { query }),
+  loadOlder: (view: View) => invoke<number>("load_older", { view }),
   unreadCount: () => invoke<number>("unread_count"),
   message: (id: number) => invoke<Detail>("message", { id }),
   setSeen: (ids: number[], seen: boolean) => invoke<void>("set_seen", { ids, seen }),

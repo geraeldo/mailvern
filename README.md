@@ -39,11 +39,12 @@ Append a new entry to `MIGRATIONS` in `crates/mail-core/src/db.rs`, for example 
 - The UI reads only from local SQLite. It never waits on the network to show a list.
 - One worker per account owns the IMAP connection. A second connection sits in IDLE on the inbox.
 - The newest 500 headers per folder sync first. Recent bodies download in the background.
+- Scrolling past the end of the local cache fetches the next 500 older headers from the server.
 - Read, flag, archive and delete update locally first, then go to the server.
 
 ## Sidebar
 
-Drag an account by its name, or a folder, to reorder. Custom folders below the last standard folder sit behind "More"; drag one higher to keep it visible. Right-click an account, or use its pencil icon, to edit it.
+Drag an account by its name, or a folder, to reorder. Custom folders below the last standard folder sit behind "More"; drag one higher to keep it visible. Right-click an account for Account Settings; right-click a message for reply, flag, archive and delete.
 
 ## Keyboard
 

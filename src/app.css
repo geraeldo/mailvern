@@ -120,9 +120,7 @@ button { cursor: default; }
 .field:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 
 .scroll { overflow-y: auto; overscroll-behavior: contain; }
-.scroll::-webkit-scrollbar { width: 10px; }
-.scroll::-webkit-scrollbar-thumb { background: transparent; border-radius: 10px; border: 3px solid transparent; background-clip: padding-box; }
-.scroll:hover::-webkit-scrollbar-thumb { background-color: var(--line-strong); }
+/* No custom scrollbar styling: macOS draws native overlay scrollbars that appear while scrolling. */
 
 .drag { -webkit-app-region: drag; }
 

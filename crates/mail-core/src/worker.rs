@@ -17,11 +17,15 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 const INITIAL_HEADERS: u32 = 500;
 const HEADER_ITEMS: &str = "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER])";
 const POLL_EVERY: Duration = Duration::from_secs(180);
+/// How many older headers to fetch each time the list reaches the end of the local cache.
+const BACKFILL: usize = 500;
 
 pub enum Cmd {
     SyncAll,
     SyncFolder(i64),
     FetchBody { folder_id: i64, uid: u32, reply: oneshot::Sender<Result<()>> },
+    /// Download headers older than anything held locally. Replies with how many arrived (0 = none left).
+    FetchOlder { folder_id: i64, reply: oneshot::Sender<Result<usize>> },
     Store { folder_id: i64, uids: Vec<u32>, flag: &'static str, add: bool },
     Move { folder_id: i64, uids: Vec<u32>, to_role: &'static str },
     Delete { folder_id: i64, uids: Vec<u32> },
@@ -102,6 +106,24 @@ impl Worker {
 
     /// Never triggers a full sync, so it is safe to call from inside one.
     async fn handle_quick(&mut self, mut cmd: Cmd) {
+        if let Cmd::FetchOlder { folder_id, reply } = cmd {
+            let had_session = self.session.is_some();
+            let mut res = self.fetch_older(folder_id).await;
+            if res.is_err() && had_session {
+                self.reset();
+                res = self.fetch_older(folder_id).await;
+            }
+            let res = match res {
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    self.fail(e);
+                    Err(anyhow!(msg))
+                }
+                ok => ok,
+            };
+            let _ = reply.send(res);
+            return;
+        }
         let reply = match &mut cmd {
             Cmd::FetchBody { reply, .. } => {
                 let (tx, _) = oneshot::channel();
@@ -226,8 +248,30 @@ impl Worker {
                 }
                 Ok(())
             }
-            Cmd::SyncAll | Cmd::SyncFolder(_) => Ok(()),
+            Cmd::SyncAll | Cmd::SyncFolder(_) | Cmd::FetchOlder { .. } => Ok(()),
         }
+    }
+
+    async fn fetch_older(&mut self, folder_id: i64) -> Result<usize> {
+        let (_, path, _) = self.db.folder(folder_id)?;
+        let (min_uid, _) = self.db.uid_range(folder_id)?;
+        if min_uid <= 1 {
+            return Ok(0);
+        }
+        self.select(&path).await?;
+        let s = self.ensure().await?;
+        let found = s.uid_search(format!("UID 1:{}", min_uid - 1)).await?;
+        let mut uids: Vec<u32> = found.into_iter().filter(|u| *u < min_uid).collect();
+        uids.sort_unstable();
+        let batch: Vec<u32> = uids.iter().rev().take(BACKFILL).copied().collect();
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        let fetches: Vec<Fetch> = s.uid_fetch(imap::uid_set(&batch), HEADER_ITEMS).await?.try_collect().await?;
+        let older = headers(&fetches, |uid| uid < min_uid);
+        self.db.insert_messages(self.account.id, folder_id, &older)?;
+        self.changed();
+        Ok(older.len())
     }
 
     async fn target_folder(&mut self, role: &str) -> Result<(i64, String)> {
@@ -320,18 +364,7 @@ impl Worker {
         } else {
             s.uid_fetch(format!("{}:*", max_uid + 1), HEADER_ITEMS).await?.try_collect().await?
         };
-        let new: Vec<NewMessage> = fetches
-            .iter()
-            .filter_map(|f| {
-                let uid = f.uid?;
-                if uid <= max_uid {
-                    return None;
-                }
-                let (seen, flagged) = imap::flags_of(f);
-                let internal = f.internal_date().map(|d| d.timestamp()).unwrap_or(0);
-                Some(parse::parse_header(uid, f.header().unwrap_or(b""), seen, flagged, f.size.unwrap_or(0), internal))
-            })
-            .collect();
+        let new = headers(&fetches, |uid| uid > max_uid);
 
         if !new.is_empty() {
             self.db.insert_messages(self.account.id, folder_id, &new)?;
@@ -394,6 +427,21 @@ impl Worker {
         }
         Ok(())
     }
+}
+
+fn headers(fetches: &[Fetch], keep: impl Fn(u32) -> bool) -> Vec<NewMessage> {
+    fetches
+        .iter()
+        .filter_map(|f| {
+            let uid = f.uid?;
+            if !keep(uid) {
+                return None;
+            }
+            let (seen, flagged) = imap::flags_of(f);
+            let internal = f.internal_date().map(|d| d.timestamp()).unwrap_or(0);
+            Some(parse::parse_header(uid, f.header().unwrap_or(b""), seen, flagged, f.size.unwrap_or(0), internal))
+        })
+        .collect()
 }
 
 /// Holds an IDLE connection on the inbox and asks the worker to sync on any change.

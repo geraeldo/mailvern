@@ -1,6 +1,7 @@
 <script lang="ts">
   import { api } from "../api";
   import { frameDoc } from "../html";
+  import { allowNativeMenu } from "../menus";
 
   let { html, allowRemote }: { html: string; allowRemote: boolean } = $props();
   let frame: HTMLIFrameElement;
@@ -19,6 +20,9 @@
     ro = new ResizeObserver(fit);
     ro.observe(d.body);
     d.querySelectorAll("img").forEach((img) => img.addEventListener("load", fit));
+    d.addEventListener("contextmenu", (e) => {
+      if (!allowNativeMenu(e, d)) e.preventDefault();
+    });
     d.addEventListener("click", (e) => {
       const a = (e.target as Element).closest?.("a");
       if (!a) return;

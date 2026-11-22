@@ -48,6 +48,11 @@ fn messages(engine: E, view: View, query: Option<String>, offset: i64, limit: i6
 }
 
 #[tauri::command]
+async fn load_older(engine: E<'_>, view: View) -> R<usize> {
+    engine.load_older(&view).await.map_err(err)
+}
+
+#[tauri::command]
 fn search(engine: E, query: String) -> R<Vec<MessageSummary>> {
     engine.search_all(&query).map_err(err)
 }
@@ -265,6 +270,7 @@ pub fn run() {
             folders,
             messages,
             search,
+            load_older,
             unread_count,
             message,
             set_seen,

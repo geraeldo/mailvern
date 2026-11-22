@@ -2,6 +2,7 @@
   import Icon from "./Icon.svelte";
   import { ui, setView, compose, openSettings, accountLabel, reorderAccounts, reorderFolders } from "../state.svelte";
   import { sortable } from "../sortable";
+  import { accountMenu } from "../menus";
   import { hint } from "../shortcuts.svelte";
   import { api, type Folder } from "../api";
 
@@ -60,7 +61,7 @@
               class="group-head"
               title={acc.email}
               onclick={() => (collapsed[acc.id] = !collapsed[acc.id])}
-              oncontextmenu={(e) => { e.preventDefault(); openSettings(acc.id); }}>
+              oncontextmenu={(e) => { e.preventDefault(); accountMenu(acc, !!collapsed[acc.id], () => (collapsed[acc.id] = !collapsed[acc.id])); }}>
               <span class="dot" style:background={acc.color || "var(--muted)"}></span>
               <span class="label">{accountLabel(acc)}</span>
               {#if st?.state === "error"}
@@ -68,7 +69,6 @@
               {/if}
               <span class="chev" class:open={!collapsed[acc.id]}><Icon name="chevron" size={12} stroke={2} /></span>
             </button>
-            <button class="edit" title="Edit account" onclick={() => openSettings(acc.id)}><Icon name="pencil" size={12} stroke={2} /></button>
           </div>
           {#if !collapsed[acc.id]}
             <div class="folders" use:sortable={{ item: ".item", onsort: (ids) => reorderFolders(acc.id, ids.map(Number)) }}>
@@ -159,25 +159,7 @@
   .item:global([data-dragging]) { background: var(--panel); }
   .group:global([data-dragging]) .group-head { background: var(--hover); }
   .head-row { position: relative; }
-  .head-row .group-head { padding-right: 30px; }
-  .edit {
-    position: absolute;
-    right: 4px;
-    top: 4px;
-    display: grid;
-    place-items: center;
-    width: 20px;
-    height: 20px;
-    padding: 0;
-    border: 0;
-    border-radius: 5px;
-    background: transparent;
-    color: var(--muted);
-    opacity: 0;
-    transition: opacity 0.12s;
-  }
-  .head-row:hover .edit { opacity: 1; }
-  .edit:hover { background: var(--active); color: var(--text); }
+
   .group-head { font-size: 12px; font-weight: 600; color: var(--muted); height: 28px; }
   .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; margin: 0 4px 0 4px; }
   .chev { display: grid; color: var(--muted); opacity: 0; transition: transform 0.15s, opacity 0.12s; }

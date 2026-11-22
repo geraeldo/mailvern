@@ -156,6 +156,45 @@ impl Engine {
         self.db.list(view, query, offset, limit)
     }
 
+    /// Fetches older mail from the server for the folders behind a view.
+    /// Returns how many messages arrived; 0 means the start of every folder was reached.
+    pub async fn load_older(&self, view: &View) -> Result<usize> {
+        let folders: Vec<(i64, i64)> = match view {
+            View::Unified => self
+                .db
+                .folders()?
+                .into_iter()
+                .filter(|f| f.role.as_deref() == Some("inbox"))
+                .map(|f| (f.account_id, f.id))
+                .collect(),
+            View::Folder { folder_id } => vec![(self.db.folder(*folder_id)?.0, *folder_id)],
+        };
+        let waits = folders.into_iter().filter_map(|(account_id, folder_id)| {
+            let (tx, rx) = oneshot::channel();
+            self.send_cmd(account_id, Cmd::FetchOlder { folder_id, reply: tx }).ok()?;
+            Some(async move {
+                match tokio::time::timeout(Duration::from_secs(120), rx).await {
+                    Ok(Ok(Ok(n))) => Ok(n),
+                    Ok(Ok(Err(e))) => Err(e),
+                    _ => Err(anyhow!("Timed out loading older mail")),
+                }
+            })
+        });
+        let results = futures::future::join_all(waits).await;
+        let mut total = 0;
+        let mut first_err = None;
+        for r in results {
+            match r {
+                Ok(n) => total += n,
+                Err(e) => first_err = first_err.or(Some(e)),
+            }
+        }
+        match (total, first_err) {
+            (0, Some(e)) => Err(e),
+            _ => Ok(total),
+        }
+    }
+
     pub fn search_all(&self, query: &str) -> Result<Vec<MessageSummary>> {
         self.db.search_all(query, 300)
     }
