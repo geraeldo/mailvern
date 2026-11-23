@@ -1,5 +1,5 @@
 import {
-  api, type Account, type Detail, type FileInfo, type Folder, type MailView, type OutboxItem, type Outgoing, type Summary, type View,
+  api, type Account, type Detail, type FileInfo, type Folder, type MailView, type OutboxItem, type Outgoing, type SearchScope, type Summary, type View,
 } from "./api";
 import { formatAddr } from "./format";
 import { textToHtml, unwrapEmail } from "./html";
@@ -38,6 +38,8 @@ export const ui = $state({
   detailLoading: false,
   detailError: null as string | null,
   query: "",
+  /** Where the search looks: starts at the open folder. */
+  searchScope: { kind: "all" } as SearchScope,
   searchingServer: false,
   compose: null as ComposeInit | null,
   /** App settings (shortcuts and, later, other preferences). */
@@ -89,6 +91,55 @@ export const unifiedRoles = [
   { role: "junk", name: "Junk" },
   { role: "trash", name: "Trash" },
 ];
+
+/** The search scope matching a view: that folder, or that standard folder across accounts. */
+export function scopeForView(v: View): SearchScope {
+  if (v.kind === "folder") return { kind: "folder", folderId: v.folderId };
+  if (v.kind === "unified") return { kind: "unified", role: v.role };
+  return { kind: "all" };
+}
+
+export const scopeKey = (s: SearchScope) =>
+  s.kind === "folder" ? `f${s.folderId}` : s.kind === "account" ? `a${s.accountId}` : s.kind === "unified" ? `u${s.role}` : "all";
+
+const unifiedPlural: Record<string, string> = { inbox: "All Inboxes", drafts: "All Drafts" };
+
+export function scopeLabel(s: SearchScope): string {
+  if (s.kind === "all") return "All Mailboxes";
+  if (s.kind === "account") {
+    const a = accountById(s.accountId);
+    return a ? accountLabel(a) : "Account";
+  }
+  if (s.kind === "unified") return unifiedPlural[s.role] ?? `All ${unifiedRoles.find((r) => r.role === s.role)?.name ?? s.role}`;
+  return folderById(s.folderId)?.name ?? "Folder";
+}
+
+/** Scopes offered while searching: everything, then narrower ones around the open view. */
+export function searchScopes(): SearchScope[] {
+  const out: SearchScope[] = [{ kind: "all" }];
+  const v = ui.view;
+  if (v.kind === "folder") {
+    const f = folderById(v.folderId);
+    if (f && ui.accounts.length > 1) out.push({ kind: "account", accountId: f.accountId });
+    out.push({ kind: "folder", folderId: v.folderId });
+  } else {
+    if (v.kind === "unified") out.push({ kind: "unified", role: v.role });
+    if (ui.accounts.length > 1) for (const a of ui.accounts) out.push({ kind: "account", accountId: a.id });
+  }
+  if (!out.some((s) => scopeKey(s) === scopeKey(ui.searchScope))) out.push(ui.searchScope);
+  return out;
+}
+
+export function setSearchScope(s: SearchScope) {
+  if (scopeKey(s) === scopeKey(ui.searchScope)) return;
+  ui.searchScope = s;
+  if (ui.query.trim()) setQuery(ui.query);
+}
+
+/** Search starts in the open folder. */
+export function beginSearch() {
+  if (!ui.query.trim()) ui.searchScope = scopeForView(ui.view);
+}
 
 export function viewTitle(): string {
   if (ui.query.trim()) return "Search";
@@ -172,8 +223,8 @@ export async function loadOutbox() {
   if (ui.view.kind === "outbox" && !ui.outbox.length) setView({ kind: "unified", role: "inbox" });
 }
 
-/** Server search results for the current query, kept so list refreshes don't ask again. */
-let remote: { q: string; rows: Summary[] } | null = null;
+/** Server search results for the current query and scope, kept so list refreshes don't ask again. */
+let remote: { q: string; scope: string; rows: Summary[] } | null = null;
 
 function mergeRows(a: Summary[], b: Summary[]): Summary[] {
   const seen = new Set(a.map((r) => r.id));
@@ -196,8 +247,9 @@ export async function loadList(reset = true) {
   let rows: Summary[];
   if (q) {
     if (!reset) return;
-    rows = await api.search(q);
-    if (remote?.q === q) rows = mergeRows(rows, remote.rows);
+    const scope = ui.searchScope;
+    rows = await api.search(q, scope);
+    if (remote?.q === q && remote.scope === scopeKey(scope)) rows = mergeRows(rows, remote.rows);
   } else {
     const limit = reset ? Math.max(PAGE, ui.list.length) : PAGE;
     rows = await api.messages(view, null, reset ? 0 : ui.list.length, limit, ui.threaded);
@@ -257,6 +309,12 @@ function clearOpen() {
 export function setView(v: View) {
   reachedStart.delete(viewKey(v));
   ui.view = v;
+  // Picking a folder while searching searches there instead.
+  if (ui.query.trim() && v.kind !== "outbox") {
+    ui.searchScope = scopeForView(v);
+    setQuery(ui.query);
+    return;
+  }
   ui.query = "";
   ui.list = [];
   ui.listReady = false;
@@ -282,16 +340,19 @@ export function setQuery(q: string) {
 
 async function searchServer(q: string) {
   if (!ui.accounts.length) return;
+  const scope = ui.searchScope;
+  const key = scopeKey(scope);
+  const current = () => ui.query.trim() === q && scopeKey(ui.searchScope) === key;
   ui.searchingServer = true;
   try {
-    const rows = await api.searchServer(q);
-    if (ui.query.trim() !== q) return;
-    remote = { q, rows };
+    const rows = await api.searchServer(q, scope);
+    if (!current()) return;
+    remote = { q, scope: key, rows };
     ui.list = mergeRows(ui.list, rows);
   } catch (e) {
-    if (ui.query.trim() === q) toast(`Server search failed: ${e}`);
+    if (current()) toast(`Server search failed: ${e}`);
   } finally {
-    if (ui.query.trim() === q) ui.searchingServer = false;
+    if (current()) ui.searchingServer = false;
   }
 }
 

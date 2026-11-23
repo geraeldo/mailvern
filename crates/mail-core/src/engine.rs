@@ -247,21 +247,35 @@ impl Engine {
         })
     }
 
-    pub fn search_all(&self, query: &str) -> Result<Vec<MessageSummary>> {
-        self.db.search_all(query, 300)
+    pub fn search(&self, query: &str, scope: &SearchScope) -> Result<Vec<MessageSummary>> {
+        self.db.search(query, scope, 300)
     }
 
-    /// Asks every account's server, which also finds mail never downloaded and words in
+    /// Asks the servers behind a scope, which also finds mail never downloaded and words in
     /// bodies not cached yet. Hits are stored locally; returns them newest first.
-    pub async fn search_server(&self, query: &str) -> Result<Vec<MessageSummary>> {
+    pub async fn search_server(&self, query: &str, scope: &SearchScope) -> Result<Vec<MessageSummary>> {
         let terms: Vec<String> = query.split_whitespace().map(|t| t.trim_matches('"').to_string()).filter(|t| !t.is_empty()).collect();
         if terms.is_empty() {
             return Ok(vec![]);
         }
         let accounts: Vec<i64> = self.workers.lock().unwrap().keys().copied().collect();
-        let waits = accounts.into_iter().filter_map(|acc| {
+        // Each account with the folders to search there (None: wherever the mail could be).
+        let targets: Vec<(i64, Option<Vec<i64>>)> = match scope {
+            SearchScope::All => accounts.into_iter().map(|a| (a, None)).collect(),
+            SearchScope::Account { account_id } => accounts.into_iter().filter(|a| a == account_id).map(|a| (a, None)).collect(),
+            SearchScope::Unified { role } => {
+                let view = View::Unified { role: role.clone() };
+                let mut by_account: HashMap<i64, Vec<i64>> = HashMap::new();
+                for (acc, folder) in self.view_folders(&view)? {
+                    by_account.entry(acc).or_default().push(folder);
+                }
+                by_account.into_iter().map(|(a, f)| (a, Some(f))).collect()
+            }
+            SearchScope::Folder { folder_id } => vec![(self.db.folder(*folder_id)?.0, Some(vec![*folder_id]))],
+        };
+        let waits = targets.into_iter().filter_map(|(acc, folders)| {
             let (tx, rx) = oneshot::channel();
-            self.send_cmd(acc, Cmd::Search { terms: terms.clone(), reply: tx }).ok()?;
+            self.send_cmd(acc, Cmd::Search { terms: terms.clone(), folders, reply: tx }).ok()?;
             Some(async move {
                 match tokio::time::timeout(Duration::from_secs(60), rx).await {
                     Ok(Ok(r)) => r,

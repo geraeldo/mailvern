@@ -136,6 +136,26 @@ pub enum View {
     },
 }
 
+/// Where a search looks.
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum SearchScope {
+    /// Every folder of every account.
+    #[default]
+    All,
+    /// Every folder of one account.
+    Account {
+        #[serde(rename = "accountId")]
+        account_id: i64,
+    },
+    /// One standard folder across every account.
+    Unified { role: String },
+    Folder {
+        #[serde(rename = "folderId")]
+        folder_id: i64,
+    },
+}
+
 fn inbox_role() -> String {
     "inbox".into()
 }

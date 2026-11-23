@@ -51,8 +51,9 @@ pub enum Cmd {
     DeleteDraft { message_id: String },
     /// Moves a snoozed message back to `to_path` as unread. Replies false if it's no longer in Snoozed.
     Unsnooze { message_id: String, to_path: String, reply: oneshot::Sender<Result<bool>> },
-    /// Searches the server. Replies with the local ids of the hits (stored if they weren't).
-    Search { terms: Vec<String>, reply: oneshot::Sender<Result<Vec<i64>>> },
+    /// Searches the server, in `folders` or wherever the mail could be.
+    /// Replies with the local ids of the hits (stored if they weren't).
+    Search { terms: Vec<String>, folders: Option<Vec<i64>>, reply: oneshot::Sender<Result<Vec<i64>>> },
 }
 
 impl Cmd {
@@ -178,11 +179,11 @@ impl Worker {
                 let _ = reply.send(res);
                 return;
             }
-            Cmd::Search { terms, reply } => {
+            Cmd::Search { terms, folders, reply } => {
                 let res = self
                     .retry(false, |w| {
-                        let t = terms.clone();
-                        Box::pin(async move { w.search(&t).await })
+                        let (t, f) = (terms.clone(), folders.clone());
+                        Box::pin(async move { w.search(&t, f.as_deref()).await })
                     })
                     .await;
                 let _ = reply.send(res);
@@ -426,12 +427,14 @@ impl Worker {
         Ok(true)
     }
 
-    /// Searches every folder that could hold the mail (just All Mail where there is one),
-    /// newest hits first, storing the ones not cached yet.
-    async fn search(&mut self, terms: &[String]) -> Result<Vec<i64>> {
+    /// Searches `only`, or else every folder that could hold the mail (just All Mail where
+    /// there is one), newest hits first, storing the ones not cached yet.
+    async fn search(&mut self, terms: &[String], only: Option<&[i64]>) -> Result<Vec<i64>> {
         let folders = self.db.account_folders(self.account.id)?;
         let all_mail: Vec<_> = folders.iter().filter(|f| f.2.as_deref() == Some("all")).cloned().collect();
-        let targets: Vec<_> = if all_mail.is_empty() {
+        let targets: Vec<_> = if let Some(only) = only {
+            folders.into_iter().filter(|f| only.contains(&f.0)).collect()
+        } else if all_mail.is_empty() {
             folders.into_iter().filter(|f| !matches!(f.2.as_deref(), Some("trash") | Some("junk"))).collect()
         } else {
             all_mail

@@ -37,6 +37,13 @@ type M = {
   id: number; accountId: number; folderId: number; fromName: string; fromAddr: string; subject: string; snippet: string;
   date: number; seen: boolean; flagged: boolean; hasAttachments: boolean; threadId: string | null; count: number; ids: number[]; snoozedUntil: number | null;
 };
+function inScope(m: M, s: any): boolean {
+  if (!s || s.kind === "all") return true;
+  if (s.kind === "account") return m.accountId === s.accountId;
+  if (s.kind === "folder") return m.folderId === s.folderId;
+  return folders.find((f) => f.id === m.folderId)?.role === s.role;
+}
+
 const messages: M[] = Array.from({ length: 64 }, (_, i) => {
   const p = people[i % people.length];
   const s = subjects[i % subjects.length];
@@ -125,7 +132,7 @@ export function installMock() {
       }
       case "search_server": {
         await new Promise((r) => setTimeout(r, 900));
-        return messages.filter((m) => m.snippet.toLowerCase().includes(args.query.toLowerCase())).slice(0, 5);
+        return messages.filter((m) => inScope(m, args.scope) && m.snippet.toLowerCase().includes(args.query.toLowerCase())).slice(0, 5);
       }
       case "archive": case "trash": case "junk": case "not_junk": case "move_to": case "snooze": case "unsnooze": {
         const dest = cmd === "snooze" ? 16 : cmd === "move_to" ? args.folderId : cmd === "archive" ? 13 : cmd === "trash" ? 15 : cmd === "junk" ? 14 : 10;
@@ -173,7 +180,7 @@ export function installMock() {
         }
         return 30;
       }
-      case "search": return messages.filter((m) => (m.subject + m.fromName + m.snippet).toLowerCase().includes(args.query.toLowerCase()));
+      case "search": return messages.filter((m) => inScope(m, args.scope) && (m.subject + m.fromName + m.snippet).toLowerCase().includes(args.query.toLowerCase()));
       case "badge_count": return messages.filter((m) => !m.seen).length;
       case "mark_badge_seen": return null;
       case "message": {

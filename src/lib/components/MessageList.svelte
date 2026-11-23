@@ -1,7 +1,8 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import Icon from "./Icon.svelte";
-  import { ui, openMessage, loadMore, viewTitle, setQuery, openAccountSettings, clickRow, isSelected, roleOf, editDraft, accountById } from "../state.svelte";
+  import { ui, openMessage, loadMore, viewTitle, setQuery, openAccountSettings, clickRow, isSelected, roleOf, editDraft, accountById,
+    beginSearch, searchScopes, scopeKey, scopeLabel, setSearchScope, setView } from "../state.svelte";
   import { hint } from "../shortcuts.svelte";
   import { messageMenu } from "../menus";
   import { shortDate, displayName } from "../format";
@@ -73,6 +74,9 @@
   }
 
   export function focusSearch() {
+    // Scheduled mail isn't searchable: search from the inboxes instead.
+    if (ui.view.kind === "outbox") setView({ kind: "unified", role: "inbox" });
+    if (!searchOpen) beginSearch();
     searchOpen = true;
     queueMicrotask(() => searchEl?.focus());
   }
@@ -101,7 +105,7 @@
               if (ui.list.length) openMessage(ui.list[0].id);
             }
           }}
-          placeholder="Search all mail"
+          placeholder="Search {scopeLabel(ui.searchScope)}"
           spellcheck="false" />
         <button class="icon-btn small" onclick={closeSearch} aria-label="Close search"><Icon name="x" size={14} /></button>
       </div>
@@ -110,6 +114,17 @@
       <button class="icon-btn" title={hint("Search", "search")} onclick={focusSearch}><Icon name="search" /></button>
     {/if}
   </header>
+  {#if searchOpen}
+    <div class="scopes" role="radiogroup" aria-label="Search in">
+      {#each searchScopes() as s (scopeKey(s))}
+        {@const on = scopeKey(s) === scopeKey(ui.searchScope)}
+        <button class="scope" class:on role="radio" aria-checked={on} onclick={() => setSearchScope(s)}>
+          {#if s.kind === "account"}<span class="dot" style:background={accountById(s.accountId)?.color || "var(--muted)"}></span>{/if}
+          {scopeLabel(s)}
+        </button>
+      {/each}
+    </div>
+  {/if}
 
   {#if ui.view.kind === "outbox"}
     <div class="scroll body">
@@ -229,6 +244,33 @@
   }
   .search input { flex: 1; min-width: 0; border: 0; outline: none; background: transparent; color: var(--text); }
   .icon-btn.small { width: 24px; height: 24px; }
+  .scopes {
+    flex: none;
+    display: flex;
+    gap: 6px;
+    padding: 0 12px 10px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .scopes::-webkit-scrollbar { display: none; }
+  .scope {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 24px;
+    padding: 0 10px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: transparent;
+    color: var(--muted);
+    font-size: 12px;
+    white-space: nowrap;
+    cursor: default;
+  }
+  .scope:hover { background: var(--hover); color: var(--text); }
+  .scope.on { background: var(--text); border-color: var(--text); color: var(--panel); }
+  .scope .dot { width: 7px; height: 7px; border-radius: 50%; }
   .body { flex: 1; position: relative; }
   .row {
     position: absolute;

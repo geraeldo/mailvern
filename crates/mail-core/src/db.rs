@@ -890,13 +890,19 @@ impl Db {
         Ok(rows)
     }
 
-    /// Searches every folder of every account.
-    pub fn search_all(&self, query: &str, limit: i64) -> Result<Vec<MessageSummary>> {
+    /// Searches the folders a scope covers, newest first.
+    pub fn search(&self, query: &str, scope: &SearchScope, limit: i64) -> Result<Vec<MessageSummary>> {
         let Some(fts) = fts_query(query) else { return Ok(vec![]) };
+        let filter = match scope {
+            SearchScope::All => "1".to_string(),
+            SearchScope::Account { account_id } => format!("m.account_id = {account_id}"),
+            SearchScope::Unified { role } => scope_sql(&View::Unified { role: role.clone() })?,
+            SearchScope::Folder { folder_id } => scope_sql(&View::Folder { folder_id: *folder_id })?,
+        };
         let c = self.c();
         let sql = format!(
             "SELECT {SUMMARY_COLS} FROM messages m JOIN messages_fts ON messages_fts.rowid = m.id
-             WHERE messages_fts MATCH ?1 ORDER BY m.date DESC LIMIT ?2"
+             WHERE {filter} AND messages_fts MATCH ?1 ORDER BY m.date DESC LIMIT ?2"
         );
         let mut st = c.prepare(&sql)?;
         let rows = st.query_map(params![fts, limit], row_to_summary)?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1316,6 +1322,31 @@ mod tests {
         db.insert_messages_as(acc, inbox, &[msg(499, true)], true).unwrap();
         db.insert_messages(acc, inbox, &[msg(499, true)]).unwrap();
         assert_eq!(db.uid_range(inbox).unwrap(), (499, 501));
+    }
+
+    #[test]
+    fn search_stays_in_its_scope() {
+        let db = Db::open(&temp_db()).unwrap();
+        let a = db.save_account(&account()).unwrap();
+        let b = db.save_account(&Account { email: "other@example.com".into(), ..account() }).unwrap();
+        let a_inbox = db.upsert_folder(a, "INBOX", "Inbox", Some("inbox")).unwrap();
+        let a_work = db.upsert_folder(a, "Work", "Work", None).unwrap();
+        let b_inbox = db.upsert_folder(b, "INBOX", "Inbox", Some("inbox")).unwrap();
+        let invoice = |uid| NewMessage { subject: "Invoice due".into(), ..msg(uid, true) };
+        db.insert_messages(a, a_inbox, &[invoice(1)]).unwrap();
+        db.insert_messages(a, a_work, &[invoice(2)]).unwrap();
+        db.insert_messages(b, b_inbox, &[invoice(3), msg(4, true)]).unwrap();
+
+        let hits = |scope: SearchScope| {
+            let mut f: Vec<i64> = db.search("invoice", &scope, 50).unwrap().into_iter().map(|m| m.folder_id).collect();
+            f.sort();
+            f
+        };
+        assert_eq!(hits(SearchScope::All), vec![a_inbox, a_work, b_inbox]);
+        assert_eq!(hits(SearchScope::Account { account_id: a }), vec![a_inbox, a_work]);
+        assert_eq!(hits(SearchScope::Unified { role: "inbox".into() }), vec![a_inbox, b_inbox]);
+        assert_eq!(hits(SearchScope::Folder { folder_id: a_work }), vec![a_work]);
+        assert!(db.search("invoice", &SearchScope::Unified { role: "bogus".into() }, 50).is_err());
     }
 
     #[test]

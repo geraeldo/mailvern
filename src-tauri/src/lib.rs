@@ -1,4 +1,4 @@
-use mail_core::model::{Account, Folder, MessageDetail, MessageSummary, Outgoing, OutboxItem, View};
+use mail_core::model::{Account, Folder, MessageDetail, MessageSummary, Outgoing, OutboxItem, SearchScope, View};
 use mail_core::Engine;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -53,8 +53,8 @@ fn thread(engine: E, id: i64) -> R<Vec<MessageSummary>> {
 }
 
 #[tauri::command]
-async fn search_server(engine: E<'_>, query: String) -> R<Vec<MessageSummary>> {
-    engine.search_server(&query).await.map_err(err)
+async fn search_server(engine: E<'_>, query: String, scope: Option<SearchScope>) -> R<Vec<MessageSummary>> {
+    engine.search_server(&query, &scope.unwrap_or_default()).await.map_err(err)
 }
 
 #[tauri::command]
@@ -78,8 +78,8 @@ async fn load_older(engine: E<'_>, view: View) -> R<usize> {
 }
 
 #[tauri::command]
-fn search(engine: E, query: String) -> R<Vec<MessageSummary>> {
-    engine.search_all(&query).map_err(err)
+fn search(engine: E, query: String, scope: Option<SearchScope>) -> R<Vec<MessageSummary>> {
+    engine.search(&query, &scope.unwrap_or_default()).map_err(err)
 }
 
 #[tauri::command]

@@ -45,8 +45,13 @@
   const syncing = $derived(Object.values(ui.status).some((s) => s.state === "syncing"));
   const errors = $derived(Object.entries(ui.status).filter(([, s]) => s.state === "error"));
 
-  const isActive = (f: Folder) => ui.view.kind === "folder" && ui.view.folderId === f.id && !ui.query;
-  const isUnifiedActive = (role: string) => ui.view.kind === "unified" && ui.view.role === role && !ui.query;
+  // While searching, the scope is what's highlighted.
+  const searching = $derived(!!ui.query.trim());
+  const isActive = (f: Folder) =>
+    searching ? ui.searchScope.kind === "folder" && ui.searchScope.folderId === f.id : ui.view.kind === "folder" && ui.view.folderId === f.id;
+  const isUnifiedActive = (role: string) =>
+    searching ? ui.searchScope.kind === "unified" && ui.searchScope.role === role : ui.view.kind === "unified" && ui.view.role === role;
+  const isAccountScope = (id: number) => searching && ui.searchScope.kind === "account" && ui.searchScope.accountId === id;
 
   function openFolderMenu(e: MouseEvent, view: MailView, unread: number) {
     e.preventDefault();
@@ -105,6 +110,7 @@
           <div class="head-row">
             <button
               class="group-head"
+              class:scoped={isAccountScope(acc.id)}
               title={acc.email}
               onclick={() => (collapsed[acc.id] = !collapsed[acc.id])}
               oncontextmenu={(e) => { e.preventDefault(); accountMenu(acc, !!collapsed[acc.id], () => (collapsed[acc.id] = !collapsed[acc.id])); }}>
@@ -215,6 +221,7 @@
   .head-row { position: relative; }
 
   .group-head { font-size: 12px; font-weight: 600; color: var(--muted); height: 28px; }
+  .group-head.scoped { background: var(--active); color: var(--text); }
   .group.all { margin-bottom: 8px; }
   .glyph { display: grid; place-items: center; width: 16px; flex: none; color: var(--muted); }
   .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; margin: 0 4px 0 4px; }

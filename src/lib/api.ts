@@ -66,6 +66,12 @@ export type Detail = Summary & {
 export type View = { kind: "unified"; role: string } | { kind: "folder"; folderId: number } | { kind: "outbox" };
 
 export type MailView = Exclude<View, { kind: "outbox" }>;
+/** Where a search looks. */
+export type SearchScope =
+  | { kind: "all" }
+  | { kind: "account"; accountId: number }
+  | { kind: "unified"; role: string }
+  | { kind: "folder"; folderId: number };
 
 export type FileInfo = { path: string; name: string; size: number };
 
@@ -105,8 +111,8 @@ export const api = {
   messages: (view: MailView, query: string | null, offset: number, limit: number, threaded = true) =>
     invoke<Summary[]>("messages", { view, query, offset, limit, threaded }),
   thread: (id: number) => invoke<Summary[]>("thread", { id }),
-  search: (query: string) => invoke<Summary[]>("search", { query }),
-  searchServer: (query: string) => invoke<Summary[]>("search_server", { query }),
+  search: (query: string, scope: SearchScope) => invoke<Summary[]>("search", { query, scope }),
+  searchServer: (query: string, scope: SearchScope) => invoke<Summary[]>("search_server", { query, scope }),
   loadOlder: (view: MailView) => invoke<number>("load_older", { view }),
   badgeCount: () => invoke<number>("badge_count"),
   markBadgeSeen: () => invoke<void>("mark_badge_seen"),
