@@ -57,7 +57,7 @@ Append a new entry to `MIGRATIONS` in `crates/mail-core/src/db.rs`, for example 
 
 ## AI
 
-Add an OpenRouter API key in Settings › AI and pick two models: one for search, one for writing. The key is stored in the Keychain (service "Mailvern", account "openrouter-api-key"). Calls go straight from the app to OpenRouter through [pi-ai](https://www.npmjs.com/package/@mariozechner/pi-ai). Only its OpenAI-compatible provider is used, and it loads the first time AI is used.
+Add an OpenRouter API key in Settings › Models and pick two models: one for search, one for writing. The key is stored in the Keychain (service "Mailvern", account "openrouter-api-key"). Calls go straight from the app to OpenRouter through [pi-ai](https://www.npmjs.com/package/@mariozechner/pi-ai). Only its OpenAI-compatible provider is used, and it loads the first time AI is used.
 
 - **Ask AI** (in search: `⌘↩`, or `↩` on a question ending in "?"): the search model works through read-only tools until it can answer. It can search with filters (sender, recipient, dates, unread, flagged, attachments, folder), also on the mail servers, count and group mail, read messages and whole conversations, and open attachments: PDF, Word, PowerPoint, Excel/CSV, forwarded emails, HTML, text and images. The answer fills the reader: a one-line answer, key facts and numbered citations (hover one to preview the email). The list shows the numbered sources. Opening a source shows the email with "‹ Answer" to go back. `Esc` goes back to the answer, then out of it. Ask follow-ups at the bottom; they keep what the model already read. The tools are in `src/lib/ai/search.svelte.ts`; attachment text comes from `crates/mail-core/src/extract.rs`.
 - **Rephrase** (the sparkle in the composer): rewrites the selection, or your whole message (everything above the signature and the quoted text). When replying, it also sends the conversation as context. Replace goes through the editor's undo, so `⌘Z` brings your text back.
@@ -66,7 +66,7 @@ Add an OpenRouter API key in Settings › AI and pick two models: one for search
 
 ## Coding agents (MCP)
 
-Turn on Settings › Agents to let coding agents on this Mac, such as Claude Code, Codex and Opencode, use Mailvern. It is off by default. The page gives a one-line setup command for each agent.
+Turn on Settings › Agent access to let coding agents on this Mac, such as Claude Code, Codex and Opencode, use Mailvern. It is off by default. The page gives a one-line setup command for each agent.
 
 - The app serves MCP over HTTP at `http://127.0.0.1:47823/mcp`, only on this Mac and only while it is open. Every request needs the access token from the setup command. Reset the token in Settings to cut off every agent. Agents keep their own copy of the token, so after a reset run the setup command again; it replaces the old entry.
 - Agents can list accounts and folders, search (also on the mail servers), count, read messages and conversations, read attachments or save them to a temp folder, and save drafts: new messages and replies, with files attached by path. A draft gets the account's signature and, for a reply, the quoted original, and shows up in Drafts to edit and send.

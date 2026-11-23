@@ -72,7 +72,7 @@ let cachedKey: string | null = null;
 /** The key, read from the Keychain once per launch. */
 export async function apiKey(): Promise<string> {
   if (!cachedKey) cachedKey = await api.aiKey();
-  if (!cachedKey) throw new Error("Add an OpenRouter API key in Settings › AI.");
+  if (!cachedKey) throw new Error("Add an OpenRouter API key in Settings › Models.");
   return cachedKey;
 }
 

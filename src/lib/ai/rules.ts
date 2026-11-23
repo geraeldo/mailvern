@@ -174,7 +174,7 @@ Work like this, in a few steps:
 /** Turns a description into a rule. Throws with a reason when it can't. */
 export async function describeRule(description: string, opts: DescribeOptions = {}): Promise<Rule> {
   const model = ai.search;
-  if (!model) throw new Error("Choose a search model in Settings › AI.");
+  if (!model) throw new Error("Choose a search model in Settings › Models.");
   const folders = folderChoices();
   const names = [...folders.keys()];
   const steps: RuleStep[] = [];

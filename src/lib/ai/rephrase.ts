@@ -118,7 +118,7 @@ export async function rephrase(
   signal: AbortSignal,
 ): Promise<string> {
   const model = ai.write;
-  if (!model) throw new Error("Choose a writing model in Settings › AI.");
+  if (!model) throw new Error("Choose a writing model in Settings › Models.");
   const key = await apiKey();
   const { html: input, images } = prepare(html);
   if (!htmlToPlain(input).trim()) throw new Error("There's no text to rephrase yet.");

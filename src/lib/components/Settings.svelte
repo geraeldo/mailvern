@@ -13,8 +13,8 @@
   const sections: { id: SettingsSection; label: string; icon: string }[] = [
     { id: "general", label: "General", icon: "settings" },
     { id: "rules", label: "Rules", icon: "filter" },
-    { id: "ai", label: "AI", icon: "sparkle" },
-    { id: "agents", label: "Agents", icon: "code" },
+    { id: "ai", label: "Models", icon: "sparkle" },
+    { id: "agents", label: "Agent access", icon: "code" },
     { id: "shortcuts", label: "Shortcuts", icon: "keyboard" },
   ];
 

@@ -57,11 +57,11 @@
       return;
     }
     if (!ai.hasKey) {
-      toast("Add an OpenRouter key in Settings › AI");
+      toast("Add an OpenRouter key in Settings › Models");
       return;
     }
     if (!writeReady()) {
-      toast("Choose a writing model in Settings › AI");
+      toast("Choose a writing model in Settings › Models");
       return;
     }
     if (!editor) return;

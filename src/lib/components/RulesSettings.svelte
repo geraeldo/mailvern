@@ -271,7 +271,7 @@
   .meta { width: 100%; font-size: 12px; color: var(--muted); }
   .act > .meta { width: auto; }
 
-  /* A switch, drawn on the native checkbox (as in Agents). */
+  /* A switch, drawn on the native checkbox (as in Agent access). */
   input[role="switch"] {
     appearance: none;
     flex: none;
