@@ -331,6 +331,16 @@ impl Engine {
         self.move_role(ids, "trash")
     }
 
+    /// Moves to the Junk folder. On Gmail, iCloud, Fastmail and others this also trains their spam filter.
+    pub fn junk(&self, ids: &[i64]) -> Result<()> {
+        self.move_role(ids, "junk")
+    }
+
+    /// "Not Junk": moves messages back to the inbox.
+    pub fn not_junk(&self, ids: &[i64]) -> Result<()> {
+        self.move_role(ids, "inbox")
+    }
+
     fn notify_changed(&self, ids: &[i64]) {
         if let Some(id) = ids.first() {
             if let Ok((acc, ..)) = self.db.locate(*id) {

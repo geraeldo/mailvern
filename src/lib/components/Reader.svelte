@@ -1,7 +1,7 @@
 <script lang="ts">
   import Icon from "./Icon.svelte";
   import MailFrame from "./MailFrame.svelte";
-  import { ui, compose, archiveSelected, trashSelected, toggleSeen, toggleFlag, accountById, accountLabel, trustSender, toast } from "../state.svelte";
+  import { ui, compose, archiveSelected, trashSelected, toggleJunk, folderById, toggleSeen, toggleFlag, accountById, accountLabel, trustSender, toast } from "../state.svelte";
   import { hint } from "../shortcuts.svelte";
   import { api, type Addr } from "../api";
   import { longDate, displayName, initials, colorFor, fileSize } from "../format";
@@ -15,6 +15,7 @@
   const trusted = $derived(!!d && ui.trustedSenders.includes(d.fromAddr.toLowerCase()));
   const allowRemote = $derived(!!d && (trusted || showImagesFor === d.id));
   const row = $derived(ui.list.find((m) => m.id === ui.selectedId));
+  const isJunk = $derived(!!d && folderById(d.folderId)?.role === "junk");
 
   function names(list: Addr[]) {
     const me = new Set(ui.accounts.map((a) => a.email.toLowerCase()));
@@ -50,6 +51,11 @@
         <span class="sep"></span>
         <button class="icon-btn" title={hint("Archive", "archive")} onclick={archiveSelected}><Icon name="archive" size={17} /></button>
         <button class="icon-btn" title={hint("Delete", "delete")} onclick={trashSelected}><Icon name="trash" size={17} /></button>
+        {#if isJunk}
+          <button class="icon-btn" title={hint("Not junk", "junk")} onclick={toggleJunk}><Icon name="inbox" size={17} /></button>
+        {:else}
+          <button class="icon-btn" title={hint("Move to junk", "junk")} onclick={toggleJunk}><Icon name="junk" size={17} /></button>
+        {/if}
         <span class="sep"></span>
         <button class="icon-btn" class:on={row && !row.seen} title={hint("Mark as unread", "toggleUnread")} onclick={toggleSeen}><Icon name="unread" size={17} /></button>
         <button class="icon-btn" class:flagged={row?.flagged} title={hint("Flag", "toggleFlag")} onclick={toggleFlag}><Icon name="flag" size={17} /></button>

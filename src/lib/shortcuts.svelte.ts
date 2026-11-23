@@ -1,7 +1,7 @@
 import { api } from "./api";
 
 export type Action =
-  | "next" | "prev" | "reply" | "replyAll" | "forward" | "compose" | "archive" | "delete"
+  | "next" | "prev" | "reply" | "replyAll" | "forward" | "compose" | "archive" | "delete" | "junk"
   | "toggleUnread" | "toggleFlag" | "search" | "sync" | "settings" | "send";
 
 export const ACTIONS: { id: Action; label: string; group: string }[] = [
@@ -15,6 +15,7 @@ export const ACTIONS: { id: Action; label: string; group: string }[] = [
   { id: "send", label: "Send", group: "Write" },
   { id: "archive", label: "Archive", group: "Organize" },
   { id: "delete", label: "Delete", group: "Organize" },
+  { id: "junk", label: "Junk / Not junk", group: "Organize" },
   { id: "toggleUnread", label: "Mark read / unread", group: "Organize" },
   { id: "toggleFlag", label: "Flag", group: "Organize" },
   { id: "sync", label: "Check for mail", group: "App" },
@@ -32,6 +33,7 @@ export const DEFAULTS: Record<Action, string[]> = {
   send: ["mod+enter"],
   archive: ["e"],
   delete: ["#", "backspace", "delete", "mod+backspace"],
+  junk: ["mod+shift+j"],
   toggleUnread: ["u"],
   toggleFlag: ["s"],
   sync: ["mod+r"],

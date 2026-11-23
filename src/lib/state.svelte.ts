@@ -262,6 +262,22 @@ export function trashSelected() {
   if (id != null) run(api.trash([id])).then(() => toast("Deleted"));
 }
 
+/** True when the open message sits in a Junk folder, so the junk action means "Not Junk". */
+export function selectedIsJunk(): boolean {
+  const row = ui.list.find((m) => m.id === ui.selectedId);
+  const fid = row?.folderId ?? ui.detail?.folderId;
+  return fid != null && folderById(fid)?.role === "junk";
+}
+
+/** Moves the open message to Junk, or back to the Inbox if it's already in Junk. */
+export function toggleJunk() {
+  const notJunk = selectedIsJunk();
+  const id = removeSelected();
+  if (id == null) return;
+  if (notJunk) run(api.notJunk([id])).then(() => toast("Moved to Inbox"));
+  else run(api.junk([id])).then(() => toast("Moved to Junk"));
+}
+
 export function toggleSeen() {
   const row = ui.list.find((m) => m.id === ui.selectedId);
   if (!row) return;

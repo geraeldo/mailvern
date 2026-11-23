@@ -299,6 +299,7 @@ impl Worker {
         let name = match role {
             "archive" => "Archive",
             "trash" => "Trash",
+            "junk" => "Junk",
             other => return Err(anyhow!("No {other} folder")),
         };
         let s = self.ensure().await?;

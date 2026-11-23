@@ -13,7 +13,7 @@
   import { allowNativeMenu } from "./lib/menus";
   import {
     ui, loadAccounts, loadFolders, loadList, loadTrusted, move, compose,
-    archiveSelected, trashSelected, toggleSeen, toggleFlag, accountById, openSettings, openAccountSettings,
+    archiveSelected, trashSelected, toggleJunk, toggleSeen, toggleFlag, accountById, openSettings, openAccountSettings,
   } from "./lib/state.svelte";
   import { keymap, comboOf, match, canFireWhileTyping, usesModifier, loadShortcuts, type Action } from "./lib/shortcuts.svelte";
 
@@ -76,6 +76,7 @@
     compose: () => compose(),
     archive: archiveSelected,
     delete: trashSelected,
+    junk: toggleJunk,
     toggleUnread: toggleSeen,
     toggleFlag: toggleFlag,
     search: () => list?.focusSearch(),

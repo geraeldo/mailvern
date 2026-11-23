@@ -93,6 +93,16 @@ fn trash(engine: E, ids: Vec<i64>) -> R<()> {
 }
 
 #[tauri::command]
+fn junk(engine: E, ids: Vec<i64>) -> R<()> {
+    engine.junk(&ids).map_err(err)
+}
+
+#[tauri::command]
+fn not_junk(engine: E, ids: Vec<i64>) -> R<()> {
+    engine.not_junk(&ids).map_err(err)
+}
+
+#[tauri::command]
 async fn send(engine: E<'_>, message: Outgoing) -> R<()> {
     engine.send(message).await.map_err(err)
 }
@@ -313,6 +323,8 @@ pub fn run() {
             set_flagged,
             archive,
             trash,
+            junk,
+            not_junk,
             send,
             sync_now,
             get_setting,

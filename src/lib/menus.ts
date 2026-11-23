@@ -2,7 +2,7 @@ import { Menu } from "@tauri-apps/api/menu";
 import type { Account, Summary, View } from "./api";
 import { api } from "./api";
 import {
-  ui, openAccountSettings, openMessage, compose, archiveSelected, trashSelected, toggleSeen, toggleFlag, markAllRead,
+  ui, openAccountSettings, openMessage, compose, archiveSelected, trashSelected, toggleJunk, selectedIsJunk, toggleSeen, toggleFlag, markAllRead,
 } from "./state.svelte";
 
 type Item = { text: string; action: () => void; enabled?: boolean } | "-";
@@ -44,6 +44,7 @@ export async function messageMenu(m: Summary) {
     "-",
     { text: "Archive", action: archiveSelected },
     { text: "Delete", action: trashSelected },
+    { text: selectedIsJunk() ? "Not Junk" : "Move to Junk", action: toggleJunk },
   ]);
 }
 
