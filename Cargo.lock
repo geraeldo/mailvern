@@ -2051,6 +2051,7 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
+ "httpdate",
  "itoa",
  "pin-project-lite",
  "smallvec",
@@ -2743,6 +2744,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "mail-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "mail-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "mail-parser"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2759,6 +2776,7 @@ dependencies = [
  "base64 0.22.1",
  "dirs 6.0.0",
  "mail-core",
+ "mail-mcp",
  "serde",
  "serde_json",
  "tauri",

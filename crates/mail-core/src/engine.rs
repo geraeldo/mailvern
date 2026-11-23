@@ -60,6 +60,23 @@ impl Engine {
         })
     }
 
+    /// Adds an account with folders (path, role, raw messages) as a sync would have stored
+    /// them, without a mail server. For tests and demos of code built on the engine.
+    #[doc(hidden)]
+    pub fn seed(&self, account: &Account, folders: &[(&str, Option<&str>, Vec<&[u8]>)]) -> Result<i64> {
+        let id = self.db.save_account(account)?;
+        for (path, role, messages) in folders {
+            let folder_id = self.db.upsert_folder(id, path, path, *role)?;
+            for (i, raw) in messages.iter().enumerate() {
+                let uid = i as u32 + 1;
+                let header = parse::parse_header(uid, raw, i % 2 == 0, false, raw.len() as u32, now() - 3600 * (messages.len() - i) as i64);
+                self.db.insert_messages(id, folder_id, &[header])?;
+                self.db.store_body(folder_id, uid, raw, &parse::body_info(raw))?;
+            }
+        }
+        Ok(id)
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.events.subscribe()
     }

@@ -106,7 +106,7 @@ fn is_text(mime: &str, ext: &str) -> bool {
 }
 
 /// Collapses runs of blank lines and trailing spaces left by extraction.
-fn tidy(s: &str) -> String {
+pub(crate) fn tidy(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut blank = 0;
     for line in s.lines() {
@@ -276,15 +276,57 @@ fn spreadsheet_text(bytes: &[u8]) -> Result<(String, usize)> {
 
 /// Readable text from HTML: no scripts or styles, line breaks at block ends.
 pub fn html_text(html: &str) -> String {
+    html_plain(html, false)
+}
+
+/// The value of attribute `name` in the inside of a tag (`a href="…" class="…"`).
+fn attr(tag: &str, name: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(i) = lower[from..].find(name) {
+        let at = from + i;
+        from = at + name.len();
+        let rest = tag[from..].trim_start();
+        if at == 0 || !lower.as_bytes()[at - 1].is_ascii_whitespace() || !rest.starts_with('=') {
+            continue;
+        }
+        let v = rest[1..].trim_start();
+        let val = match v.chars().next() {
+            Some(q @ ('"' | '\'')) => v[1..].split(q).next().unwrap_or(""),
+            _ => v.split(char::is_whitespace).next().unwrap_or(""),
+        };
+        return Some(unescape_xml(val.trim()));
+    }
+    None
+}
+
+/// `html_text`, and with `links` also where links go and what images are (their alt text),
+/// which a reader of mail needs: "click here" is useless without the address.
+pub(crate) fn html_plain(html: &str, links: bool) -> String {
     let mut out = String::new();
     let mut rest = html;
     let mut skip_until: Option<&str> = None;
+    // The link being read: its address and where its text starts in `out`.
+    let mut link: Option<(String, usize)> = None;
     while let Some(lt) = rest.find('<') {
         if skip_until.is_none() {
             out.push_str(&unescape_xml(&rest[..lt]).replace(['\n', '\r'], " "));
         }
-        let Some(gt) = rest[lt..].find('>') else { break };
-        let tag = rest[lt + 1..lt + gt].to_ascii_lowercase();
+        // Comments can hold tags (Outlook's conditional blocks), so they end at "-->" only.
+        if rest[lt..].starts_with("<!--") {
+            let Some(end) = rest[lt..].find("-->") else { return finish(out) };
+            rest = &rest[lt + end + 3..];
+            continue;
+        }
+        let Some(gt) = rest[lt..].find('>') else {
+            // A "<" that opens no tag is just text.
+            if skip_until.is_none() {
+                out.push_str(&unescape_xml(&rest[lt..]));
+            }
+            return finish(out);
+        };
+        let raw = &rest[lt + 1..lt + gt];
+        let tag = raw.to_ascii_lowercase();
         rest = &rest[lt + gt + 1..];
         let closing = tag.starts_with('/');
         let name = tag.trim_start_matches('/').split(|c: char| c.is_whitespace() || c == '/').next().unwrap_or("").to_string();
@@ -299,6 +341,22 @@ pub fn html_text(html: &str) -> String {
             "style" if !closing => skip_until = Some("style"),
             "head" if !closing => skip_until = Some("head"),
             "br" => out.push('\n'),
+            "a" if links && !closing => {
+                link = attr(raw, "href").filter(|h| h.starts_with("http://") || h.starts_with("https://")).map(|h| (h, out.len()));
+            }
+            "a" if links => {
+                if let Some((href, start)) = link.take() {
+                    let text = out[start..].trim();
+                    if !text.is_empty() && !href.contains(text) && !text.contains(href.as_str()) {
+                        out.push_str(&format!(" ({href})"));
+                    }
+                }
+            }
+            "img" if links => {
+                if let Some(alt) = attr(raw, "alt").filter(|a| !a.trim().is_empty()) {
+                    out.push_str(&format!("[image: {}]", alt.trim()));
+                }
+            }
             "td" | "th" if closing => out.push_str(" | "),
             "li" if !closing => out.push_str("\n• "),
             "p" | "div" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "li" | "blockquote" | "table" | "section" | "article" | "header" | "footer" => {
@@ -310,6 +368,10 @@ pub fn html_text(html: &str) -> String {
     if skip_until.is_none() {
         out.push_str(&unescape_xml(rest));
     }
+    finish(out)
+}
+
+fn finish(out: String) -> String {
     let lines: Vec<String> = out.lines().map(|l| l.split_whitespace().collect::<Vec<_>>().join(" ")).collect();
     tidy(&lines.join("\n"))
 }
@@ -397,6 +459,13 @@ mod tests {
         let t = html_text("<html><head><title>x</title></head><body><style>p{}</style><p>Hi&nbsp;Budi,</p><table><tr><td>Item</td><td>Rp&#160;10</td></tr></table><script>alert(1)</script>Bye</body></html>");
         assert_eq!(t, "Hi Budi,\n\nItem | Rp 10 |\n\nBye");
         assert_eq!(unescape_xml("a &lt;b&gt; &#x41; & c"), "a <b> A & c");
+    }
+
+    #[test]
+    fn links_images_and_comments() {
+        let html = r#"<p>Pay <A class=x HREF="https://pay.example.com/?a=1&amp;b=2">here</a> or see <a href="https://example.com">https://example.com</a>.</p><!--[if mso]><v:rect>Button</v:rect><![endif]--><img src="x.png" alt="Logo"><a href="mailto:a@b.co">mail</a>"#;
+        assert_eq!(html_plain(html, true), "Pay here (https://pay.example.com/?a=1&b=2) or see https://example.com.\n[image: Logo]mail");
+        assert_eq!(html_text(html), "Pay here or see https://example.com.\nmail");
     }
 
     #[test]

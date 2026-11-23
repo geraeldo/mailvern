@@ -127,6 +127,9 @@ export type OutboxItem = { id: number; accountId: number; message: Outgoing; sen
 
 export type Cancelled = { message: Outgoing; attachments: FileInfo[] };
 
+/** Whether coding agents on this Mac may connect (the MCP server), and how. */
+export type AgentAccess = { enabled: boolean; running: boolean; url: string; token: string | null; error: string | null };
+
 export type MailEvent =
   | { kind: "changed"; accountId: number }
   | { kind: "status"; accountId: number; state: "syncing" | "idle" | "error"; message: string | null }
@@ -187,4 +190,7 @@ export const api = {
   contacts: (query: string) => invoke<Addr[]>("contacts", { query }),
   openUrl: (url: string) => invoke<void>("open_url", { url }),
   readImage: (path: string) => invoke<string>("read_image", { path }),
+  agentAccess: () => invoke<AgentAccess>("agent_access"),
+  setAgentAccess: (enabled: boolean) => invoke<AgentAccess>("set_agent_access", { enabled }),
+  resetAgentToken: () => invoke<AgentAccess>("reset_agent_token"),
 };

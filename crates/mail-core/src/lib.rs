@@ -6,6 +6,7 @@ pub mod model;
 mod parse;
 pub mod secrets;
 mod smtp;
+pub mod text;
 mod worker;
 
 pub use engine::Engine;

@@ -317,6 +317,14 @@ export function installMock() {
       case "plugin:event|listen": return 1;
       case "plugin:menu|new": return [1, "menu"];
       case "plugin:menu|popup": (window as any).__lastMenu = args; return null;
+      case "agent_access":
+      case "set_agent_access":
+      case "reset_agent_token": {
+        if (cmd === "set_agent_access") settings.mcp_enabled = args.enabled ? "on" : "off";
+        if (cmd !== "agent_access") settings.mcp_token = cmd === "reset_agent_token" || !settings.mcp_token ? `mv_${crypto.randomUUID().replaceAll("-", "")}` : settings.mcp_token;
+        const enabled = settings.mcp_enabled === "on";
+        return { enabled, running: enabled, url: "http://127.0.0.1:47823/mcp", token: enabled ? settings.mcp_token : null, error: null };
+      }
       case "copy_text": (window as any).__copied = args.text; return navigator.clipboard?.writeText(args.text).catch(() => {});
       default: return null;
     }

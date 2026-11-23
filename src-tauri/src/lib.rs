@@ -8,6 +8,8 @@ use tauri::{Emitter, Manager, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
 
+mod agents;
+
 type E<'a> = State<'a, Arc<Engine>>;
 type R<T> = Result<T, String>;
 
@@ -444,12 +446,14 @@ pub fn run() {
                 }
             };
             app.manage(engine.clone());
+            app.manage(agents::Agents::default());
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = engine.start() {
                     eprintln!("start failed: {e:#}");
                 }
+                handle.state::<agents::Agents>().apply(&engine).await;
                 let mut rx = engine.subscribe();
                 loop {
                     match rx.recv().await {
@@ -513,6 +517,9 @@ pub fn run() {
             contacts,
             read_image,
             open_url,
+            agents::agent_access,
+            agents::set_agent_access,
+            agents::reset_agent_token,
         ])
         // Like other Mac mail apps: closing the window (⌘W, red button) only hides it,
         // so sync and notifications keep running. ⌘Q still quits.

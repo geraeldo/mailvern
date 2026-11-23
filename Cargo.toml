@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/mail-core", "src-tauri"]
+members = ["crates/mail-core", "crates/mail-mcp", "src-tauri"]
 
 [profile.release]
 lto = true

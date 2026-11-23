@@ -4,12 +4,14 @@
   import Shortcuts from "./Shortcuts.svelte";
   import General from "./General.svelte";
   import AISettings from "./AISettings.svelte";
+  import AgentSettings from "./AgentSettings.svelte";
   import { ui, type SettingsSection } from "../state.svelte";
 
   // App-wide preferences. Account settings live in AccountSettings.
   const sections: { id: SettingsSection; label: string; icon: string }[] = [
     { id: "general", label: "General", icon: "settings" },
     { id: "ai", label: "AI", icon: "sparkle" },
+    { id: "agents", label: "Agents", icon: "code" },
     { id: "shortcuts", label: "Shortcuts", icon: "keyboard" },
   ];
 
@@ -40,6 +42,8 @@
       <General />
     {:else if current.id === "ai"}
       <AISettings />
+    {:else if current.id === "agents"}
+      <AgentSettings />
     {:else if current.id === "shortcuts"}
       <Shortcuts />
     {/if}

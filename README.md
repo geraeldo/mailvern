@@ -4,6 +4,7 @@ A fast, simple IMAP mail client for macOS.
 
 - Rust core (`crates/mail-core`): IMAP sync, IDLE push, SQLite cache with full-text search, SMTP sending.
 - Tauri 2 shell (`src-tauri`) with a Svelte UI (`src`).
+- MCP server (`crates/mail-mcp`) inside the app, so coding agents on this Mac can search mail and save drafts.
 - Passwords are stored in the macOS Keychain (service "Mailvern"), never in the database.
 
 ## Run
@@ -61,6 +62,21 @@ Add an OpenRouter API key in Settings › AI and pick two models: one for search
 - **Rephrase** (the sparkle in the composer): rewrites the selection, or your whole message (everything above the signature and the quoted text). When replying, it also sends the conversation as context. Replace goes through the editor's undo, so `⌘Z` brings your text back.
 - "Only use providers that don't store or train on requests" (on by default) asks OpenRouter to skip providers that keep data.
 - The AI can't send, move or delete mail. Mail content is treated as data, never as instructions.
+
+## Coding agents (MCP)
+
+Turn on Settings › Agents to let coding agents on this Mac, such as Claude Code and Opencode, use Mailvern. It is off by default. The page gives a one-line setup command for each agent.
+
+- The app serves MCP over HTTP at `http://127.0.0.1:47823/mcp`, only on this Mac and only while it is open. Every request needs the access token from the setup command. Reset the token in Settings to cut off every agent.
+- Agents can list accounts and folders, search (also on the mail servers), count, read messages and conversations, read attachments or save them to a temp folder, and save drafts: new messages and replies, with files attached by path. A draft gets the account's signature and, for a reply, the quoted original, and shows up in Drafts to edit and send.
+- Agents can't send, move, delete or mark mail. Mail is untrusted text and agents can run commands, so a person reads every draft before it goes out. An agent can replace only drafts it made since the app started, and hidden files (keys, `.env`) can't be attached.
+- The tools are in `crates/mail-mcp/src/tools.rs`. The server shares the app's engine, so there is still one IMAP connection per account and the UI shows changes at once.
+
+To try an agent against a made-up mailbox instead of real mail:
+
+```bash
+cargo run -p mail-mcp --example serve
+```
 
 ## Sidebar
 
