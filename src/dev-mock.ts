@@ -88,7 +88,7 @@ export function installMock() {
         return null;
       case "messages": {
         const v = args.view;
-        const rows = messages.filter((m) => (v.kind === "unified" ? m.folderId % 10 === 0 : m.folderId === v.folderId));
+        const rows = messages.filter((m) => (v.kind === "unified" ? folders.find((f) => f.id === m.folderId)?.role === v.role : m.folderId === v.folderId));
         return rows.slice(args.offset, args.offset + args.limit);
       }
       case "load_older": {
@@ -119,6 +119,13 @@ export function installMock() {
           text: null,
           attachments: m.hasAttachments ? [{ index: 0, filename: "Q4-agenda.pdf", mime: "application/pdf", size: 284_000 }, { index: 1, filename: "budget.xlsx", mime: "application/vnd.ms-excel", size: 48_200 }] : [],
         };
+      }
+      case "mark_read": {
+        const v = args.view;
+        const hit = (fid: number) => (v.kind === "unified" ? folders.find((f) => f.id === fid)?.role === v.role : fid === v.folderId);
+        for (const m of messages) if (hit(m.folderId)) m.seen = true;
+        refreshCounts();
+        return null;
       }
       case "set_seen":
         for (const id of args.ids) { const m = messages.find((x) => x.id === id); if (m) m.seen = args.seen; }

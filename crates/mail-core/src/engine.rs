@@ -159,16 +159,7 @@ impl Engine {
     /// Fetches older mail from the server for the folders behind a view.
     /// Returns how many messages arrived; 0 means the start of every folder was reached.
     pub async fn load_older(&self, view: &View) -> Result<usize> {
-        let folders: Vec<(i64, i64)> = match view {
-            View::Unified => self
-                .db
-                .folders()?
-                .into_iter()
-                .filter(|f| f.role.as_deref() == Some("inbox"))
-                .map(|f| (f.account_id, f.id))
-                .collect(),
-            View::Folder { folder_id } => vec![(self.db.folder(*folder_id)?.0, *folder_id)],
-        };
+        let folders = self.view_folders(view)?;
         let waits = folders.into_iter().filter_map(|(account_id, folder_id)| {
             let (tx, rx) = oneshot::channel();
             self.send_cmd(account_id, Cmd::FetchOlder { folder_id, reply: tx }).ok()?;
@@ -193,6 +184,20 @@ impl Engine {
             (0, Some(e)) => Err(e),
             _ => Ok(total),
         }
+    }
+
+    /// (account, folder) pairs behind a view.
+    fn view_folders(&self, view: &View) -> Result<Vec<(i64, i64)>> {
+        Ok(match view {
+            View::Unified { role } => self
+                .db
+                .folders()?
+                .into_iter()
+                .filter(|f| f.role.as_deref() == Some(role.as_str()))
+                .map(|f| (f.account_id, f.id))
+                .collect(),
+            View::Folder { folder_id } => vec![(self.db.folder(*folder_id)?.0, *folder_id)],
+        })
     }
 
     pub fn search_all(&self, query: &str) -> Result<Vec<MessageSummary>> {
@@ -266,6 +271,22 @@ impl Engine {
             self.send_cmd(acc, Cmd::Store { folder_id, uids, flag: "\\Seen", add: seen })?;
         }
         self.notify_changed(ids);
+        Ok(())
+    }
+
+    /// Marks everything in the view's folders as read, including mail not cached locally.
+    pub fn mark_read(&self, view: &View) -> Result<()> {
+        let mut accounts = Vec::new();
+        for (acc, folder_id) in self.view_folders(view)? {
+            self.db.mark_folder_read(folder_id)?;
+            self.send_cmd(acc, Cmd::MarkAllRead { folder_id })?;
+            if !accounts.contains(&acc) {
+                accounts.push(acc);
+            }
+        }
+        for account_id in accounts {
+            let _ = self.events.send(Event::Changed { account_id });
+        }
         Ok(())
     }
 

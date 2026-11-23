@@ -27,6 +27,8 @@ pub enum Cmd {
     /// Download headers older than anything held locally. Replies with how many arrived (0 = none left).
     FetchOlder { folder_id: i64, reply: oneshot::Sender<Result<usize>> },
     Store { folder_id: i64, uids: Vec<u32>, flag: &'static str, add: bool },
+    /// Set \Seen on every unread message in the folder on the server.
+    MarkAllRead { folder_id: i64 },
     Move { folder_id: i64, uids: Vec<u32>, to_role: &'static str },
     Delete { folder_id: i64, uids: Vec<u32> },
     EnsureSent { message_id: String, raw: Vec<u8> },
@@ -213,6 +215,17 @@ impl Worker {
                 let s = self.ensure().await?;
                 let q = format!("{}FLAGS.SILENT ({})", if *add { "+" } else { "-" }, flag);
                 let _: Vec<Fetch> = s.uid_store(imap::uid_set(uids), q).await?.try_collect().await?;
+                Ok(())
+            }
+            Cmd::MarkAllRead { folder_id } => {
+                let (_, path, _) = self.db.folder(*folder_id)?;
+                self.select(&path).await?;
+                let s = self.ensure().await?;
+                let uids: Vec<u32> = s.uid_search("UNSEEN").await?.into_iter().collect();
+                if uids.is_empty() {
+                    return Ok(());
+                }
+                let _: Vec<Fetch> = s.uid_store(imap::uid_set(&uids), "+FLAGS.SILENT (\\Seen)").await?.try_collect().await?;
                 Ok(())
             }
             Cmd::Move { folder_id, uids, to_role } => {

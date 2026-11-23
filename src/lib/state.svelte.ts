@@ -10,7 +10,7 @@ const PAGE = 200;
 export const ui = $state({
   accounts: [] as Account[],
   folders: [] as Folder[],
-  view: { kind: "unified" } as View,
+  view: { kind: "unified", role: "inbox" } as View,
   list: [] as Summary[],
   hasMore: false,
   listReady: false,
@@ -53,9 +53,22 @@ export function folderById(id: number): Folder | undefined {
   return ui.folders.find((f) => f.id === id);
 }
 
+/** Standard folders shown under All Accounts, in sidebar order. */
+export const unifiedRoles = [
+  { role: "inbox", name: "Inbox" },
+  { role: "drafts", name: "Drafts" },
+  { role: "sent", name: "Sent" },
+  { role: "archive", name: "Archive" },
+  { role: "junk", name: "Junk" },
+  { role: "trash", name: "Trash" },
+];
+
 export function viewTitle(): string {
   if (ui.query.trim()) return "Search";
-  if (ui.view.kind === "unified") return "All Inbox";
+  if (ui.view.kind === "unified") {
+    const role = ui.view.role;
+    return unifiedRoles.find((r) => r.role === role)?.name ?? "";
+  }
   if (ui.view.kind === "folder") {
     const id = ui.view.folderId;
     return folderById(id)?.name ?? "";
@@ -120,7 +133,7 @@ export async function loadList(reset = true) {
 
 /** Views whose folders have no older mail left on the server. */
 const reachedStart = new Set<string>();
-const viewKey = (v: View) => (v.kind === "folder" ? `f${v.folderId}` : v.kind);
+const viewKey = (v: View) => (v.kind === "folder" ? `f${v.folderId}` : v.kind === "unified" ? `u${v.role}` : v.kind);
 
 /** Next page from the local cache; past its end, older mail from the server. */
 export async function loadMore() {
@@ -254,6 +267,16 @@ export function toggleSeen() {
   if (!row) return;
   row.seen = !row.seen;
   run(api.setSeen([row.id], row.seen));
+}
+
+/** Marks everything in a folder (or a unified folder) as read, here and on the server. */
+export async function markAllRead(view: View) {
+  const inView = (fid: number) =>
+    view.kind === "folder" ? fid === view.folderId : view.kind === "unified" && folderById(fid)?.role === view.role;
+  for (const m of ui.list) if (inView(m.folderId)) m.seen = true;
+  if (ui.detail && inView(ui.detail.folderId)) ui.detail.seen = true;
+  for (const f of ui.folders) if (inView(f.id)) f.unread = 0;
+  await run(api.markRead(view));
 }
 
 export function toggleFlag() {

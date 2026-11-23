@@ -101,12 +101,23 @@ pub struct Outgoing {
 #[derive(Deserialize, Clone, Debug)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum View {
-    Unified,
+    /// One standard folder (inbox, sent, drafts…) across every account.
+    Unified {
+        #[serde(default = "inbox_role")]
+        role: String,
+    },
     Folder {
         #[serde(rename = "folderId")]
         folder_id: i64,
     },
 }
+
+fn inbox_role() -> String {
+    "inbox".into()
+}
+
+/// Folder roles a unified view may cover.
+pub const UNIFIED_ROLES: &[&str] = &["inbox", "drafts", "sent", "archive", "junk", "trash"];
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(tag = "kind", rename_all = "camelCase")]

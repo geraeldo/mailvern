@@ -1,8 +1,8 @@
 import { Menu } from "@tauri-apps/api/menu";
-import type { Account, Summary } from "./api";
+import type { Account, Summary, View } from "./api";
 import { api } from "./api";
 import {
-  ui, openAccountSettings, openMessage, compose, archiveSelected, trashSelected, toggleSeen, toggleFlag,
+  ui, openAccountSettings, openMessage, compose, archiveSelected, trashSelected, toggleSeen, toggleFlag, markAllRead,
 } from "./state.svelte";
 
 type Item = { text: string; action: () => void; enabled?: boolean } | "-";
@@ -24,6 +24,10 @@ export function accountMenu(acc: Account, collapsed: boolean, toggle: () => void
     "-",
     { text: collapsed ? "Expand" : "Collapse", action: toggle },
   ]);
+}
+
+export function folderMenu(view: View, unread: number) {
+  return popup([{ text: "Mark All as Read", action: () => markAllRead(view), enabled: unread > 0 }]);
 }
 
 export async function messageMenu(m: Summary) {

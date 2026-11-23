@@ -110,7 +110,7 @@
         sigHtml = keepHtml;
       }
       toast("Saved");
-      if (ui.accounts.length === 1) setView({ kind: "unified" });
+      if (ui.accounts.length === 1) setView({ kind: "unified", role: "inbox" });
     } catch (e) {
       error = String(e);
     } finally {
@@ -130,7 +130,7 @@
     await api.deleteAccount(draft.id);
     await loadAccounts();
     await loadFolders();
-    setView({ kind: "unified" });
+    setView({ kind: "unified", role: "inbox" });
     choose(ui.accounts[0]?.id ?? 0);
   }
 

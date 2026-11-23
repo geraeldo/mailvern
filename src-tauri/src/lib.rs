@@ -73,6 +73,11 @@ fn set_seen(engine: E, ids: Vec<i64>, seen: bool) -> R<()> {
 }
 
 #[tauri::command]
+fn mark_read(engine: E, view: View) -> R<()> {
+    engine.mark_read(&view).map_err(err)
+}
+
+#[tauri::command]
 fn set_flagged(engine: E, ids: Vec<i64>, flagged: bool) -> R<()> {
     engine.set_flagged(&ids, flagged).map_err(err)
 }
@@ -274,6 +279,7 @@ pub fn run() {
             unread_count,
             message,
             set_seen,
+            mark_read,
             set_flagged,
             archive,
             trash,

@@ -53,7 +53,7 @@ export type Detail = Summary & {
   attachments: Attachment[];
 };
 
-export type View = { kind: "unified" } | { kind: "folder"; folderId: number } | { kind: "search" };
+export type View = { kind: "unified"; role: string } | { kind: "folder"; folderId: number } | { kind: "search" };
 
 export type FileInfo = { path: string; name: string; size: number };
 
@@ -89,6 +89,7 @@ export const api = {
   unreadCount: () => invoke<number>("unread_count"),
   message: (id: number) => invoke<Detail>("message", { id }),
   setSeen: (ids: number[], seen: boolean) => invoke<void>("set_seen", { ids, seen }),
+  markRead: (view: View) => invoke<void>("mark_read", { view }),
   setFlagged: (ids: number[], flagged: boolean) => invoke<void>("set_flagged", { ids, flagged }),
   archive: (ids: number[]) => invoke<void>("archive", { ids }),
   trash: (ids: number[]) => invoke<void>("trash", { ids }),

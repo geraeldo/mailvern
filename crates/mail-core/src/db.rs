@@ -509,7 +509,10 @@ impl Db {
     pub fn list(&self, view: &View, query: Option<&str>, offset: i64, limit: i64) -> Result<Vec<MessageSummary>> {
         let c = self.c();
         let scope = match view {
-            View::Unified => "m.folder_id IN (SELECT id FROM folders WHERE role = 'inbox')".to_string(),
+            View::Unified { role } => {
+                let role = UNIFIED_ROLES.iter().find(|r| **r == role).ok_or_else(|| anyhow!("Unknown folder role"))?;
+                format!("m.folder_id IN (SELECT id FROM folders WHERE role = '{role}')")
+            }
             View::Folder { folder_id } => format!("m.folder_id = {}", folder_id),
         };
         let fts = query.and_then(fts_query);
@@ -570,6 +573,12 @@ impl Db {
             c.execute("UPDATE messages SET seen = ? WHERE id = ?", params![seen, id])?;
         }
         Ok(())
+    }
+
+    /// Marks every cached message in a folder as read.
+    pub fn mark_folder_read(&self, folder_id: i64) -> Result<usize> {
+        let c = self.c();
+        Ok(c.execute("UPDATE messages SET seen = 1 WHERE folder_id = ? AND seen = 0", [folder_id])?)
     }
 
     pub fn set_flagged(&self, ids: &[i64], flagged: bool) -> Result<()> {

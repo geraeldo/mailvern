@@ -1,15 +1,16 @@
 <script lang="ts">
   import Icon from "./Icon.svelte";
-  import { ui, setView, compose, openSettings, openAccountSettings, accountLabel, reorderAccounts, reorderFolders } from "../state.svelte";
+  import { ui, setView, compose, openSettings, openAccountSettings, accountLabel, reorderAccounts, reorderFolders, unifiedRoles } from "../state.svelte";
   import { sortable } from "../sortable";
-  import { accountMenu } from "../menus";
+  import { accountMenu, folderMenu } from "../menus";
   import { hint } from "../shortcuts.svelte";
-  import { api, type Folder } from "../api";
+  import { api, type Folder, type View } from "../api";
 
   const roleIcon: Record<string, string> = { inbox: "inbox", sent: "sent", drafts: "drafts", archive: "archive", trash: "trash", junk: "junk" };
   const hiddenNames = new Set(["outbox", "templates", "snoozed"]);
 
   let collapsed = $state<Record<number, boolean>>({});
+  let allCollapsed = $state(false);
   let showMore = $state<Record<number, boolean>>({});
 
   /**
@@ -26,11 +27,25 @@
     return { visible, extra };
   }
 
-  const totalUnread = $derived(ui.folders.filter((f) => f.role === "inbox").reduce((n, f) => n + f.unread, 0));
+  /** All Accounts: each standard folder that at least one account has, with unread summed across accounts. */
+  const unified = $derived(
+    unifiedRoles
+      .map((r) => {
+        const fs = ui.folders.filter((f) => f.role === r.role);
+        return { ...r, present: fs.length > 0, unread: fs.reduce((n, f) => n + f.unread, 0) };
+      })
+      .filter((r) => r.present),
+  );
   const syncing = $derived(Object.values(ui.status).some((s) => s.state === "syncing"));
   const errors = $derived(Object.entries(ui.status).filter(([, s]) => s.state === "error"));
 
   const isActive = (f: Folder) => ui.view.kind === "folder" && ui.view.folderId === f.id && !ui.query;
+  const isUnifiedActive = (role: string) => ui.view.kind === "unified" && ui.view.role === role && !ui.query;
+
+  function openFolderMenu(e: MouseEvent, view: View, unread: number) {
+    e.preventDefault();
+    folderMenu(view, unread);
+  }
   const showCount = (f: Folder) => f.unread > 0 && (f.role === "inbox" || !f.role);
 </script>
 
@@ -42,14 +57,32 @@
   </header>
 
   <nav class="scroll">
-    <button
-      class="item top"
-      class:active={ui.view.kind === "unified" && !ui.query}
-      onclick={() => setView({ kind: "unified" })}>
-      <Icon name="inboxes" />
-      <span class="label">All Inbox</span>
-      {#if totalUnread}<span class="count">{totalUnread}</span>{/if}
-    </button>
+    {#if ui.accounts.length}
+      <div class="group all">
+        <div class="head-row">
+          <button class="group-head" onclick={() => (allCollapsed = !allCollapsed)}>
+            <span class="glyph"><Icon name="inboxes" size={12} stroke={2} /></span>
+            <span class="label">All Accounts</span>
+            <span class="chev" class:open={!allCollapsed}><Icon name="chevron" size={12} stroke={2} /></span>
+          </button>
+        </div>
+        {#if !allCollapsed}
+          <div class="folders">
+            {#each unified as u (u.role)}
+              <button
+                class="item"
+                class:active={isUnifiedActive(u.role)}
+                onclick={() => setView({ kind: "unified", role: u.role })}
+                oncontextmenu={(e) => openFolderMenu(e, { kind: "unified", role: u.role }, u.unread)}>
+                <Icon name={roleIcon[u.role]} />
+                <span class="label">{u.name}</span>
+                {#if u.unread && u.role === "inbox"}<span class="count">{u.unread}</span>{/if}
+              </button>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    {/if}
 
     <div class="accounts" use:sortable={{ item: ".group", handle: ".group-head", onsort: (ids) => reorderAccounts(ids.map(Number)) }}>
       {#each ui.accounts as acc (acc.id)}
@@ -73,7 +106,12 @@
           {#if !collapsed[acc.id]}
             <div class="folders" use:sortable={{ item: ".item", onsort: (ids) => reorderFolders(acc.id, ids.map(Number)) }}>
               {#each fs.visible as f (f.id)}
-                <button class="item" data-id={f.id} class:active={isActive(f)} onclick={() => setView({ kind: "folder", folderId: f.id })}>
+                <button
+                  class="item"
+                  data-id={f.id}
+                  class:active={isActive(f)}
+                  onclick={() => setView({ kind: "folder", folderId: f.id })}
+                  oncontextmenu={(e) => openFolderMenu(e, { kind: "folder", folderId: f.id }, f.unread)}>
                   <Icon name={roleIcon[f.role ?? ""] ?? "folder"} />
                   <span class="label">{f.name}</span>
                   {#if showCount(f)}<span class="count">{f.unread}</span>{/if}
@@ -151,12 +189,11 @@
   }
   .item:hover, .group-head:hover, .more:hover, .add:hover { background: var(--hover); }
   .item.active { background: var(--active); color: var(--text); font-weight: 500; }
-  .item.top { margin-bottom: 10px; color: var(--text); font-weight: 500; }
   .item :global(svg) { flex: none; color: var(--muted); }
-  .item.active :global(svg), .item.top :global(svg) { color: var(--text); }
+  .item.active :global(svg) { color: var(--text); }
   .label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .count { font-size: 12px; font-variant-numeric: tabular-nums; color: var(--muted); font-weight: 500; }
-  .item.active .count, .item.top .count { color: var(--text-2); }
+  .item.active .count { color: var(--text-2); }
   .group { padding-top: 6px; background: var(--side); border-radius: 8px; }
   .group:global([data-dragging]), .item:global([data-dragging]) { box-shadow: 0 6px 20px rgba(20, 18, 14, 0.14); }
   .item:global([data-dragging]) { background: var(--panel); }
@@ -164,6 +201,8 @@
   .head-row { position: relative; }
 
   .group-head { font-size: 12px; font-weight: 600; color: var(--muted); height: 28px; }
+  .group.all { margin-bottom: 8px; }
+  .glyph { display: grid; place-items: center; width: 16px; flex: none; color: var(--muted); }
   .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; margin: 0 4px 0 4px; }
   .chev { display: grid; color: var(--muted); opacity: 0; transition: transform 0.15s, opacity 0.12s; }
   .head-row:hover .chev { opacity: 1; }
