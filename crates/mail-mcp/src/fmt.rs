@@ -4,7 +4,7 @@
 use anyhow::{anyhow, Result};
 use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
 use mail_core::model::{Account, Addr, Folder, MessageSummary};
-use mail_core::Engine;
+use std::collections::HashMap;
 
 /// "2026-11-05 14:30 Thu", in local time.
 pub fn stamp(unix: i64) -> String {
@@ -56,15 +56,34 @@ pub fn kb(bytes: usize) -> String {
     }
 }
 
-/// The user's accounts and folders, for naming things by id.
+/// The user's accounts and folders, for naming things by id, and how their sync is doing.
 pub struct Names {
     pub accounts: Vec<Account>,
     pub folders: Vec<Folder>,
+    /// Account → latest sync state and error message, where known.
+    pub sync: HashMap<i64, (String, Option<String>)>,
 }
 
 impl Names {
-    pub fn load(engine: &Engine) -> Result<Names> {
-        Ok(Names { accounts: engine.accounts()?, folders: engine.folders()? })
+    pub fn load(ctx: &crate::Ctx) -> Result<Names> {
+        Ok(Names { accounts: ctx.engine.accounts()?, folders: ctx.engine.folders()?, sync: ctx.sync.lock().unwrap().clone() })
+    }
+
+    /// What is wrong with an account's local mail, if anything: " · can't sync: …".
+    fn trouble(&self, a: &Account) -> Option<String> {
+        match self.sync.get(&a.id) {
+            Some((state, message)) if state == "error" => Some(format!("can't sync: {}", message.as_deref().unwrap_or("unknown error"))),
+            _ if !self.folders.iter().any(|f| f.account_id == a.id) => Some("nothing downloaded yet".into()),
+            Some((state, _)) if state == "syncing" => Some("syncing now".into()),
+            _ => None,
+        }
+    }
+
+    /// A line for search results when some account's mail may be missing, so "nothing found"
+    /// isn't taken for "no such mail".
+    pub fn warning(&self) -> Option<String> {
+        let bad: Vec<String> = self.accounts.iter().filter_map(|a| self.trouble(a).map(|t| format!("{} ({t})", a.email))).collect();
+        (!bad.is_empty()).then(|| format!("Note: Mailvern's copy of the mail may be incomplete for {}. Results can be missing until it has synced; tell the user rather than concluding the mail doesn't exist.", bad.join(", ")))
     }
 
     pub fn account(&self, id: i64) -> Option<&Account> {
@@ -105,7 +124,9 @@ impl Names {
                     })
                     .collect();
                 let label = if label.is_empty() { String::new() } else { format!("{label} ") };
-                format!("Account {}: {label}<{}>\n{}", a.id, a.email, folders.join("\n"))
+                let trouble = self.trouble(a).map(|t| format!(" · {t}")).unwrap_or_default();
+                let folders = if folders.is_empty() { "  (no folders yet)".to_string() } else { folders.join("\n") };
+                format!("Account {}: {label}<{}>{trouble}\n{folders}", a.id, a.email)
             })
             .collect::<Vec<_>>()
             .join("\n\n")
@@ -137,6 +158,35 @@ pub fn subject(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listing_says_when_mail_is_missing() {
+        let acc = |id: i64, email: &str| Account {
+            id,
+            name: String::new(),
+            email: email.into(),
+            imap_host: String::new(),
+            imap_port: 993,
+            smtp_host: String::new(),
+            smtp_port: 465,
+            color: String::new(),
+            signature: String::new(),
+            position: id,
+            label: String::new(),
+        };
+        let folder = |id: i64, account_id: i64| Folder { id, account_id, path: "INBOX".into(), name: "Inbox".into(), role: Some("inbox".into()), unread: 2, position: None };
+        let mut names = Names { accounts: vec![acc(1, "a@x.co"), acc(2, "b@x.co"), acc(3, "c@x.co")], folders: vec![folder(5, 1), folder(6, 3)], sync: HashMap::new() };
+        names.sync.insert(1, ("idle".into(), None));
+        names.sync.insert(3, ("error".into(), Some("Sign-in failed".into())));
+        assert_eq!(
+            names.listing(),
+            "Account 1: <a@x.co>\n  folder 5: Inbox [inbox] · 2 unread\n\nAccount 2: <b@x.co> · nothing downloaded yet\n  (no folders yet)\n\nAccount 3: <c@x.co> · can't sync: Sign-in failed\n  folder 6: Inbox [inbox] · 2 unread"
+        );
+        let warning = names.warning().unwrap();
+        assert!(warning.contains("b@x.co (nothing downloaded yet), c@x.co (can't sync: Sign-in failed)"), "{warning}");
+        names.accounts.truncate(1);
+        assert!(names.warning().is_none());
+    }
 
     #[test]
     fn dates_and_clipping() {

@@ -20,6 +20,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
+use mail_core::model::Event;
 use mail_core::Engine;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -49,6 +50,9 @@ pub(crate) struct Ctx {
     /// Drafts saved through this server since it started (Message-ID → account). Only these
     /// can be replaced, so an agent can't overwrite a draft the user wrote.
     pub drafts: Mutex<HashMap<String, i64>>,
+    /// Each account's latest sync state ("syncing", "idle", "error") and error message, so
+    /// tools can say when results are incomplete instead of looking like "no such mail".
+    pub sync: Mutex<HashMap<i64, (String, Option<String>)>>,
 }
 
 /// A running server. Dropping it stops it and closes its connections.
@@ -64,10 +68,23 @@ impl Server {
             .await
             .with_context(|| format!("Can't listen on port {port}"))?;
         let addr = listener.local_addr()?;
-        let ctx = Arc::new(Ctx { engine, token, drafts: Mutex::new(HashMap::new()) });
+        let ctx = Arc::new(Ctx { engine, token, drafts: Mutex::new(HashMap::new()), sync: Mutex::new(HashMap::new()) });
         let task = tokio::spawn(async move {
             // Connections live in this set, so they end when the server is dropped.
             let mut conns = JoinSet::new();
+            let watcher = ctx.clone();
+            conns.spawn(async move {
+                let mut events = watcher.engine.subscribe();
+                loop {
+                    match events.recv().await {
+                        Ok(Event::Status { account_id, state, message }) => {
+                            watcher.sync.lock().unwrap().insert(account_id, (state, message));
+                        }
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(_) => break,
+                    }
+                }
+            });
             loop {
                 tokio::select! {
                     accepted = listener.accept() => {

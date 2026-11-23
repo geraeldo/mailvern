@@ -245,7 +245,7 @@ pub async fn call(ctx: &Ctx, name: &str, args: Value) -> Option<Out> {
 }
 
 fn list_folders(ctx: &Ctx) -> Result<Out> {
-    Ok(text(Names::load(&ctx.engine)?.listing()))
+    Ok(text(Names::load(ctx)?.listing()))
 }
 
 async fn search_mail(ctx: &Ctx, args: Value) -> Result<Out> {
@@ -254,15 +254,16 @@ async fn search_mail(ctx: &Ctx, args: Value) -> Result<Out> {
     q.limit = Some(f.limit.unwrap_or(20).clamp(1, 50));
     let offset = f.offset.unwrap_or(0).max(0);
     let (r, server_error) = if f.server { ctx.engine.query_mail_server(&q).await? } else { (ctx.engine.query_mail(&q)?, None) };
-    let names = Names::load(&ctx.engine)?;
+    let names = Names::load(ctx)?;
     let mut out = if r.total == 1 { "1 message matches".to_string() } else { format!("{} messages match", r.total) };
     if let Some(e) = server_error {
         out.push_str(&format!(" (server search failed: {e}; local results only)"));
     }
     out.push('.');
+    let warning = names.warning().map(|w| format!("\n\n{w}")).unwrap_or_default();
     if r.rows.is_empty() {
         out.push_str(if f.server { " Try fewer or different words, or other filters." } else { " Try fewer or different words, other filters, or server: true." });
-        return Ok(text(out));
+        return Ok(text(out + &warning));
     }
     out.push_str("\n\n");
     out.push_str(&r.rows.iter().map(|m| row(m, &names)).collect::<Vec<_>>().join("\n\n"));
@@ -270,7 +271,7 @@ async fn search_mail(ctx: &Ctx, args: Value) -> Result<Out> {
     if r.total > shown {
         out.push_str(&format!("\n\nMore: use offset {shown}."));
     }
-    Ok(text(out))
+    Ok(text(out + &warning))
 }
 
 fn count_mail(ctx: &Ctx, args: Value) -> Result<Out> {
@@ -284,7 +285,7 @@ fn count_mail(ctx: &Ctx, args: Value) -> Result<Out> {
         bail!("groupBy must be one of sender, domain, recipient, month, year, folder, account");
     }
     let (total, groups) = ctx.engine.group_mail(&q, by)?;
-    let names = Names::load(&ctx.engine)?;
+    let names = Names::load(ctx)?;
     let lines: Vec<String> = groups
         .iter()
         .map(|g| {
@@ -304,7 +305,7 @@ fn count_mail(ctx: &Ctx, args: Value) -> Result<Out> {
 async fn read_message(ctx: &Ctx, args: Value) -> Result<Out> {
     let a: ReadArgs = parse(args)?;
     let d = ctx.engine.message(a.id).await?;
-    let names = Names::load(&ctx.engine)?;
+    let names = Names::load(ctx)?;
     let s = &d.summary;
     let mut lines = vec![format!("Message #{}", s.id), format!("Date: {}", stamp(s.date)), format!("From: {}", who(Some(&s.from_name), &s.from_addr))];
     for (label, list) in [("To", &d.to), ("Cc", &d.cc), ("Bcc", &d.bcc), ("Reply-To", &d.reply_to)] {
@@ -339,7 +340,7 @@ async fn read_conversation(ctx: &Ctx, args: Value) -> Result<Out> {
     if thread.is_empty() {
         bail!("No message {}", a.id);
     }
-    let names = Names::load(&ctx.engine)?;
+    let names = Names::load(ctx)?;
     let skipped = thread.len().saturating_sub(15);
     let mut parts = Vec::new();
     for m in &thread[skipped..] {
