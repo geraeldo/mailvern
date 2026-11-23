@@ -13,6 +13,7 @@
     onchange,
     plain = false,
     label = undefined,
+    prompt = undefined,
   }: {
     value: T;
     options: Option[];
@@ -21,6 +22,8 @@
     plain?: boolean;
     /** Accessible name, when no visible label points at it. */
     label?: string;
+    /** Makes it an add menu: a "+ prompt" button whose pick is handed over, never shown as chosen. */
+    prompt?: string;
   } = $props();
 
   let open = $state(false);
@@ -66,7 +69,7 @@
 
   function pick(o: Option) {
     hide();
-    if (o.value !== value) onchange(o.value);
+    if (prompt || o.value !== value) onchange(o.value);
   }
 
   function move(to: number) {
@@ -107,7 +110,7 @@
   onresize={() => open && hide(false)}
   onscrollcapture={(e) => { if (open && !listEl?.contains(e.target as Node)) hide(false); }} />
 
-<div class="select" class:plain bind:this={root}>
+<div class="select" class:plain class:menu={prompt} bind:this={root}>
   <button
     bind:this={trigger}
     type="button"
@@ -118,11 +121,15 @@
     aria-label={label}
     onclick={() => (open ? hide() : show())}
     onkeydown={onKey}>
-    <span class="text">
-      <span class="lbl">{current?.label ?? ""}</span>
-      {#if current?.detail}<span class="detail">{current.detail}</span>{/if}
-    </span>
-    <span class="caret"><Icon name="chevronDown" size={13} stroke={2} /></span>
+    {#if prompt}
+      <Icon name="plus" size={14} /><span class="lbl">{prompt}</span>
+    {:else}
+      <span class="text">
+        <span class="lbl">{current?.label ?? ""}</span>
+        {#if current?.detail}<span class="detail">{current.detail}</span>{/if}
+      </span>
+      <span class="caret"><Icon name="chevronDown" size={13} stroke={2} /></span>
+    {/if}
   </button>
   {#if open}
     <div
@@ -148,7 +155,7 @@
             <span class="lbl">{o.label}</span>
             {#if o.detail}<span class="detail">{o.detail}</span>{/if}
           </span>
-          <span class="tick">{#if o.value === value}<Icon name="check" size={13} stroke={2.2} />{/if}</span>
+          <span class="tick">{#if !prompt && o.value === value}<Icon name="check" size={13} stroke={2.2} />{/if}</span>
         </button>
       {/each}
     </div>
@@ -182,6 +189,16 @@
     font-size: 14px;
   }
   .plain .current:hover, .plain .current.open { background: var(--hover); }
+  .menu .current {
+    gap: 6px;
+    height: 26px;
+    padding: 0 8px;
+    border-color: transparent;
+    background: transparent;
+    font-size: 12.5px;
+    color: var(--text-2);
+  }
+  .menu .current:hover, .menu .current.open { background: var(--hover); }
   .text { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
   .lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .detail { flex-shrink: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 0.93em; }

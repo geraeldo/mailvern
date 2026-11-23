@@ -14,7 +14,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 
 const INITIAL_HEADERS: u32 = 500;
 const HEADER_ITEMS: &str = "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER])";
@@ -66,6 +66,8 @@ pub struct Worker {
     account: Account,
     db: Arc<Db>,
     events: broadcast::Sender<Event>,
+    /// Wakes the rule runner after new Inbox mail is queued for it.
+    rules_wake: Arc<Notify>,
     rx: mpsc::UnboundedReceiver<Cmd>,
     session: Option<Session>,
     selected: Option<String>,
@@ -73,8 +75,8 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn new(account: Account, db: Arc<Db>, events: broadcast::Sender<Event>, rx: mpsc::UnboundedReceiver<Cmd>) -> Self {
-        Worker { account, db, events, rx, session: None, selected: None, deferred: VecDeque::new() }
+    pub fn new(account: Account, db: Arc<Db>, events: broadcast::Sender<Event>, rules_wake: Arc<Notify>, rx: mpsc::UnboundedReceiver<Cmd>) -> Self {
+        Worker { account, db, events, rules_wake, rx, session: None, selected: None, deferred: VecDeque::new() }
     }
 
     fn emit(&self, e: Event) {
@@ -577,18 +579,13 @@ impl Worker {
         let new = headers(&fetches, |uid| uid > max_uid);
 
         if !new.is_empty() {
-            self.db.insert_messages(self.account.id, folder_id, &new)?;
+            let added = self.db.insert_messages(self.account.id, folder_id, &new)?;
             changed = true;
-            if role == Some("inbox") && max_uid > 0 {
-                let unseen: Vec<&NewMessage> = new.iter().filter(|m| !m.seen).collect();
-                if let Some(last) = unseen.iter().max_by_key(|m| m.date) {
-                    self.emit(Event::NewMail {
-                        account_id: self.account.id,
-                        from: if last.from_name.is_empty() { last.from_addr.clone() } else { last.from_name.clone() },
-                        subject: last.subject.clone(),
-                        count: unseen.len(),
-                    });
-                }
+            // New Inbox mail goes through the rules, which then announce what's still there.
+            // A first sync (max_uid 0) is old mail: no rules, no notification.
+            if role == Some("inbox") && max_uid > 0 && !added.is_empty() {
+                self.db.queue_for_rules(self.account.id, &added, chrono::Utc::now().timestamp())?;
+                self.rules_wake.notify_one();
             }
         }
 

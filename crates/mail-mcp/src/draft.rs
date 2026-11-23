@@ -182,6 +182,7 @@ pub fn compose(args: &DraftArgs, account: &Account, mine: &[String], source: Opt
         in_reply_to,
         references,
         message_id: None,
+        auto_submitted: None,
     })
 }
 
@@ -297,6 +298,7 @@ pub fn edit(args: &EditArgs, account: &Account, existing: &MessageDetail, kept: 
         in_reply_to: existing.in_reply_to.clone(),
         references: existing.references.clone(),
         message_id: existing.message_id.clone(),
+        auto_submitted: None,
     })
 }
 
@@ -351,6 +353,7 @@ mod tests {
             html: Some("<html><head><style>p{}</style></head><body><p>Updated &amp; attached.</p></body></html>".into()),
             text: None,
             attachments: vec![],
+            list_id: None,
         }
     }
 

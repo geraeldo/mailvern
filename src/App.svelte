@@ -23,10 +23,13 @@
   } from "./lib/state.svelte";
   import { snoozePresets } from "./lib/when";
   import { exitAi } from "./lib/ai/search.svelte";
+  import { loadRules, rulesUi } from "./lib/rules.svelte";
   import { keymap, comboOf, match, canFireWhileTyping, usesModifier, loadShortcuts, type Action } from "./lib/shortcuts.svelte";
 
   let list: MessageList;
   let notify = false;
+  /** Rules waiting for approval, to say so when an agent adds one. */
+  let pendingRules = 0;
 
   let pending: ReturnType<typeof setTimeout> | undefined;
   function scheduleRefresh() {
@@ -60,6 +63,13 @@
         } as any);
       } else if (e.kind === "outbox") {
         loadOutbox();
+      } else if (e.kind === "rulePaused") {
+        toast(`Paused the rule “${e.name}”: ${e.reason}. Turn it on again in Settings › Rules.`, { ms: 8000 });
+        loadRules();
+      } else if (e.kind === "rulesChanged") {
+        if (rulesUi.loaded) loadRules();
+        if (e.pendingApproval > pendingRules) toast("An agent set up a rule that sends mail. Review it in Settings › Rules.", { ms: 8000 });
+        pendingRules = e.pendingApproval;
       } else if (e.kind === "sendFailed") {
         toast(`Couldn't send “${e.subject || "(no subject)"}”. It will retry from Scheduled.`, { ms: 6000 });
         if (notify) sendNotification({ title: "Message not sent", body: `${e.subject || "(no subject)"}: ${e.message}` });

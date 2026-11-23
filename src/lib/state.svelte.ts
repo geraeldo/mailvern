@@ -10,7 +10,7 @@ export type ComposeMode = "new" | "reply" | "replyAll" | "forward" | "draft";
 /** A message to reopen in the composer: a saved draft, or one taken back out of the outbox. */
 export type Restore = { message: Outgoing; attachments: FileInfo[]; unsaved?: boolean };
 export type ComposeInit = { mode: ComposeMode; source?: Detail; accountId?: number; to?: string[]; restore?: Restore; key: number };
-export type SettingsSection = "general" | "ai" | "agents" | "shortcuts";
+export type SettingsSection = "general" | "rules" | "ai" | "agents" | "shortcuts";
 export type SyncStatus = { state: "syncing" | "idle" | "error"; message: string | null };
 /** One thing AI search did, shown while it works. */
 export type AiStep = { kind: "search" | "read" | "attachment" | "count" | "thread" | "folders" | "note"; text: string; done: boolean; error?: boolean };

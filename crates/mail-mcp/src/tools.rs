@@ -1,6 +1,7 @@
 //! The tools an agent gets. Reading tools mirror Ask AI's (`src/lib/ai/search.svelte.ts`).
-//! The only thing an agent can change is the Drafts folder: nothing here sends, moves,
-//! deletes or marks mail, because mail is untrusted text and agents can run commands.
+//! The only mail an agent can change is in Drafts: nothing here sends, moves, deletes or
+//! marks mail, because mail is untrusted text and agents can run commands. Agents can also
+//! manage rules for mail yet to arrive (`rules`); rules that send wait for the user.
 
 use crate::draft::{compose, edit, DraftArgs, EditArgs};
 use crate::fmt::{addr_list, clip, kb, row, stamp, subject, to_unix, who, Names};
@@ -15,12 +16,12 @@ use serde_json::{json, Value};
 /// Images above this (as base64) are not handed to the agent's model; it can save them instead.
 const MAX_IMAGE_BASE64: usize = 4 * 1024 * 1024;
 
-pub struct Out {
+pub(crate) struct Out {
     pub content: Vec<Value>,
     pub is_error: bool,
 }
 
-fn text(t: impl Into<String>) -> Out {
+pub(crate) fn text(t: impl Into<String>) -> Out {
     Out { content: vec![json!({ "type": "text", "text": t.into() })], is_error: false }
 }
 
@@ -47,7 +48,7 @@ pub fn list() -> Value {
         json!({ "type": "object", "properties": props, "additionalProperties": false })
     };
     let read_only = json!({ "readOnlyHint": true });
-    json!([
+    let mut tools = json!([
         {
             "name": "list_folders",
             "title": "List accounts and folders",
@@ -177,7 +178,9 @@ pub fn list() -> Value {
             },
             "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false },
         },
-    ])
+    ]);
+    tools.as_array_mut().expect("a list").extend(crate::rules::list());
+    tools
 }
 
 #[derive(Deserialize, Default)]
@@ -243,7 +246,7 @@ struct AttachmentArgs {
     offset: usize,
 }
 
-fn parse<T: DeserializeOwned>(args: Value) -> Result<T> {
+pub(crate) fn parse<T: DeserializeOwned>(args: Value) -> Result<T> {
     serde_json::from_value(args).map_err(|e| anyhow!("Invalid arguments: {e}"))
 }
 
@@ -260,7 +263,7 @@ pub async fn call(ctx: &Ctx, name: &str, args: Value) -> Option<Out> {
         "save_attachment" => save_attachment(ctx, args).await,
         "create_draft" => create_draft(ctx, args).await,
         "edit_draft" => edit_draft(ctx, args).await,
-        _ => return None,
+        _ => crate::rules::call(ctx, name, args)?,
     };
     Some(result.unwrap_or_else(|e| Out { is_error: true, ..text(format!("Error: {e:#}")) }))
 }
@@ -537,13 +540,19 @@ mod tests {
     fn every_tool_has_a_schema_and_a_handler() {
         let tools = list();
         let names: Vec<&str> = tools.as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["list_folders", "search_mail", "count_mail", "read_message", "read_conversation", "read_attachment", "save_attachment", "create_draft", "edit_draft"]);
+        assert_eq!(
+            names,
+            [
+                "list_folders", "search_mail", "count_mail", "read_message", "read_conversation", "read_attachment", "save_attachment",
+                "create_draft", "edit_draft", "list_rules", "create_rule", "update_rule", "delete_rule", "test_rule",
+            ]
+        );
         for t in tools.as_array().unwrap() {
             assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
             assert!(t["description"].as_str().unwrap().len() > 20);
         }
-        // Nothing that sends, moves or deletes.
-        assert!(!names.iter().any(|n| n.contains("send") || n.contains("delete") || n.contains("move") || n.contains("trash")));
+        // Nothing that sends, moves or deletes mail. (Removing a rule is not removing mail.)
+        assert!(!names.iter().filter(|n| !crate::rules::NAMES.contains(n)).any(|n| n.contains("send") || n.contains("delete") || n.contains("move") || n.contains("trash")));
         assert_eq!(tools[1]["inputSchema"]["properties"]["from"]["type"], "string");
         assert_eq!(tools[1]["inputSchema"]["properties"]["server"]["type"], "boolean");
     }

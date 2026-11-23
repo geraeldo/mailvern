@@ -5,11 +5,14 @@
   import General from "./General.svelte";
   import AISettings from "./AISettings.svelte";
   import AgentSettings from "./AgentSettings.svelte";
+  import RulesSettings from "./RulesSettings.svelte";
+  import { rulesUi } from "../rules.svelte";
   import { ui, type SettingsSection } from "../state.svelte";
 
   // App-wide preferences. Account settings live in AccountSettings.
   const sections: { id: SettingsSection; label: string; icon: string }[] = [
     { id: "general", label: "General", icon: "settings" },
+    { id: "rules", label: "Rules", icon: "filter" },
     { id: "ai", label: "AI", icon: "sparkle" },
     { id: "agents", label: "Agents", icon: "code" },
     { id: "shortcuts", label: "Shortcuts", icon: "keyboard" },
@@ -19,6 +22,7 @@
 
   function close() {
     ui.settings = null;
+    rulesUi.draft = null;
   }
 </script>
 
@@ -26,7 +30,7 @@
   <aside>
     <div class="side-title">Settings</div>
     {#each sections as s (s.id)}
-      <button class="nav" class:active={current.id === s.id} onclick={() => (ui.settings = s.id)}>
+      <button class="nav" class:active={current.id === s.id} onclick={() => { ui.settings = s.id; rulesUi.draft = null; }}>
         <Icon name={s.icon} size={16} /> {s.label}
       </button>
     {/each}
@@ -34,12 +38,14 @@
 
   <main class="scroll">
     <header>
-      <h2>{current.label}</h2>
+      <h2>{current.id === "rules" && rulesUi.draft ? (rulesUi.draft.id ? "Edit rule" : "New rule") : current.label}</h2>
       <button class="icon-btn" title="Close  Esc" onclick={close}><Icon name="x" /></button>
     </header>
 
     {#if current.id === "general"}
       <General />
+    {:else if current.id === "rules"}
+      <RulesSettings />
     {:else if current.id === "ai"}
       <AISettings />
     {:else if current.id === "agents"}

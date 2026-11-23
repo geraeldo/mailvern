@@ -87,6 +87,8 @@ pub struct MessageDetail {
     pub html: Option<String>,
     pub text: Option<String>,
     pub attachments: Vec<AttachmentInfo>,
+    /// The List-Id header, for "Create rule from this list".
+    pub list_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -109,6 +111,196 @@ pub struct Outgoing {
     /// and sending it removes the draft.
     #[serde(default)]
     pub message_id: Option<String>,
+    /// An `Auto-Submitted` header (RFC 3834) for mail a rule sends: "auto-replied" or "auto-generated".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_submitted: Option<String>,
+}
+
+// ---------- rules ----------
+
+/// What part of a message a rule condition looks at.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RuleField {
+    /// The sender's name or address.
+    From,
+    /// The part of the sender's address after "@".
+    FromDomain,
+    To,
+    Cc,
+    ToOrCc,
+    /// Sent to one of my addresses and nobody else. Ignores `op` and `value`.
+    OnlyToMe,
+    /// One of my addresses is in Cc. Ignores `op` and `value`.
+    CcMe,
+    Subject,
+    /// The plain text of the body (quoted replies left out).
+    Body,
+    /// The List-Id header of mailing lists and notifications.
+    ListId,
+    /// Ignores `op` and `value`.
+    HasAttachment,
+}
+
+impl RuleField {
+    /// Fields that are true or false on their own, without a value to compare.
+    pub fn is_flag(self) -> bool {
+        matches!(self, RuleField::OnlyToMe | RuleField::CcMe | RuleField::HasAttachment)
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum RuleOp {
+    #[default]
+    Contains,
+    Is,
+    StartsWith,
+    EndsWith,
+    /// A regular expression, case-insensitive.
+    Regex,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleCondition {
+    pub field: RuleField,
+    #[serde(default)]
+    pub op: RuleOp,
+    #[serde(default)]
+    pub value: String,
+}
+
+/// When a snoozed message comes back, relative to when the rule runs.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SnoozeUntil {
+    /// In three hours.
+    LaterToday,
+    /// 8:00 tomorrow.
+    Tomorrow,
+    /// 8:00 next Monday.
+    NextWeek,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum RuleAction {
+    #[serde(rename_all = "camelCase")]
+    Move { folder_id: i64 },
+    Archive,
+    Trash,
+    Junk,
+    MarkRead,
+    Flag,
+    Snooze { until: SnoozeUntil },
+    /// No notification or badge for this message.
+    SkipNotification,
+    Forward { to: Vec<String> },
+    Reply {
+        #[serde(default)]
+        subject: Option<String>,
+        text: String,
+    },
+}
+
+impl RuleAction {
+    /// Actions that send mail on the user's behalf.
+    pub fn sends(&self) -> bool {
+        matches!(self, RuleAction::Forward { .. } | RuleAction::Reply { .. })
+    }
+
+    /// Actions that take the message out of the Inbox. A message can only go to one place.
+    pub fn relocates(&self) -> bool {
+        matches!(
+            self,
+            RuleAction::Move { .. } | RuleAction::Archive | RuleAction::Trash | RuleAction::Junk | RuleAction::Snooze { .. }
+        )
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Rule {
+    #[serde(default)]
+    pub id: i64,
+    pub name: String,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// Only mail arriving in this account. None: every account.
+    #[serde(default)]
+    pub account_id: Option<i64>,
+    /// All conditions must hold (true) or any one of them (false).
+    #[serde(default = "yes")]
+    pub match_all: bool,
+    /// No conditions: every new message.
+    #[serde(default)]
+    pub conditions: Vec<RuleCondition>,
+    /// The rule doesn't apply when any of these holds.
+    #[serde(default)]
+    pub exceptions: Vec<RuleCondition>,
+    pub actions: Vec<RuleAction>,
+    /// Don't look at later rules once this one matches.
+    #[serde(default)]
+    pub stop: bool,
+    /// Who saved it last: "user" or "agent". Set by the engine.
+    #[serde(default = "user_origin")]
+    pub origin: String,
+    /// An agent added or changed mail-sending actions; the user has to turn it on.
+    #[serde(default)]
+    pub needs_approval: bool,
+    /// Why the engine switched it off (e.g. it sent too much mail).
+    #[serde(default)]
+    pub paused_reason: Option<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn user_origin() -> String {
+    "user".into()
+}
+
+/// How a rule would do on mail already here.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleTest {
+    /// Messages that match.
+    pub count: usize,
+    /// Messages looked at.
+    pub scanned: usize,
+    /// Messages that couldn't be checked because their body isn't downloaded.
+    pub without_body: usize,
+    /// The newest matches.
+    pub sample: Vec<MessageSummary>,
+}
+
+/// What running a rule on existing mail did.
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleRun {
+    pub matched: usize,
+    /// Forwards and replies sent.
+    pub sent: usize,
+    /// Forwards and replies left out: automatic mail, lists, limits, or not asked for.
+    pub not_sent: usize,
+}
+
+/// One thing a rule did, for the activity log.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleActivity {
+    pub id: i64,
+    pub rule_id: Option<i64>,
+    pub rule_name: String,
+    pub account_id: i64,
+    pub subject: String,
+    pub from_addr: String,
+    pub action: RuleAction,
+    pub at: i64,
+    pub undone: bool,
+    pub can_undo: bool,
 }
 
 /// A message waiting to be sent (undo window or scheduled), or one that failed.
@@ -261,4 +453,10 @@ pub enum Event {
     Outbox,
     #[serde(rename_all = "camelCase")]
     SendFailed { subject: String, message: String },
+    /// Rules were added, changed or removed.
+    #[serde(rename_all = "camelCase")]
+    RulesChanged { pending_approval: usize },
+    /// The engine switched a rule off.
+    #[serde(rename_all = "camelCase")]
+    RulePaused { rule_id: i64, name: String, reason: String },
 }

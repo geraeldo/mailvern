@@ -1,5 +1,6 @@
 use mail_core::model::{
-    Account, AttachmentContent, Folder, MailGroup, MailQuery, MessageDetail, MessageSummary, Outgoing, OutboxItem, SearchScope, View,
+    Account, AttachmentContent, Folder, MailGroup, MailQuery, MessageDetail, MessageSummary, Outgoing, OutboxItem, Rule, RuleActivity,
+    RuleRun, RuleTest, SearchScope, View,
 };
 use mail_core::Engine;
 use std::path::PathBuf;
@@ -273,6 +274,59 @@ fn set_setting(engine: E, key: String, value: String) -> R<()> {
     engine.set_setting(&key, &value).map_err(err)
 }
 
+// ---------- rules ----------
+
+#[tauri::command]
+fn rules(engine: E) -> R<Vec<Rule>> {
+    engine.rules().map_err(err)
+}
+
+/// Saves a rule from the Rules settings: the user's own, so it's live at once.
+#[tauri::command]
+fn save_rule(engine: E, rule: Rule) -> R<Rule> {
+    engine.save_rule(rule, false).map_err(err)
+}
+
+#[tauri::command]
+fn delete_rule(engine: E, id: i64) -> R<()> {
+    engine.delete_rule(id).map_err(err)
+}
+
+#[tauri::command]
+fn reorder_rules(engine: E, ids: Vec<i64>) -> R<()> {
+    engine.reorder_rules(&ids).map_err(err)
+}
+
+#[tauri::command]
+fn set_rule_enabled(engine: E, id: i64, enabled: bool) -> R<()> {
+    engine.set_rule_enabled(id, enabled).map_err(err)
+}
+
+#[tauri::command]
+fn check_rule(engine: E, rule: Rule) -> R<()> {
+    engine.check_rule(&rule).map_err(err)
+}
+
+#[tauri::command]
+fn test_rule(engine: E, rule: Rule, folder_id: Option<i64>) -> R<RuleTest> {
+    engine.test_rule(&rule, folder_id).map_err(err)
+}
+
+#[tauri::command]
+async fn run_rule(engine: E<'_>, id: i64, folder_id: Option<i64>, include_sending: bool) -> R<RuleRun> {
+    engine.run_rule(id, folder_id, include_sending).await.map_err(err)
+}
+
+#[tauri::command]
+fn rule_activity(engine: E, limit: usize) -> R<Vec<RuleActivity>> {
+    engine.rule_activity(limit).map_err(err)
+}
+
+#[tauri::command]
+fn undo_rule_activity(engine: E, id: i64) -> R<()> {
+    engine.undo_rule_activity(id).map_err(err)
+}
+
 fn safe_name(name: &str) -> String {
     let n: String = name.chars().map(|c| if matches!(c, '/' | '\\' | ':' | '\0') { '_' } else { c }).collect();
     let n = n.trim_start_matches('.').trim().to_string();
@@ -539,6 +593,16 @@ pub fn run() {
             agents::agent_access,
             agents::set_agent_access,
             agents::reset_agent_token,
+            rules,
+            save_rule,
+            delete_rule,
+            reorder_rules,
+            set_rule_enabled,
+            check_rule,
+            test_rule,
+            run_rule,
+            rule_activity,
+            undo_rule_activity,
         ])
         // Like other Mac mail apps: closing the window (⌘W, red button) only hides it,
         // so sync and notifications keep running. ⌘Q still quits.

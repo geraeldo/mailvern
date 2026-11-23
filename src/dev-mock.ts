@@ -141,6 +141,25 @@ function mockOpenRouter(url: string, init?: RequestInit): Response | null {
     const short = user.includes("shorter");
     return sse([...textChunks(short ? "<div>Hi Maya,</div><div><br></div><div>The agenda looks good. Could we add 15 minutes for the offsite budget?</div>" : "<div>Hi Maya,</div><div><br></div><div>Thanks for sharing the agenda. It looks great to me. Could we add 15 minutes to discuss the offsite budget?</div><div><br></div><div>See you Thursday.</div>"), end("stop")]);
   }
+  // Rules from plain language: propose a rule moving mail to a "Clients" folder.
+  const propose = req.tools.find((t: any) => t.function?.name === "propose_rule");
+  if (propose) {
+    const folderEnum: string[] = propose.function.parameters.properties.actions.items.properties.folder.enum ?? [];
+    const folder = folderEnum.find((f) => f.endsWith("Clients")) ?? folderEnum[0];
+    return sse([
+      ...toolChunks([{
+        name: "propose_rule",
+        args: {
+          name: "Northwind to Clients",
+          account: "all accounts",
+          matchAll: true,
+          conditions: [{ field: "fromDomain", op: "is", value: "northwind.io" }],
+          actions: [{ type: "move", folder }, { type: "flag" }],
+        },
+      }]),
+      end("tool_calls"),
+    ]);
+  }
   // Script: search, read the conversation it found, then answer. Follow-ups answer at once.
   const lastUser = msgs.map((m) => m.role).lastIndexOf("user");
   const results = msgs.slice(lastUser + 1).filter((m) => m.role === "tool");
@@ -193,8 +212,82 @@ export function installMock() {
     }
     return realFetch(input, init);
   };
+  // Rules: one live rule, and one an agent added that waits for approval.
+  let ruleId = 2;
+  const rules: any[] = [
+    { id: 1, name: "Newsletters", enabled: true, accountId: null, matchAll: true, conditions: [{ field: "subject", op: "contains", value: "digest" }], exceptions: [], actions: [{ type: "archive" }, { type: "markRead" }], stop: false, origin: "user", needsApproval: false, pausedReason: null },
+    { id: 2, name: "Forward invoices to accounting", enabled: false, accountId: 1, matchAll: true, conditions: [{ field: "subject", op: "regex", value: "invoice|receipt" }], exceptions: [], actions: [{ type: "forward", to: ["accounting@acme.co"] }], stop: false, origin: "agent", needsApproval: true, pausedReason: null },
+  ];
+  const ruleLog: any[] = [
+    { id: 1, ruleId: 1, ruleName: "Newsletters", accountId: 1, subject: "Weekly digest", fromAddr: "news@product.io", action: { type: "archive" }, at: Math.floor(Date.now() / 1000) - 3600, undone: false, canUndo: true },
+  ];
+  const ruleMatches = (r: any, m: M) => {
+    const test = (c: any) => {
+      const hay = ({ from: `${m.fromName} ${m.fromAddr}`, fromDomain: m.fromAddr.split("@")[1] ?? "", subject: m.subject, body: m.snippet } as Record<string, string>)[c.field];
+      if (c.field === "hasAttachment") return m.hasAttachments;
+      if (hay === undefined) return false;
+      const h = hay.toLowerCase(), v = String(c.value).toLowerCase();
+      if (c.op === "regex") { try { return new RegExp(c.value, "i").test(hay); } catch { return false; } }
+      return c.op === "is" ? h === v : c.op === "startsWith" ? h.startsWith(v) : c.op === "endsWith" ? h.endsWith(v) : h.includes(v);
+    };
+    const pos = r.conditions.length === 0 || (r.matchAll ? r.conditions.every(test) : r.conditions.some(test));
+    return pos && !r.exceptions.some(test);
+  };
+  const ruleCandidates = (r: any, folderId: number | null) =>
+    messages.filter((m) => (folderId ? m.folderId === folderId : folders.find((f) => f.id === m.folderId)?.role === "inbox" && (r.accountId == null || m.accountId === r.accountId)));
+  const checkRule = (r: any) => {
+    if (!r.name.trim()) throw "Give the rule a name";
+    if (!r.actions.length) throw "Add at least one action";
+    for (const c of [...r.conditions, ...r.exceptions]) {
+      if (!["onlyToMe", "ccMe", "hasAttachment"].includes(c.field) && !String(c.value).trim()) throw "A condition needs something to look for";
+      if (c.op === "regex") { try { new RegExp(c.value); } catch { throw `“${c.value}” isn't a valid pattern`; } }
+    }
+    if (r.actions.some((a: any) => a.type === "move") && r.accountId == null) throw "Choose an account: a rule that moves mail to a folder works in one account";
+  };
+
   mockIPC(async (cmd, args: any) => {
     switch (cmd) {
+      case "rules": return rules.map((r) => ({ ...r }));
+      case "check_rule": checkRule(args.rule); return null;
+      case "save_rule": {
+        checkRule(args.rule);
+        const r = { ...args.rule, origin: "user", needsApproval: false, pausedReason: null };
+        const i = rules.findIndex((x) => x.id === r.id);
+        if (i >= 0) rules[i] = r; else { r.id = ++ruleId; rules.push(r); }
+        return { ...r };
+      }
+      case "delete_rule": { const i = rules.findIndex((x) => x.id === args.id); if (i >= 0) rules.splice(i, 1); return null; }
+      case "reorder_rules": { const ids: number[] = args.ids; rules.sort((a, b) => ids.indexOf(a.id) - ids.indexOf(b.id)); return null; }
+      case "set_rule_enabled": {
+        const r = rules.find((x) => x.id === args.id);
+        if (r) { r.enabled = args.enabled; if (args.enabled) { r.needsApproval = false; r.pausedReason = null; } }
+        return null;
+      }
+      case "test_rule": {
+        checkRule({ ...args.rule, name: args.rule.name || "x", actions: [{ type: "archive" }] });
+        const c = ruleCandidates(args.rule, args.folderId);
+        const hits = c.filter((m) => ruleMatches(args.rule, m)).sort((a, b) => b.date - a.date);
+        return { count: hits.length, scanned: c.length, withoutBody: 0, sample: hits.slice(0, 20) };
+      }
+      case "run_rule": {
+        const r = rules.find((x) => x.id === args.id);
+        const hits = ruleCandidates(r, args.folderId).filter((m) => ruleMatches(r, m));
+        const sends = r.actions.filter((a: any) => a.type === "forward" || a.type === "reply").length;
+        for (const m of hits) {
+          for (const a of r.actions) {
+            if (a.type === "markRead") m.seen = true;
+            if (a.type === "flag") m.flagged = true;
+            if (a.type === "archive") m.folderId = m.accountId * 10 + 3;
+            if (a.type === "trash") m.folderId = m.accountId * 10 + 5;
+            if (a.type === "move") m.folderId = a.folderId;
+            if (a.type !== "forward" && a.type !== "reply") ruleLog.unshift({ id: ruleLog.length + 1, ruleId: r.id, ruleName: r.name, accountId: m.accountId, subject: m.subject, fromAddr: m.fromAddr, action: a, at: Math.floor(Date.now() / 1000), undone: false, canUndo: a.type !== "skipNotification" });
+          }
+        }
+        refreshCounts();
+        return { matched: hits.length, sent: args.includeSending ? hits.length * sends : 0, notSent: args.includeSending ? 0 : hits.length * sends };
+      }
+      case "rule_activity": return ruleLog.slice(0, args.limit);
+      case "undo_rule_activity": { const e = ruleLog.find((x) => x.id === args.id); if (e) { e.undone = true; e.canUndo = false; } return null; }
       case "accounts": return accounts;
       case "folders": {
         const order = (id: number) => accounts.findIndex((a) => a.id === id);
@@ -315,6 +408,7 @@ export function installMock() {
           references: null,
           html: m.id > 64 ? `<p>${m.snippet}</p>` : html,
           text: null,
+          listId: m.fromAddr.includes("github") || m.subject.toLowerCase().includes("digest") ? "<updates.list.example.com>" : null,
           attachments: m.hasAttachments ? [{ index: 0, filename: "Q4-agenda.pdf", mime: "application/pdf", size: 284_000 }, { index: 1, filename: "budget.xlsx", mime: "application/vnd.ms-excel", size: 48_200 }] : [],
         };
       }

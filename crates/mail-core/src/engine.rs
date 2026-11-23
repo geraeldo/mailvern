@@ -43,7 +43,12 @@ impl Drop for Handle {
     }
 }
 
+#[path = "rule_runner.rs"]
+mod rule_runner;
+
 /// The public API the UI talks to. Every read is served from the local database.
+/// Cloning is cheap: clones share everything.
+#[derive(Clone)]
 pub struct Engine {
     db: Arc<Db>,
     events: broadcast::Sender<Event>,
@@ -51,7 +56,10 @@ pub struct Engine {
     /// Wakes the scheduler when the outbox or snoozes change.
     wake: Arc<Notify>,
     /// Fetches sender pictures; made on first use (None if the system DNS setup can't be read).
-    icons: std::sync::OnceLock<Option<Arc<icons::Fetcher>>>,
+    /// Shared by clones, so there is one fetcher.
+    icons: Arc<std::sync::OnceLock<Option<Arc<icons::Fetcher>>>>,
+    /// Wakes the rule runner when new Inbox mail is queued for it.
+    rules_wake: Arc<Notify>,
 }
 
 impl Engine {
@@ -62,7 +70,8 @@ impl Engine {
             events,
             workers: Arc::new(Mutex::new(HashMap::new())),
             wake: Arc::new(Notify::new()),
-            icons: std::sync::OnceLock::new(),
+            icons: Arc::new(std::sync::OnceLock::new()),
+            rules_wake: Arc::new(Notify::new()),
         })
     }
 
@@ -93,12 +102,13 @@ impl Engine {
             self.start_account(acc);
         }
         tokio::spawn(scheduler(self.db.clone(), self.events.clone(), self.workers.clone(), self.wake.clone()));
+        tokio::spawn(self.clone().rule_runner());
         Ok(())
     }
 
     fn start_account(&self, acc: Account) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let worker = Worker::new(acc.clone(), self.db.clone(), self.events.clone(), rx);
+        let worker = Worker::new(acc.clone(), self.db.clone(), self.events.clone(), self.rules_wake.clone(), rx);
         let _ = tx.send(Cmd::SyncAll);
         let tasks = vec![
             tokio::spawn(worker.run()),
@@ -440,6 +450,7 @@ impl Engine {
             html: p.html,
             text: p.text,
             attachments: p.attachments,
+            list_id: self.db.list_id(id)?,
         })
     }
 
