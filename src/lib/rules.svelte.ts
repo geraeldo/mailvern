@@ -144,19 +144,10 @@ export type FromMessage = "sender" | "domain" | "list" | "subject";
 
 /** A new rule that catches mail like this message. */
 export function ruleFromMessage(d: Detail, kind: FromMessage): Rule {
+  if (kind === "sender" || kind === "domain") return ruleFromAddress(d.fromAddr, d.fromName, d.accountId, kind);
   const r = blankRule();
   r.accountId = d.accountId;
-  const domain = d.fromAddr.split("@")[1] ?? "";
-  const name = d.fromName || d.fromAddr;
   switch (kind) {
-    case "sender":
-      r.name = `From ${name}`;
-      r.conditions = [{ field: "from", op: "is", value: d.fromAddr }];
-      break;
-    case "domain":
-      r.name = `From ${domain}`;
-      r.conditions = [{ field: "fromDomain", op: "is", value: domain }];
-      break;
     case "list": {
       const id = d.listId?.match(/<([^>]+)>/)?.[1] ?? d.listId ?? "";
       r.name = `List ${id}`;
@@ -167,6 +158,22 @@ export function ruleFromMessage(d: Detail, kind: FromMessage): Rule {
       r.name = `“${d.subject}”`;
       r.conditions = [{ field: "subject", op: "contains", value: d.subject.replace(/^\s*((re|fwd?|aw|wg)\s*:\s*)+/i, "") }];
       break;
+  }
+  r.actions = [{ type: "archive" }];
+  return r;
+}
+
+/** A new rule that catches mail from this address, or from anyone at its domain. */
+export function ruleFromAddress(email: string, name: string | null, accountId: number | null, kind: "sender" | "domain"): Rule {
+  const r = blankRule();
+  r.accountId = accountId;
+  const domain = email.split("@")[1] ?? "";
+  if (kind === "sender") {
+    r.name = `From ${name || email}`;
+    r.conditions = [{ field: "from", op: "is", value: email }];
+  } else {
+    r.name = `From ${domain}`;
+    r.conditions = [{ field: "fromDomain", op: "is", value: domain }];
   }
   r.actions = [{ type: "archive" }];
   return r;

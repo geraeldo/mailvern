@@ -1,9 +1,11 @@
 import { Menu } from "@tauri-apps/api/menu";
-import type { Account, MailView, Summary } from "./api";
-import { openRuleEditor, ruleFromMessage, describeFromMessage, type FromMessage } from "./rules.svelte";
+import type { Account, Addr, Detail, MailView, Summary } from "./api";
+import { api } from "./api";
+import { formatAddr } from "./format";
+import { openRuleEditor, ruleFromAddress, ruleFromMessage, describeFromMessage, type FromMessage } from "./rules.svelte";
 import {
   ui, openAccountSettings, openMessage, compose, archiveSelected, trashSelected, toggleJunk, selectedIsJunk, toggleSeen, toggleFlag, markAllRead,
-  checkForMail, checkAccountForMail, copyThread, selectedRows, snoozeSelected, unsnoozeSelected, moveRows, moveSelected, roleOf, editDraft,
+  toast, setQuery, trustSender, checkForMail, checkAccountForMail, copyThread, selectedRows, snoozeSelected, unsnoozeSelected, moveRows, moveSelected, roleOf, editDraft,
 } from "./state.svelte";
 
 type Item = { text: string; action: () => void; enabled?: boolean } | { text: string; items: Item[] } | "-";
@@ -92,6 +94,49 @@ function ruleItems(): Item[] {
     { text: "Describe a Rule…", action: () => ui.detail && describeFromMessage(ui.detail) },
     { text: "New Rule…", action: () => openRuleEditor() },
   ];
+}
+
+async function copy(text: string, what: string) {
+  try {
+    await api.copyText(text);
+    toast(`Copied ${what}`);
+  } catch (e) {
+    toast(`Couldn't copy: ${e}`);
+  }
+}
+
+/**
+ * Right-click on a sender or recipient in the reader. `d` is the message it appears in
+ * (for replying), `sender` whether this is its From address.
+ */
+export function addressMenu(e: MouseEvent, a: Addr, d?: Detail, sender = false) {
+  e.preventDefault();
+  e.stopPropagation();
+  const name = a.name?.trim();
+  const email = a.email.toLowerCase();
+  const mine = ui.accounts.some((x) => x.email.toLowerCase() === email);
+  const domain = email.split("@")[1] ?? "";
+  const accountId = d?.accountId ?? null;
+  const trusted = ui.trustedSenders.includes(email);
+  return popup([
+    { text: "Send Email", action: () => compose("new", { to: [formatAddr(a)] }) },
+    ...(d && !mine ? [{ text: `Reply to ${name || a.email} Only`, action: () => compose("reply", { source: d, to: [formatAddr(a)] }) }] : []),
+    "-",
+    { text: "Copy Address", action: () => copy(a.email, "address") },
+    ...(name ? [
+      { text: "Copy Name", action: () => copy(name, "name") },
+      { text: "Copy Name and Address", action: () => copy(formatAddr(a), "name and address") },
+    ] : []),
+    "-",
+    { text: "Search for This Address", action: () => setQuery(a.email) },
+    ...(mine ? [] : [
+      { text: "Create Rule", items: [
+        { text: `From ${a.email}…`, action: () => openRuleEditor(ruleFromAddress(a.email, name ?? null, accountId, "sender")) },
+        { text: `From Anyone at ${domain}…`, action: () => openRuleEditor(ruleFromAddress(a.email, name ?? null, accountId, "domain")), enabled: !!domain },
+      ] },
+    ]),
+    ...(sender && !mine && !trusted ? ["-" as const, { text: "Always Load Images from This Sender", action: () => trustSender(a.email) }] : []),
+  ]);
 }
 
 /**

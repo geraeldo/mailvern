@@ -6,6 +6,7 @@
   import { api, type Addr, type Summary } from "../api";
   import { longDate, shortDate, displayName, fileSize } from "../format";
   import Avatar from "./Avatar.svelte";
+  import { addressMenu } from "../menus";
   import { hasRemoteContent, textToHtml } from "../html";
 
   let { m, expanded, focus = false }: { m: Summary; expanded: boolean; focus?: boolean } = $props();
@@ -37,9 +38,17 @@
     if (focus) el?.scrollIntoView({ block: "start" });
   });
 
-  function names(list: Addr[]) {
-    const me = new Set(ui.accounts.map((a) => a.email.toLowerCase()));
-    return list.map((a) => (me.has(a.email.toLowerCase()) ? "me" : displayName(a.name, a.email))).join(", ");
+  const me = $derived(new Set(ui.accounts.map((a) => a.email.toLowerCase())));
+  const sender = $derived<Addr>({ name: m.fromName, email: m.fromAddr });
+  const collapsible = $derived(ui.thread.length > 1);
+
+  // Clicking anywhere on the header folds the message back up, unless the
+  // click hit one of its buttons or ended a text selection.
+  function headerClick(e: MouseEvent) {
+    if (!collapsible) return;
+    if ((e.target as HTMLElement).closest("button, a")) return;
+    if (window.getSelection()?.toString()) return;
+    open = false;
   }
 
   async function save(index: number) {
@@ -59,6 +68,10 @@
   }
 </script>
 
+{#snippet names(list: Addr[])}
+  {#each list as a, i}{#if i}, {/if}<span class="who-addr" role="presentation" title={a.email} oncontextmenu={(e) => addressMenu(e, a, d)}>{me.has(a.email.toLowerCase()) ? "me" : displayName(a.name, a.email)}</span>{/each}
+{/snippet}
+
 <div class="msg" class:open bind:this={el}>
   {#if !open}
     <button class="collapsed" onclick={() => (open = true)}>
@@ -71,17 +84,18 @@
       <span class="cdate">{shortDate(m.date)}</span>
     </button>
   {:else}
-    <div class="meta">
-      <button class="avatar" onclick={() => (open = false)} title="Collapse"><Avatar name={m.fromName} email={m.fromAddr} size={38} lookup={roleOf(m) !== "junk"} /></button>
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <div class="meta" class:collapsible role="presentation" onclick={headerClick}>
+      <button class="avatar" disabled={!collapsible} onclick={() => (open = false)} title={collapsible ? "Collapse" : undefined}><Avatar name={m.fromName} email={m.fromAddr} size={38} lookup={roleOf(m) !== "junk"} /></button>
       <div class="who">
         <div class="line">
           {#if isDraft}<span class="draft">Draft</span>{/if}
-          <span class="name">{displayName(m.fromName, m.fromAddr)}</span>
-          {#if m.fromName}<span class="addr">{m.fromAddr}</span>{/if}
+          <span class="name" role="presentation" oncontextmenu={(e) => addressMenu(e, sender, d, true)}>{displayName(m.fromName, m.fromAddr)}</span>
+          {#if m.fromName}<span class="addr" role="presentation" oncontextmenu={(e) => addressMenu(e, sender, d, true)}>{m.fromAddr}</span>{/if}
         </div>
         {#if d}
           <div class="to">
-            to {names(d.to) || "undisclosed recipients"}{#if d.cc.length}, cc {names(d.cc)}{/if}{#if d.bcc.length}, bcc {names(d.bcc)}{/if}
+            to {#if d.to.length}{@render names(d.to)}{:else}undisclosed recipients{/if}{#if d.cc.length}, cc {@render names(d.cc)}{/if}{#if d.bcc.length}, bcc {@render names(d.bcc)}{/if}
           </div>
         {/if}
       </div>
@@ -163,7 +177,9 @@
   .cdate { flex: none; color: var(--muted); font-size: 12px; }
   .draft { color: var(--danger); font-weight: 600; margin-right: 4px; }
   .meta { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 18px; }
+  .meta.collapsible { cursor: pointer; }
   .avatar { flex: none; border: 0; padding: 0; background: none; border-radius: 50%; display: grid; }
+  .avatar:disabled { cursor: default; opacity: 1; }
   .who { flex: 1; min-width: 80px; -webkit-user-select: text; user-select: text; }
   .line { display: flex; align-items: baseline; gap: 8px; min-width: 0; overflow: hidden; }
   .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: none; max-width: 100%; }
