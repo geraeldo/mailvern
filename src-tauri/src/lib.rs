@@ -318,6 +318,11 @@ async fn run_rule(engine: E<'_>, id: i64, folder_id: Option<i64>, include_sendin
 }
 
 #[tauri::command]
+fn rule_facts(engine: E, ids: Vec<i64>) -> R<Vec<mail_core::rules::Facts>> {
+    engine.rule_facts(&ids).map_err(err)
+}
+
+#[tauri::command]
 fn rule_activity(engine: E, limit: usize) -> R<Vec<RuleActivity>> {
     engine.rule_activity(limit).map_err(err)
 }
@@ -603,6 +608,7 @@ pub fn run() {
             run_rule,
             rule_activity,
             undo_rule_activity,
+            rule_facts,
         ])
         // Like other Mac mail apps: closing the window (⌘W, red button) only hides it,
         // so sync and notifications keep running. ⌘Q still quits.

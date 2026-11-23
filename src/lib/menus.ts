@@ -1,6 +1,6 @@
 import { Menu } from "@tauri-apps/api/menu";
 import type { Account, MailView, Summary } from "./api";
-import { openRuleEditor, ruleFromMessage, type FromMessage } from "./rules.svelte";
+import { openRuleEditor, ruleFromMessage, describeFromMessage, type FromMessage } from "./rules.svelte";
 import {
   ui, openAccountSettings, openMessage, compose, archiveSelected, trashSelected, toggleJunk, selectedIsJunk, toggleSeen, toggleFlag, markAllRead,
   checkForMail, checkAccountForMail, copyThread, selectedRows, snoozeSelected, unsnoozeSelected, moveRows, moveSelected, roleOf, editDraft,
@@ -89,6 +89,7 @@ function ruleItems(): Item[] {
     ...(d.listId ? [{ text: "From This Mailing List…", action: make("list") }] : []),
     { text: "With This Subject…", action: make("subject"), enabled: !!d.subject.trim() },
     "-",
+    { text: "Describe a Rule…", action: () => ui.detail && describeFromMessage(ui.detail) },
     { text: "New Rule…", action: () => openRuleEditor() },
   ];
 }

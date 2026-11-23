@@ -1,6 +1,6 @@
 // AI settings: the OpenRouter key (in the Keychain), the models for search and for writing,
 // and whether requests may go to providers that keep or train on data.
-import type { Model } from "@mariozechner/pi-ai";
+import type { Model } from "@earendil-works/pi-ai";
 import { api } from "../api";
 
 const OPENROUTER = "https://openrouter.ai/api/v1";

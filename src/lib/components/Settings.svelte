@@ -23,6 +23,7 @@
   function close() {
     ui.settings = null;
     rulesUi.draft = null;
+    rulesUi.source = null;
   }
 </script>
 

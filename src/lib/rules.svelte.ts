@@ -1,5 +1,5 @@
 // Rules: what the Rules settings show and edit, and the words used to describe a rule.
-import { api, type Detail, type Rule, type RuleAction, type RuleCondition, type RuleField, type RuleOp, type SnoozeUntil } from "./api";
+import { api, type Detail, type Rule, type RuleAction, type RuleCondition, type RuleFacts, type RuleField, type RuleOp, type SnoozeUntil } from "./api";
 import { accountById, accountLabel, folderById, openSettings, toast, ui } from "./state.svelte";
 
 export const rulesUi = $state({
@@ -7,6 +7,8 @@ export const rulesUi = $state({
   loaded: false,
   /** The rule being edited (id 0 for a new one), or null for the list. */
   draft: null as Rule | null,
+  /** A message to describe a rule from ("Create Rule › Describe…"): the AI starts from its headers. */
+  source: null as RuleFacts | null,
 });
 
 export async function loadRules() {
@@ -122,7 +124,20 @@ export function ruleSummary(r: Rule): string {
 /** Opens Settings › Rules on the editor, on `draft` or a blank rule. */
 export function openRuleEditor(draft: Rule | null = null) {
   rulesUi.draft = structuredClone($state.snapshot(draft ?? blankRule())) as Rule;
+  rulesUi.source = null;
   openSettings("rules");
+}
+
+/** Opens Settings › Rules on the describe box, with this message as the example to start from. */
+export async function describeFromMessage(d: Detail) {
+  try {
+    const [facts] = await api.ruleFacts([d.id]);
+    rulesUi.draft = null;
+    rulesUi.source = facts ?? null;
+    openSettings("rules");
+  } catch (e) {
+    toast(String(e));
+  }
 }
 
 export type FromMessage = "sender" | "domain" | "list" | "subject";

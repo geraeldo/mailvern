@@ -182,6 +182,25 @@ export type Rule = {
   /** Why Mailvern switched it off. */
   pausedReason: string | null;
 };
+/** The headers rules look at in a message. */
+export type RuleFacts = {
+  id: number;
+  accountId: number;
+  folderId: number;
+  fromName: string;
+  fromAddr: string;
+  to: Addr[];
+  cc: Addr[];
+  replyTo: Addr[];
+  subject: string;
+  listId: string | null;
+  /** Set when a machine sent it: its Auto-Submitted value, or bulk/list/junk from Precedence. */
+  auto: string | null;
+  hasAttachments: boolean;
+  seen: boolean;
+  date: number;
+  role: string | null;
+};
 export type RuleTest = { count: number; scanned: number; withoutBody: number; sample: Summary[] };
 export type RuleRun = { matched: number; sent: number; notSent: number };
 export type RuleActivity = {
@@ -276,4 +295,5 @@ export const api = {
     invoke<RuleRun>("run_rule", { id, folderId, includeSending }),
   ruleActivity: (limit = 50) => invoke<RuleActivity[]>("rule_activity", { limit }),
   undoRuleActivity: (id: number) => invoke<void>("undo_rule_activity", { id }),
+  ruleFacts: (ids: number[]) => invoke<RuleFacts[]>("rule_facts", { ids }),
 };

@@ -225,7 +225,8 @@ function consider(run: Run, m: { id: number; threadId: string | null }) {
 }
 
 async function runTool(call: ToolCall, run: Run, step: (s: AiStep) => AiStep): Promise<Out> {
-  const a = call.arguments;
+  // Validated against the tool's schema before it gets here (validateToolCall).
+  const a = call.arguments as Record<string, any>;
   const remember = (rows: Summary[]) => rows.forEach((r) => run.seen.set(r.id, r));
   switch (call.name) {
     case "search_mail": {

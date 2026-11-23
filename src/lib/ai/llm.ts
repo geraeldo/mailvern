@@ -1,21 +1,25 @@
-// The slice of pi-ai the app uses. Only the OpenAI-compatible provider is imported (OpenRouter
-// speaks it); pi-ai's main entry would bundle every provider and their Node-only dependencies.
-import type { AssistantMessageEventStream, Context, Model, Tool, ToolCall } from "@mariozechner/pi-ai";
+// The slice of Pi (pi-ai) the app uses. Only the OpenAI-compatible API is used: OpenRouter
+// speaks it. It is called directly, without a provider collection or the built-in catalogs.
+import { normalizeContext, type AssistantMessageEventStream, type Context, type Model, type Tool, type ToolCall, type TranscriptContext } from "@earendil-works/pi-ai";
 import { Type, type TSchema } from "typebox";
 import { Value } from "typebox/value";
 
-export type { AssistantMessage, Context, ImageContent, TextContent, Tool, ToolCall, ToolResultMessage } from "@mariozechner/pi-ai";
+export type { AssistantMessage, Context, ImageContent, Message, TextContent, Tool, ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
 export { Type };
 
 export type StreamOptions = { apiKey: string; signal?: AbortSignal; maxTokens?: number };
 
-// Loaded on first use: it brings pi-ai's model catalog, which the app doesn't need at launch.
-let provider: Promise<typeof import("@mariozechner/pi-ai/openai-completions")> | null = null;
+// Loaded on first use: it brings the OpenAI SDK, which the app doesn't need at launch.
+let api: Promise<typeof import("@earendil-works/pi-ai/api/openai-completions")> | null = null;
 
-export async function stream(model: Model<"openai-completions">, context: Context, options: StreamOptions): Promise<AssistantMessageEventStream> {
-  provider ??= import("@mariozechner/pi-ai/openai-completions");
-  provider.catch(() => (provider = null));
-  return (await provider).streamOpenAICompletions(model, context, options);
+/**
+ * Streams one reply. Takes a context with a system prompt and tools, or a transcript whose
+ * system messages already carry them (what the agent loop passes).
+ */
+export async function stream(model: Model<"openai-completions">, context: Context | TranscriptContext, options: StreamOptions): Promise<AssistantMessageEventStream> {
+  api ??= import("@earendil-works/pi-ai/api/openai-completions");
+  api.catch(() => (api = null));
+  return (await api).stream(model, normalizeContext(context as Context), options);
 }
 
 /** A string enum as plain JSON Schema (`enum`), which every provider accepts. */

@@ -141,24 +141,21 @@ function mockOpenRouter(url: string, init?: RequestInit): Response | null {
     const short = user.includes("shorter");
     return sse([...textChunks(short ? "<div>Hi Maya,</div><div><br></div><div>The agenda looks good. Could we add 15 minutes for the offsite budget?</div>" : "<div>Hi Maya,</div><div><br></div><div>Thanks for sharing the agenda. It looks great to me. Could we add 15 minutes to discuss the offsite budget?</div><div><br></div><div>See you Thursday.</div>"), end("stop")]);
   }
-  // Rules from plain language: propose a rule moving mail to a "Clients" folder.
+  // Rules from plain language, as an agent: look at Northwind's mail, try the rule, propose it.
   const propose = req.tools.find((t: any) => t.function?.name === "propose_rule");
   if (propose) {
     const folderEnum: string[] = propose.function.parameters.properties.actions.items.properties.folder.enum ?? [];
     const folder = folderEnum.find((f) => f.endsWith("Clients")) ?? folderEnum[0];
-    return sse([
-      ...toolChunks([{
-        name: "propose_rule",
-        args: {
-          name: "Northwind to Clients",
-          account: "all accounts",
-          matchAll: true,
-          conditions: [{ field: "fromDomain", op: "is", value: "northwind.io" }],
-          actions: [{ type: "move", folder }, { type: "flag" }],
-        },
-      }]),
-      end("tool_calls"),
-    ]);
+    const rule = {
+      name: "Northwind to Clients",
+      account: "all accounts",
+      matchAll: true,
+      conditions: [{ field: "fromDomain", op: "is", value: "northwind.io" }],
+      actions: [{ type: "move", folder }, { type: "flag" }],
+    };
+    const done = msgs.filter((m) => m.role === "tool").length;
+    const next = done === 0 ? { name: "search_mail", args: { from: "northwind" } } : done === 1 ? { name: "try_rule", args: rule } : { name: "propose_rule", args: rule };
+    return sse([...toolChunks([next]), end("tool_calls")]);
   }
   // Script: search, read the conversation it found, then answer. Follow-ups answer at once.
   const lastUser = msgs.map((m) => m.role).lastIndexOf("user");
@@ -287,6 +284,13 @@ export function installMock() {
         return { matched: hits.length, sent: args.includeSending ? hits.length * sends : 0, notSent: args.includeSending ? 0 : hits.length * sends };
       }
       case "rule_activity": return ruleLog.slice(0, args.limit);
+      case "rule_facts":
+        return (args.ids as number[]).map((id) => messages.find((m) => m.id === id)).filter(Boolean).map((m) => ({
+          id: m!.id, accountId: m!.accountId, folderId: m!.folderId, fromName: m!.fromName, fromAddr: m!.fromAddr,
+          to: [{ name: "Alex Rivera", email: accounts[m!.accountId - 1].email }], cc: [], replyTo: [], subject: m!.subject,
+          listId: m!.fromAddr.includes("github") ? "<updates.list.example.com>" : null, auto: null,
+          hasAttachments: m!.hasAttachments, seen: m!.seen, date: m!.date, role: folders.find((f) => f.id === m!.folderId)?.role ?? null,
+        }));
       case "undo_rule_activity": { const e = ruleLog.find((x) => x.id === args.id); if (e) { e.undone = true; e.canUndo = false; } return null; }
       case "accounts": return accounts;
       case "folders": {

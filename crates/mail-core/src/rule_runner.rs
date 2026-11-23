@@ -35,6 +35,12 @@ impl Engine {
         self.db.rules()
     }
 
+    /// The headers rules look at, for these messages (missing ones are left out). The AI
+    /// that writes rules reads these as examples.
+    pub fn rule_facts(&self, ids: &[i64]) -> Result<Vec<Facts>> {
+        ids.iter().filter_map(|id| self.db.rule_facts(*id).transpose()).collect()
+    }
+
     pub fn rule(&self, id: i64) -> Result<Rule> {
         self.db.rule(id)?.ok_or_else(|| anyhow!("There is no rule {id}"))
     }

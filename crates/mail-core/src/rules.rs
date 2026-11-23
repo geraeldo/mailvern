@@ -5,9 +5,11 @@ use crate::model::*;
 use crate::text::{escape_html, html_to_text, quotable_html};
 use chrono::{Datelike, Duration, Local, TimeZone};
 use regex::{Regex, RegexBuilder};
+use serde::Serialize;
 
-/// What rules can see of a stored message.
-#[derive(Clone, Debug, Default)]
+/// What rules can see of a stored message: its headers, never its body.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Facts {
     pub id: i64,
     pub account_id: i64,

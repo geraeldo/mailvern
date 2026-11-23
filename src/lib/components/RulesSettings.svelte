@@ -7,7 +7,7 @@
   import Icon from "./Icon.svelte";
   import RuleEditor from "./RuleEditor.svelte";
   import { rulesUi, loadRules, ruleSummary, openRuleEditor, actionText, sends } from "../rules.svelte";
-  import { describeRule } from "../ai/rules";
+  import { describeRule, type RuleStep } from "../ai/rules";
   import { searchReady } from "../ai/config.svelte";
   import { openSettings, toast } from "../state.svelte";
 
@@ -15,7 +15,14 @@
   let describe = $state("");
   let thinking = $state(false);
   let aiError = $state<string | null>(null);
+  let steps = $state<RuleStep[]>([]);
   let abort: AbortController | null = null;
+  let describeInput = $state<HTMLInputElement>();
+
+  // Coming from a message's "Describe a Rule…": ready for typing.
+  $effect(() => {
+    if (rulesUi.source) describeInput?.focus();
+  });
 
   onMount(() => {
     loadRules();
@@ -91,15 +98,17 @@
     }
     thinking = true;
     aiError = null;
+    steps = [];
     abort = new AbortController();
     try {
-      const rule = await describeRule(text, abort.signal);
+      const rule = await describeRule(text, { signal: abort.signal, source: $state.snapshot(rulesUi.source), onStep: (s) => (steps = s) });
       describe = "";
       openRuleEditor(rule);
     } catch (e) {
       if (!abort.signal.aborted) aiError = e instanceof Error ? e.message : String(e);
     }
     thinking = false;
+    steps = [];
   }
 </script>
 
@@ -110,7 +119,8 @@
     <Icon name="sparkle" />
     <input
       class="plain"
-      placeholder="Describe a rule, e.g. “Archive GitHub mail and mark it read”"
+      placeholder={rulesUi.source ? "What should happen to mail like this?" : "Describe a rule, e.g. “Archive GitHub mail and mark it read”"}
+      bind:this={describeInput}
       bind:value={describe}
       disabled={thinking} />
     {#if thinking}
@@ -119,7 +129,19 @@
       <button class="btn sm" disabled={!describe.trim()}>Create</button>
     {/if}
   </form>
-  {#if thinking}<p class="hint">Writing the rule…</p>{/if}
+  {#if rulesUi.source}
+    <div class="source">
+      <span>Like <b>{rulesUi.source.fromName || rulesUi.source.fromAddr}</b> · “{rulesUi.source.subject || "(no subject)"}”</span>
+      <button class="icon-btn" title="Don't start from this message" onclick={() => (rulesUi.source = null)} disabled={thinking}><Icon name="x" size={13} /></button>
+    </div>
+  {/if}
+  {#if thinking}
+    <ul class="steps">
+      {#each steps as s, i (i)}
+        <li class:done={s.done}>{s.text}{s.done ? "" : "…"}</li>
+      {/each}
+    </ul>
+  {/if}
   {#if aiError}<p class="err">{aiError}</p>{/if}
 
   <section>
@@ -206,6 +228,13 @@
   .describe:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
   .describe :global(svg) { color: var(--accent); flex: none; }
   .plain { flex: 1; min-width: 0; height: 100%; border: 0; outline: none; background: transparent; font-size: 13.5px; }
+  .source { display: flex; align-items: center; gap: 6px; margin-top: 8px; padding: 2px 4px 2px 10px; border-radius: 8px; background: var(--hover); font-size: 12.5px; color: var(--text-2); }
+  .source span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .source .icon-btn { width: 24px; height: 24px; }
+  .steps { margin: 8px 0 0; padding: 0 0 0 2px; list-style: none; display: flex; flex-direction: column; gap: 3px; font-size: 12.5px; color: var(--text-2); }
+  .steps li.done { color: var(--muted); }
+  .steps li::before { content: "•"; margin-right: 6px; color: var(--accent); }
+  .steps li.done::before { content: "✓"; }
 
   .list { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
   .list:empty { display: none; }
