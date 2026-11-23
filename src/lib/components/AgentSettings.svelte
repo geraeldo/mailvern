@@ -8,6 +8,10 @@
   let busy = $state(false);
   let failed = $state<string | null>(null);
   let copied = $state<string | null>(null);
+  /** The token was just reset: every agent set up before is locked out until its command is run again. */
+  let wasReset = $state(false);
+  /** Commands copied since the reset, to show which agents are done. */
+  let redone = $state<string[]>([]);
 
   onMount(() => change(api.agentAccess()));
 
@@ -50,6 +54,7 @@
     try {
       await api.copyText(text);
       copied = what;
+      if (wasReset && !redone.includes(what)) redone.push(what);
       setTimeout(() => copied === what && (copied = null), 1600);
     } catch (e) {
       failed = String(e);
@@ -63,7 +68,12 @@
       okLabel: "Reset",
       cancelLabel: "Cancel",
     });
-    if (ok) change(api.resetAgentToken());
+    if (!ok) return;
+    await change(api.resetAgentToken());
+    if (!failed) {
+      wasReset = true;
+      redone = [];
+    }
   }
 </script>
 
@@ -90,12 +100,24 @@
 
 {#if access?.enabled && token}
   <div class="group">
-    <div class="gname">Set up an agent</div>
+    <div class="gname">{wasReset ? "Set up your agents again" : "Set up an agent"}</div>
+    {#if wasReset}
+      <p class="notice">
+        The token is reset, and agents set up with the old one can no longer connect.
+        For each agent you use, copy its command below and run it in Terminal. It removes the old entry and adds the new one.
+      </p>
+    {/if}
     {#each clients as c (c.name)}
       <div class="row">
         <span class="text">
           <span class="label">{c.name}</span>
-          <span class="detail">Run this in Terminal. After a token reset, run it again.</span>
+          <span class="detail">
+            {#if wasReset}
+              {redone.includes(c.name) ? "Copied. Run it in Terminal to reconnect." : "Needs the new token: copy and run this in Terminal."}
+            {:else}
+              Run this in Terminal. It replaces any earlier Mailvern entry, so it is also how you reconnect after a token reset.
+            {/if}
+          </span>
           <code>{masked(c.command)}</code>
         </span>
         <button class="btn" onclick={() => copy(c.command, c.name)}>{copied === c.name ? "Copied" : "Copy"}</button>
@@ -104,7 +126,9 @@
     <div class="row">
       <span class="text">
         <span class="label">Another agent</span>
-        <span class="detail">Add an MCP server of type HTTP with this address, and this header.</span>
+        <span class="detail">
+          Add an MCP server of type HTTP with this address, and this header.{wasReset ? " Replace the old header in the agent's settings with this one." : ""}
+        </span>
         <code>{access.url}</code>
         <code>Authorization: Bearer {masked(token)}</code>
       </span>
@@ -163,5 +187,14 @@
     user-select: text;
   }
   .btn { flex: none; }
+  .notice {
+    margin: 4px 0 2px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: var(--accent-soft);
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: var(--text);
+  }
   .note { margin: 14px 0 0; font-size: 12.5px; line-height: 1.5; color: var(--muted); }
 </style>

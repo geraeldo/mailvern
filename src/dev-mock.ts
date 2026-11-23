@@ -343,6 +343,12 @@ export function installMock() {
         const enabled = settings.mcp_enabled === "on";
         return { enabled, running: enabled, url: "http://127.0.0.1:47823/mcp", token: enabled ? settings.mcp_token : null, error: null };
       }
+      // Confirm dialogs are accepted: the answer is the label of the OK button.
+      case "plugin:dialog|message": {
+        const b = args.buttons;
+        const custom = b && typeof b === "object" ? (Object.values(b)[0] as unknown) : null;
+        return Array.isArray(custom) ? custom[0] : typeof custom === "string" ? custom : "Yes";
+      }
       case "copy_text": (window as any).__copied = args.text; return navigator.clipboard?.writeText(args.text).catch(() => {});
       default: return null;
     }
