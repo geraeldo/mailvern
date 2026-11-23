@@ -69,14 +69,18 @@ impl Names {
         Ok(Names { accounts: ctx.engine.accounts()?, folders: ctx.engine.folders()?, sync: ctx.sync.lock().unwrap().clone() })
     }
 
-    /// What is wrong with an account's local mail, if anything: " · can't sync: …".
+    /// Why an account's local mail can't be relied on, if so: it can't sync, or nothing has
+    /// been downloaded. A sync in progress is not trouble; mail is checked all the time.
     fn trouble(&self, a: &Account) -> Option<String> {
         match self.sync.get(&a.id) {
             Some((state, message)) if state == "error" => Some(format!("can't sync: {}", message.as_deref().unwrap_or("unknown error"))),
             _ if !self.folders.iter().any(|f| f.account_id == a.id) => Some("nothing downloaded yet".into()),
-            Some((state, _)) if state == "syncing" => Some("syncing now".into()),
             _ => None,
         }
+    }
+
+    fn syncing(&self, a: &Account) -> bool {
+        self.sync.get(&a.id).is_some_and(|(state, _)| state == "syncing")
     }
 
     /// A line for search results when some account's mail may be missing, so "nothing found"
@@ -124,7 +128,8 @@ impl Names {
                     })
                     .collect();
                 let label = if label.is_empty() { String::new() } else { format!("{label} ") };
-                let trouble = self.trouble(a).map(|t| format!(" · {t}")).unwrap_or_default();
+                let state = self.trouble(a).or_else(|| self.syncing(a).then(|| "checking for mail now".to_string()));
+                let trouble = state.map(|t| format!(" · {t}")).unwrap_or_default();
                 let folders = if folders.is_empty() { "  (no folders yet)".to_string() } else { folders.join("\n") };
                 format!("Account {}: {label}<{}>{trouble}\n{folders}", a.id, a.email)
             })
@@ -176,11 +181,12 @@ mod tests {
         };
         let folder = |id: i64, account_id: i64| Folder { id, account_id, path: "INBOX".into(), name: "Inbox".into(), role: Some("inbox".into()), unread: 2, position: None };
         let mut names = Names { accounts: vec![acc(1, "a@x.co"), acc(2, "b@x.co"), acc(3, "c@x.co")], folders: vec![folder(5, 1), folder(6, 3)], sync: HashMap::new() };
-        names.sync.insert(1, ("idle".into(), None));
+        // A routine check for mail is shown in the list but is no reason to doubt results.
+        names.sync.insert(1, ("syncing".into(), None));
         names.sync.insert(3, ("error".into(), Some("Sign-in failed".into())));
         assert_eq!(
             names.listing(),
-            "Account 1: <a@x.co>\n  folder 5: Inbox [inbox] · 2 unread\n\nAccount 2: <b@x.co> · nothing downloaded yet\n  (no folders yet)\n\nAccount 3: <c@x.co> · can't sync: Sign-in failed\n  folder 6: Inbox [inbox] · 2 unread"
+            "Account 1: <a@x.co> · checking for mail now\n  folder 5: Inbox [inbox] · 2 unread\n\nAccount 2: <b@x.co> · nothing downloaded yet\n  (no folders yet)\n\nAccount 3: <c@x.co> · can't sync: Sign-in failed\n  folder 6: Inbox [inbox] · 2 unread"
         );
         let warning = names.warning().unwrap();
         assert!(warning.contains("b@x.co (nothing downloaded yet), c@x.co (can't sync: Sign-in failed)"), "{warning}");
