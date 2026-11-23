@@ -2,7 +2,7 @@
   import Icon from "./Icon.svelte";
   import { ui, setView, compose, openSettings, openAccountSettings, accountLabel, reorderAccounts, reorderFolders, unifiedRoles } from "../state.svelte";
   import { sortable } from "../sortable";
-  import { accountMenu, folderMenu } from "../menus";
+  import { accountMenu, allAccountsMenu, folderMenu } from "../menus";
   import { hint } from "../shortcuts.svelte";
   import { api, type Folder, type MailView } from "../api";
 
@@ -53,6 +53,13 @@
     searching ? ui.searchScope.kind === "unified" && ui.searchScope.role === role : ui.view.kind === "unified" && ui.view.role === role;
   const isAccountScope = (id: number) => searching && ui.searchScope.kind === "account" && ui.searchScope.accountId === id;
 
+  const everyCollapsed = () => allCollapsed && ui.accounts.every((a) => collapsed[a.id]);
+  function setAllCollapsed(value: boolean) {
+    allCollapsed = value;
+    collapsed = Object.fromEntries(ui.accounts.map((a) => [a.id, value]));
+  }
+  const fold = (isCollapsed: boolean, toggle: () => void) => ({ collapsed: isCollapsed, toggle, allCollapsed: everyCollapsed(), setAll: setAllCollapsed });
+
   function openFolderMenu(e: MouseEvent, view: MailView, unread: number) {
     e.preventDefault();
     folderMenu(view, unread);
@@ -71,7 +78,10 @@
     {#if ui.accounts.length}
       <div class="group all">
         <div class="head-row">
-          <button class="group-head" onclick={() => (allCollapsed = !allCollapsed)}>
+          <button
+            class="group-head"
+            onclick={() => (allCollapsed = !allCollapsed)}
+            oncontextmenu={(e) => { e.preventDefault(); allAccountsMenu(fold(allCollapsed, () => (allCollapsed = !allCollapsed))); }}>
             <span class="glyph"><Icon name="inboxes" size={12} stroke={2} /></span>
             <span class="label">All Accounts</span>
             <span class="chev" class:open={!allCollapsed}><Icon name="chevron" size={12} stroke={2} /></span>
@@ -113,7 +123,7 @@
               class:scoped={isAccountScope(acc.id)}
               title={acc.email}
               onclick={() => (collapsed[acc.id] = !collapsed[acc.id])}
-              oncontextmenu={(e) => { e.preventDefault(); accountMenu(acc, !!collapsed[acc.id], () => (collapsed[acc.id] = !collapsed[acc.id])); }}>
+              oncontextmenu={(e) => { e.preventDefault(); accountMenu(acc, fold(!!collapsed[acc.id], () => (collapsed[acc.id] = !collapsed[acc.id]))); }}>
               <span class="dot" style:background={acc.color || "var(--muted)"}></span>
               <span class="label">{accountLabel(acc)}</span>
               {#if st?.state === "error"}

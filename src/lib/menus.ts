@@ -25,13 +25,32 @@ async function popup(items: Item[]) {
   await menu.popup();
 }
 
-export function accountMenu(acc: Account, collapsed: boolean, toggle: () => void) {
+/** Collapse/expand one sidebar group, plus every group at once. */
+export type Fold = { collapsed: boolean; toggle: () => void; allCollapsed: boolean; setAll: (collapsed: boolean) => void };
+
+function foldItems(f: Fold): Item[] {
+  return [
+    { text: f.collapsed ? "Expand" : "Collapse", action: f.toggle },
+    f.allCollapsed ? { text: "Expand All", action: () => f.setAll(false) } : { text: "Collapse All", action: () => f.setAll(true) },
+  ];
+}
+
+export function accountMenu(acc: Account, fold: Fold) {
   return popup([
     { text: "Account Settings…", action: () => openAccountSettings(acc.id) },
     { text: "Add Account…", action: () => openAccountSettings("new") },
     { text: "Check for Mail", action: () => checkAccountForMail(acc.id) },
     "-",
-    { text: collapsed ? "Expand" : "Collapse", action: toggle },
+    ...foldItems(fold),
+  ]);
+}
+
+/** Right-click on the All Accounts header. */
+export function allAccountsMenu(fold: Fold) {
+  return popup([
+    { text: "Add Account…", action: () => openAccountSettings("new") },
+    "-",
+    ...foldItems(fold),
   ]);
 }
 
