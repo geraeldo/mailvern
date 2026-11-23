@@ -1,4 +1,4 @@
-//! Access for coding agents on this Mac (Claude Code, Opencode): runs the MCP server from
+//! Access for coding agents on this Mac (Claude Code, Codex, Opencode): runs the MCP server from
 //! `crates/mail-mcp` while the setting is on. Off by default.
 
 use mail_core::Engine;

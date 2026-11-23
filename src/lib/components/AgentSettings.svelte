@@ -23,11 +23,22 @@
   }
 
   const token = $derived(access?.token ?? "");
-  /** One-line setup for each agent. The names and flags are the agents' own. */
+  /**
+   * One-line setup for each agent, in the agents' own commands. Each can be run again:
+   * it replaces the earlier entry, which is how a new token reaches an agent after a reset.
+   * Codex has no flag for a header, so its entry goes straight into its config file.
+   */
   const clients = $derived(
     access && token
       ? [
-          { name: "Claude Code", command: `claude mcp add --transport http --scope user mailvern ${access.url} --header "Authorization: Bearer ${token}"` },
+          {
+            name: "Claude Code",
+            command: `claude mcp remove mailvern -s user >/dev/null 2>&1; claude mcp add --transport http --scope user mailvern ${access.url} --header "Authorization: Bearer ${token}"`,
+          },
+          {
+            name: "Codex",
+            command: `codex mcp remove mailvern >/dev/null 2>&1; printf '\\n[mcp_servers.mailvern]\\nurl = "${access.url}"\\nhttp_headers = { Authorization = "Bearer ${token}" }\\n' >> ~/.codex/config.toml`,
+          },
           { name: "Opencode", command: `opencode mcp add --global mailvern --url ${access.url} --header "Authorization=Bearer ${token}"` },
         ]
       : [],
@@ -46,7 +57,7 @@
   }
 
   async function reset() {
-    const ok = await ask("Agents you have set up will stop working until you set them up again with the new token.", {
+    const ok = await ask("Agents you have set up will stop working until you run their setup command again.", {
       title: "Reset the access token?",
       kind: "warning",
       okLabel: "Reset",
@@ -63,7 +74,7 @@
     <span class="text">
       <span class="label">Let agents on this Mac use Mailvern</span>
       <span class="detail">
-        Coding agents such as Claude Code and Opencode can then search and read your mail, open attachments and save drafts.
+        Coding agents such as Claude Code, Codex and Opencode can then search and read your mail, open attachments and save drafts.
         They can't send, move or delete anything.
       </span>
       {#if failed}
@@ -84,7 +95,7 @@
       <div class="row">
         <span class="text">
           <span class="label">{c.name}</span>
-          <span class="detail">Run this once in Terminal.</span>
+          <span class="detail">Run this in Terminal. After a token reset, run it again.</span>
           <code>{masked(c.command)}</code>
         </span>
         <button class="btn" onclick={() => copy(c.command, c.name)}>{copied === c.name ? "Copied" : "Copy"}</button>

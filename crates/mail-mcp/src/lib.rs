@@ -1,4 +1,4 @@
-//! An MCP server for Mailvern, so coding agents on this Mac (Claude Code, Opencode) can
+//! An MCP server for Mailvern, so coding agents on this Mac (Claude Code, Codex, Opencode) can
 //! search and read mail and save drafts.
 //!
 //! It runs inside the app and shares its `Engine`, so there is one IMAP connection per
