@@ -252,6 +252,16 @@ async function run(p: Promise<unknown>) {
   loadFolders();
 }
 
+/** Checks the server for new mail in just this folder (or unified folder). */
+export function checkForMail(view: View) {
+  api.syncView(view).catch((e) => toast(String(e)));
+}
+
+/** Checks the server for new mail in every folder of one account. */
+export function checkAccountForMail(accountId: number) {
+  api.syncAccount(accountId).catch((e) => toast(String(e)));
+}
+
 export function archiveSelected() {
   const id = removeSelected();
   if (id != null) run(api.archive([id])).then(() => toast("Archived"));

@@ -71,6 +71,19 @@ impl Engine {
         }
     }
 
+    /// Checks every folder of one account.
+    pub fn sync_account(&self, account_id: i64) -> Result<()> {
+        self.send_cmd(account_id, Cmd::SyncAll)
+    }
+
+    /// Checks just the folders behind a view (one folder, or one role across accounts).
+    pub fn sync_view(&self, view: &View) -> Result<()> {
+        for (acc, folder_id) in self.view_folders(view)? {
+            self.send_cmd(acc, Cmd::SyncFolder(folder_id))?;
+        }
+        Ok(())
+    }
+
     // ---------- accounts ----------
 
     pub fn accounts(&self) -> Result<Vec<Account>> {

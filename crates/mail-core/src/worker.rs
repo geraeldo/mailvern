@@ -186,6 +186,7 @@ impl Worker {
         match cmd {
             Cmd::SyncAll => self.sync_all().await,
             Cmd::SyncFolder(id) => {
+                self.status("syncing", None);
                 let (_, path, role) = self.db.folder(*id)?;
                 self.sync_folder(*id, &path, role.as_deref()).await?;
                 self.prefetch(*id, &path, role.as_deref()).await?;

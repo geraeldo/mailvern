@@ -113,6 +113,16 @@ fn sync_now(engine: E) {
 }
 
 #[tauri::command]
+fn sync_account(engine: E, account_id: i64) -> R<()> {
+    engine.sync_account(account_id).map_err(err)
+}
+
+#[tauri::command]
+fn sync_view(engine: E, view: View) -> R<()> {
+    engine.sync_view(&view).map_err(err)
+}
+
+#[tauri::command]
 fn get_setting(engine: E, key: String) -> R<Option<String>> {
     engine.setting(&key).map_err(err)
 }
@@ -327,6 +337,8 @@ pub fn run() {
             not_junk,
             send,
             sync_now,
+            sync_view,
+            sync_account,
             get_setting,
             set_setting,
             open_attachment,
