@@ -8,8 +8,8 @@ const accounts = [
   { id: 3, label: "", name: "Acme Billing", email: "billing@acme.co", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465, color: "#D9A21B", signature: "", position: 2 },
 ];
 
-const roles = ["inbox", "drafts", "sent", "archive", "junk", "trash"];
-const names: Record<string, string> = { inbox: "Inbox", drafts: "Drafts", sent: "Sent", archive: "Archive", junk: "Spam", trash: "Trash" };
+const roles = ["inbox", "drafts", "sent", "archive", "junk", "trash", "snoozed"];
+const names: Record<string, string> = { inbox: "Inbox", drafts: "Drafts", sent: "Sent", archive: "Archive", junk: "Spam", trash: "Trash", snoozed: "Snoozed" };
 const folders = accounts.flatMap((a) =>
   [...roles.map((r, i) => ({ id: a.id * 10 + i, accountId: a.id, path: names[r], name: names[r], role: r as string | null, unread: 0, position: null as number | null })),
     { id: a.id * 10 + 7, accountId: a.id, path: "Clients", name: "Clients", role: null, unread: 0, position: null },
@@ -33,7 +33,11 @@ const subjects = [
 ];
 
 const now = Math.floor(Date.now() / 1000);
-const messages = Array.from({ length: 64 }, (_, i) => {
+type M = {
+  id: number; accountId: number; folderId: number; fromName: string; fromAddr: string; subject: string; snippet: string;
+  date: number; seen: boolean; flagged: boolean; hasAttachments: boolean; threadId: string | null; count: number; ids: number[]; snoozedUntil: number | null;
+};
+const messages: M[] = Array.from({ length: 64 }, (_, i) => {
   const p = people[i % people.length];
   const s = subjects[i % subjects.length];
   const acc = accounts[i % 3];
@@ -49,8 +53,21 @@ const messages = Array.from({ length: 64 }, (_, i) => {
     seen: i % 3 !== 0,
     flagged: i === 2,
     hasAttachments: i % 4 === 1,
+    threadId: `t${i + 1}`,
+    count: 1,
+    ids: [i + 1],
+    snoozedUntil: null,
   };
 });
+// A conversation: Maya's agenda (1), Alex's reply in Sent (65), and Maya again (66).
+messages[0].date = now - 7200;
+messages.push(
+  { ...messages[0], id: 65, folderId: 12, fromName: "Alex Rivera", fromAddr: "hello@acme.co", subject: "Re: Q4 planning — draft agenda", snippet: "Looks good. Can we add 15 minutes for the offsite budget?", date: now - 3000, seen: true, threadId: "t1", hasAttachments: false, flagged: false, ids: [65] },
+  { ...messages[0], id: 66, subject: "Re: Q4 planning — draft agenda", snippet: "Done, added it after hiring. See you Thursday!", date: now - 600, seen: false, threadId: "t1", hasAttachments: false, flagged: false, ids: [66] },
+  { ...messages[4], id: 67, folderId: 16, subject: "Lunch on Friday?", snippet: "Snoozed until the weekend.", date: now - 86400 * 3, seen: true, threadId: "t67", ids: [67], snoozedUntil: now + 86400 * 2 },
+);
+const outbox: any[] = [];
+let outboxId = 0;
 
 function refreshCounts() {
   for (const f of folders) f.unread = messages.filter((m) => m.folderId === f.id && !m.seen).length;
@@ -88,19 +105,71 @@ export function installMock() {
         return null;
       case "messages": {
         const v = args.view;
-        const rows = messages.filter((m) => (v.kind === "unified" ? folders.find((f) => f.id === m.folderId)?.role === v.role : m.folderId === v.folderId));
-        return rows.slice(args.offset, args.offset + args.limit);
+        const rows = messages
+          .filter((m) => (v.kind === "unified" ? folders.find((f) => f.id === m.folderId)?.role === v.role : m.folderId === v.folderId))
+          .sort((a, b) => b.date - a.date);
+        if (!args.threaded) return rows.slice(args.offset, args.offset + args.limit).map((m) => ({ ...m, count: 1, ids: [m.id] }));
+        const groups = new Map<string, M[]>();
+        for (const m of rows) groups.set(m.threadId ?? `m${m.id}`, [...(groups.get(m.threadId ?? `m${m.id}`) ?? []), m]);
+        const out = [...groups.values()].map((g) => ({
+          ...g[0],
+          seen: g.every((m) => m.seen),
+          ids: g.map((m) => m.id),
+          count: messages.filter((m) => m.threadId === g[0].threadId).length,
+        }));
+        return out.slice(args.offset, args.offset + args.limit);
       }
+      case "thread": {
+        const m = messages.find((x) => x.id === args.id)!;
+        return messages.filter((x) => x.threadId === m.threadId).sort((a, b) => a.date - b.date);
+      }
+      case "search_server": {
+        await new Promise((r) => setTimeout(r, 900));
+        return messages.filter((m) => m.snippet.toLowerCase().includes(args.query.toLowerCase())).slice(0, 5);
+      }
+      case "archive": case "trash": case "junk": case "not_junk": case "move_to": case "snooze": case "unsnooze": {
+        const dest = cmd === "snooze" ? 16 : cmd === "move_to" ? args.folderId : cmd === "archive" ? 13 : cmd === "trash" ? 15 : cmd === "junk" ? 14 : 10;
+        for (const id of args.ids) {
+          const m = messages.find((x) => x.id === id);
+          if (!m) continue;
+          const acc = m.accountId * 10;
+          m.folderId = cmd === "move_to" ? dest : acc + (dest % 10);
+          m.snoozedUntil = cmd === "snooze" ? args.until : null;
+          if (cmd === "unsnooze") m.seen = false;
+        }
+        refreshCounts();
+        return null;
+      }
+      case "set_flagged":
+        for (const id of args.ids) { const m = messages.find((x) => x.id === id); if (m) m.flagged = args.flagged; }
+        return null;
+      case "outbox": return outbox;
+      case "send": {
+        const id = ++outboxId;
+        const sendAt = args.sendAt ?? Math.floor(Date.now() / 1000) + Number(settings.undo_send ?? 10);
+        outbox.push({ id, accountId: args.message.accountId, message: args.message, sendAt, error: null });
+        if (!args.sendAt) setTimeout(() => { const i = outbox.findIndex((o) => o.id === id); if (i >= 0) outbox.splice(i, 1); }, (sendAt * 1000 - Date.now()));
+        return id;
+      }
+      case "cancel_send": {
+        const i = outbox.findIndex((o) => o.id === args.id);
+        if (i < 0) throw "Too late, it's on its way";
+        const [o] = outbox.splice(i, 1);
+        return { message: o.message, attachments: [] };
+      }
+      case "send_now": { const i = outbox.findIndex((o) => o.id === args.id); if (i >= 0) outbox.splice(i, 1); return null; }
+      case "save_draft": await new Promise((r) => setTimeout(r, 300)); return args.message.messageId ?? `<draft-${Date.now()}@mock>`;
+      case "delete_draft": return null;
       case "load_older": {
         // Simulate the server returning 30 older messages, twice, then nothing.
         olderCalls++;
         if (olderCalls > 2) return 0;
         await new Promise((r) => setTimeout(r, 600));
-        const base = messages.length;
+        const base = Math.max(...messages.map((m) => m.id));
         const oldest = Math.min(...messages.map((m) => m.date));
         for (let i = 0; i < 30; i++) {
           const p = people[i % people.length], s = subjects[i % subjects.length];
-          messages.push({ id: base + i + 1, accountId: 1, folderId: 10, fromName: p[0], fromAddr: p[1], subject: `${s[0]} (older)`, snippet: s[1], date: oldest - (i + 1) * 86400, seen: true, flagged: false, hasAttachments: false });
+          messages.push({ id: base + i + 1, accountId: 1, folderId: 10, fromName: p[0], fromAddr: p[1], subject: `${s[0]} (older)`, snippet: s[1], date: oldest - (i + 1) * 86400, seen: true, flagged: false, hasAttachments: false, threadId: `o${i}`, count: 1, ids: [base + i + 1], snoozedUntil: null });
         }
         return 30;
       }
@@ -113,10 +182,12 @@ export function installMock() {
           ...m,
           to: [{ name: "Alex Rivera", email: accounts[m.accountId - 1].email }],
           cc: m.id % 2 ? [{ name: "Priya Nair", email: "priya@acme.co" }] : [],
+          bcc: [],
           replyTo: [],
           messageId: `<m${m.id}@example.com>`,
+          inReplyTo: null,
           references: null,
-          html,
+          html: m.id > 64 ? `<p>${m.snippet}</p>` : html,
           text: null,
           attachments: m.hasAttachments ? [{ index: 0, filename: "Q4-agenda.pdf", mime: "application/pdf", size: 284_000 }, { index: 1, filename: "budget.xlsx", mime: "application/vnd.ms-excel", size: 48_200 }] : [],
         };

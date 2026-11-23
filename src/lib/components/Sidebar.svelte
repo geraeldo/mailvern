@@ -4,9 +4,9 @@
   import { sortable } from "../sortable";
   import { accountMenu, folderMenu } from "../menus";
   import { hint } from "../shortcuts.svelte";
-  import { api, type Folder, type View } from "../api";
+  import { api, type Folder, type MailView } from "../api";
 
-  const roleIcon: Record<string, string> = { inbox: "inbox", sent: "sent", drafts: "drafts", archive: "archive", trash: "trash", junk: "junk" };
+  const roleIcon: Record<string, string> = { inbox: "inbox", snoozed: "clock", sent: "sent", drafts: "drafts", archive: "archive", trash: "trash", junk: "junk" };
   const hiddenNames = new Set(["outbox", "templates", "snoozed"]);
 
   let collapsed = $state<Record<number, boolean>>({});
@@ -40,13 +40,15 @@
       })
       .filter((r) => r.present),
   );
+  /** Mail waiting for a later time, or that failed. Messages just sent (still undoable) don't count. */
+  const scheduled = $derived(ui.outbox.filter((o) => o.error || o.sendAt * 1000 > Date.now() + (ui.undoSend + 5) * 1000));
   const syncing = $derived(Object.values(ui.status).some((s) => s.state === "syncing"));
   const errors = $derived(Object.entries(ui.status).filter(([, s]) => s.state === "error"));
 
   const isActive = (f: Folder) => ui.view.kind === "folder" && ui.view.folderId === f.id && !ui.query;
   const isUnifiedActive = (role: string) => ui.view.kind === "unified" && ui.view.role === role && !ui.query;
 
-  function openFolderMenu(e: MouseEvent, view: View, unread: number) {
+  function openFolderMenu(e: MouseEvent, view: MailView, unread: number) {
     e.preventDefault();
     folderMenu(view, unread);
   }
@@ -82,6 +84,13 @@
                 <span class="label">{u.name}</span>
                 {#if u.unread && u.role === "inbox"}<span class="count">{u.unread}</span>{/if}
               </button>
+              {#if u.role === "inbox" && (scheduled.length || ui.view.kind === "outbox")}
+                <button class="item" class:active={ui.view.kind === "outbox" && !ui.query} onclick={() => setView({ kind: "outbox" })}>
+                  <Icon name="outbox" />
+                  <span class="label">Scheduled</span>
+                  <span class="count" class:failed={scheduled.some((o) => o.error)}>{scheduled.length || ""}</span>
+                </button>
+              {/if}
             {/each}
           </div>
         {/if}
@@ -198,6 +207,7 @@
   .label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .count { font-size: 12px; font-variant-numeric: tabular-nums; color: var(--muted); font-weight: 500; }
   .item.active .count { color: var(--text-2); }
+  .count.failed { color: var(--danger); }
   .group { padding-top: 6px; background: var(--side); border-radius: 8px; }
   .group:global([data-dragging]), .item:global([data-dragging]) { box-shadow: 0 6px 20px rgba(20, 18, 14, 0.14); }
   .item:global([data-dragging]) { background: var(--panel); }

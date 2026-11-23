@@ -103,6 +103,14 @@ export function emailWrap(inner: string): string {
   return `<div style="font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',Helvetica,Arial,sans-serif;font-size:14px;line-height:1.55;color:#1d1c1a">${root.innerHTML}</div>`;
 }
 
+/** Undoes `emailWrap`, for reopening a draft or a queued message in the composer. */
+export function unwrapEmail(html: string): string {
+  const doc = new DOMParser().parseFromString(sanitize(html), "text/html");
+  const only = doc.body.children.length === 1 ? (doc.body.firstElementChild as HTMLElement) : null;
+  if (only?.tagName === "DIV" && /^font-family:\s*-apple-system/.test(only.getAttribute("style") || "")) return only.innerHTML;
+  return doc.body.innerHTML;
+}
+
 export function quoteForward(d: Detail): string {
   const lines = [
     `From: ${escapeHtml(d.fromName ? `${d.fromName} <${d.fromAddr}>` : d.fromAddr)}`,

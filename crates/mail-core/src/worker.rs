@@ -10,6 +10,8 @@ use async_imap::extensions::idle::IdleResponse;
 use async_imap::types::Fetch;
 use futures::TryStreamExt;
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -20,6 +22,17 @@ const POLL_EVERY: Duration = Duration::from_secs(180);
 /// How many older headers to fetch each time the list reaches the end of the local cache.
 const BACKFILL: usize = 500;
 
+/// Where a move goes: a standard folder (created if missing) or a specific folder.
+pub enum Target {
+    Role(&'static str),
+    Folder(i64),
+}
+
+/// Most hits fetched per folder by a server search.
+const SEARCH_HITS: usize = 50;
+
+type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
 pub enum Cmd {
     SyncAll,
     SyncFolder(i64),
@@ -29,9 +42,17 @@ pub enum Cmd {
     Store { folder_id: i64, uids: Vec<u32>, flag: &'static str, add: bool },
     /// Set \Seen on every unread message in the folder on the server.
     MarkAllRead { folder_id: i64 },
-    Move { folder_id: i64, uids: Vec<u32>, to_role: &'static str },
+    Move { folder_id: i64, uids: Vec<u32>, to: Target },
     Delete { folder_id: i64, uids: Vec<u32> },
     EnsureSent { message_id: String, raw: Vec<u8> },
+    /// Stores a draft in Drafts, replacing any earlier version with the same Message-ID.
+    SaveDraft { message_id: String, raw: Vec<u8>, reply: oneshot::Sender<Result<()>> },
+    /// Removes a draft (after sending it, or when it's discarded).
+    DeleteDraft { message_id: String },
+    /// Moves a snoozed message back to `to_path` as unread. Replies false if it's no longer in Snoozed.
+    Unsnooze { message_id: String, to_path: String, reply: oneshot::Sender<Result<bool>> },
+    /// Searches the server. Replies with the local ids of the hits (stored if they weren't).
+    Search { terms: Vec<String>, reply: oneshot::Sender<Result<Vec<i64>>> },
 }
 
 impl Cmd {
@@ -106,25 +127,68 @@ impl Worker {
         }
     }
 
+    /// Runs `f`, once more on a fresh connection if it fails on a reused one.
+    /// `report` shows a failure as the account's status; a search failure shouldn't.
+    async fn retry<T>(&mut self, report: bool, f: impl for<'a> Fn(&'a mut Worker) -> BoxFut<'a, T>) -> Result<T> {
+        let had_session = self.session.is_some();
+        let mut res = f(self).await;
+        if res.is_err() && had_session {
+            self.reset();
+            res = f(self).await;
+        }
+        match res {
+            Err(e) => {
+                let msg = format!("{e:#}");
+                if report {
+                    self.fail(e);
+                } else {
+                    self.reset();
+                }
+                Err(anyhow!(msg))
+            }
+            ok => ok,
+        }
+    }
+
     /// Never triggers a full sync, so it is safe to call from inside one.
     async fn handle_quick(&mut self, mut cmd: Cmd) {
-        if let Cmd::FetchOlder { folder_id, reply } = cmd {
-            let had_session = self.session.is_some();
-            let mut res = self.fetch_older(folder_id).await;
-            if res.is_err() && had_session {
-                self.reset();
-                res = self.fetch_older(folder_id).await;
+        match cmd {
+            Cmd::FetchOlder { folder_id, reply } => {
+                let res = self.retry(true, |w| Box::pin(w.fetch_older(folder_id))).await;
+                let _ = reply.send(res);
+                return;
             }
-            let res = match res {
-                Err(e) => {
-                    let msg = format!("{e:#}");
-                    self.fail(e);
-                    Err(anyhow!(msg))
-                }
-                ok => ok,
-            };
-            let _ = reply.send(res);
-            return;
+            Cmd::SaveDraft { message_id, raw, reply } => {
+                let res = self
+                    .retry(true, |w| {
+                        let (m, r) = (message_id.clone(), raw.clone());
+                        Box::pin(async move { w.save_draft(&m, &r).await })
+                    })
+                    .await;
+                let _ = reply.send(res);
+                return;
+            }
+            Cmd::Unsnooze { message_id, to_path, reply } => {
+                let res = self
+                    .retry(true, |w| {
+                        let (m, p) = (message_id.clone(), to_path.clone());
+                        Box::pin(async move { w.unsnooze(&m, &p).await })
+                    })
+                    .await;
+                let _ = reply.send(res);
+                return;
+            }
+            Cmd::Search { terms, reply } => {
+                let res = self
+                    .retry(false, |w| {
+                        let t = terms.clone();
+                        Box::pin(async move { w.search(&t).await })
+                    })
+                    .await;
+                let _ = reply.send(res);
+                return;
+            }
+            _ => {}
         }
         let reply = match &mut cmd {
             Cmd::FetchBody { reply, .. } => {
@@ -229,18 +293,32 @@ impl Worker {
                 let _: Vec<Fetch> = s.uid_store(imap::uid_set(&uids), "+FLAGS.SILENT (\\Seen)").await?.try_collect().await?;
                 Ok(())
             }
-            Cmd::Move { folder_id, uids, to_role } => {
-                let (to_id, to_path) = self.target_folder(to_role).await?;
+            Cmd::Move { folder_id, uids, to } => {
+                let (to_id, to_path, to_role) = match to {
+                    Target::Role(role) => {
+                        let (id, path) = self.target_folder(role).await?;
+                        (id, path, Some(role.to_string()))
+                    }
+                    Target::Folder(id) => {
+                        let (_, path, role) = self.db.folder(*id)?;
+                        (*id, path, role)
+                    }
+                };
                 let (_, path, _) = self.db.folder(*folder_id)?;
-                self.select(&path).await?;
-                let set = imap::uid_set(uids);
-                let s = self.ensure().await?;
-                if s.uid_mv(&set, &to_path).await.is_err() {
-                    s.uid_copy(&set, &to_path).await?;
-                    let _: Vec<Fetch> = s.uid_store(&set, "+FLAGS.SILENT (\\Deleted)").await?.try_collect().await?;
-                    let _: Vec<u32> = s.expunge().await?.try_collect().await?;
+                if path == to_path {
+                    return Ok(());
                 }
-                self.sync_folder(to_id, &to_path, Some(to_role)).await?;
+                self.move_uids(&path, uids, &to_path).await?;
+                self.sync_folder(to_id, &to_path, to_role.as_deref()).await?;
+                Ok(())
+            }
+            Cmd::DeleteDraft { message_id } => {
+                let Some((id, path)) = self.db.folder_by_role(self.account.id, "drafts")? else { return Ok(()) };
+                self.select(&path).await?;
+                let uids = self.find_message_id(message_id).await?;
+                self.expunge_uids(&uids).await?;
+                self.db.delete_by_message_id(id, message_id)?;
+                self.changed();
                 Ok(())
             }
             Cmd::Delete { folder_id, uids } => {
@@ -262,8 +340,120 @@ impl Worker {
                 }
                 Ok(())
             }
-            Cmd::SyncAll | Cmd::SyncFolder(_) | Cmd::FetchOlder { .. } => Ok(()),
+            Cmd::SyncAll
+            | Cmd::SyncFolder(_)
+            | Cmd::FetchOlder { .. }
+            | Cmd::SaveDraft { .. }
+            | Cmd::Unsnooze { .. }
+            | Cmd::Search { .. } => Ok(()),
         }
+    }
+
+    /// Moves uids out of `from` (MOVE, or COPY + delete where MOVE isn't supported).
+    async fn move_uids(&mut self, from: &str, uids: &[u32], to: &str) -> Result<()> {
+        self.select(from).await?;
+        let set = imap::uid_set(uids);
+        let s = self.ensure().await?;
+        if s.uid_mv(&set, to).await.is_err() {
+            s.uid_copy(&set, to).await?;
+            self.expunge_uids(uids).await?;
+        }
+        Ok(())
+    }
+
+    /// Deletes uids in the selected folder. Uses UID EXPUNGE so nothing else marked deleted goes too.
+    async fn expunge_uids(&mut self, uids: &[u32]) -> Result<()> {
+        if uids.is_empty() {
+            return Ok(());
+        }
+        let set = imap::uid_set(uids);
+        let s = self.ensure().await?;
+        let _: Vec<Fetch> = s.uid_store(&set, "+FLAGS.SILENT (\\Deleted)").await?.try_collect().await?;
+        let uid_expunged = match s.uid_expunge(&set).await {
+            Ok(stream) => stream.try_collect::<Vec<u32>>().await.is_ok(),
+            Err(_) => false,
+        };
+        if !uid_expunged {
+            let _: Vec<u32> = s.expunge().await?.try_collect().await?;
+        }
+        Ok(())
+    }
+
+    /// Uids in the selected folder whose Message-ID header is `message_id`.
+    async fn find_message_id(&mut self, message_id: &str) -> Result<Vec<u32>> {
+        let s = self.ensure().await?;
+        let q = format!("HEADER Message-ID {}", imap::quote(message_id));
+        Ok(s.uid_search(q).await?.into_iter().collect())
+    }
+
+    async fn save_draft(&mut self, message_id: &str, raw: &[u8]) -> Result<()> {
+        let (id, path) = self.target_folder("drafts").await?;
+        self.select(&path).await?;
+        let old = self.find_message_id(message_id).await?;
+        let s = self.ensure().await?;
+        s.append(&path, Some("(\\Seen \\Draft)"), None, raw).await?;
+        self.expunge_uids(&old).await?;
+        self.db.delete_by_message_id(id, message_id)?;
+        self.sync_folder(id, &path, Some("drafts")).await?;
+        Ok(())
+    }
+
+    async fn unsnooze(&mut self, message_id: &str, to_path: &str) -> Result<bool> {
+        let Some((snoozed_id, snoozed_path)) = self.db.folder_by_role(self.account.id, "snoozed")? else { return Ok(false) };
+        self.select(&snoozed_path).await?;
+        let uids = self.find_message_id(message_id).await?;
+        if uids.is_empty() {
+            return Ok(false);
+        }
+        let (to_id, to_path, to_role) = match self.db.folder_by_path(self.account.id, to_path)? {
+            Some((id, role)) if role.as_deref() != Some("snoozed") => (id, to_path.to_string(), role),
+            _ => {
+                let (id, path) = self.target_folder("inbox").await?;
+                (id, path, Some("inbox".to_string()))
+            }
+        };
+        self.move_uids(&snoozed_path, &uids, &to_path).await?;
+        self.db.delete_by_message_id(snoozed_id, message_id)?;
+        // Back as unread, like new mail.
+        self.select(&to_path).await?;
+        let back = self.find_message_id(message_id).await?;
+        if !back.is_empty() {
+            let s = self.ensure().await?;
+            let _: Vec<Fetch> = s.uid_store(imap::uid_set(&back), "-FLAGS.SILENT (\\Seen)").await?.try_collect().await?;
+        }
+        self.sync_folder(to_id, &to_path, to_role.as_deref()).await?;
+        self.changed();
+        Ok(true)
+    }
+
+    /// Searches every folder that could hold the mail (just All Mail where there is one),
+    /// newest hits first, storing the ones not cached yet.
+    async fn search(&mut self, terms: &[String]) -> Result<Vec<i64>> {
+        let folders = self.db.account_folders(self.account.id)?;
+        let all_mail: Vec<_> = folders.iter().filter(|f| f.2.as_deref() == Some("all")).cloned().collect();
+        let targets: Vec<_> = if all_mail.is_empty() {
+            folders.into_iter().filter(|f| !matches!(f.2.as_deref(), Some("trash") | Some("junk"))).collect()
+        } else {
+            all_mail
+        };
+        let criteria = imap::search_criteria(terms);
+        let mut ids = Vec::new();
+        for (folder_id, path, _) in targets {
+            self.select(&path).await?;
+            let s = self.ensure().await?;
+            let mut uids: Vec<u32> = s.uid_search(&criteria).await?.into_iter().collect();
+            uids.sort_unstable_by(|a, b| b.cmp(a));
+            uids.truncate(SEARCH_HITS);
+            let missing = self.db.missing_uids(folder_id, &uids)?;
+            if !missing.is_empty() {
+                let s = self.ensure().await?;
+                let fetches: Vec<Fetch> = s.uid_fetch(imap::uid_set(&missing), HEADER_ITEMS).await?.try_collect().await?;
+                let found = headers(&fetches, |u| missing.contains(&u));
+                self.db.insert_messages_as(self.account.id, folder_id, &found, true)?;
+            }
+            ids.extend(self.db.ids_for_uids(folder_id, &uids)?);
+        }
+        Ok(ids)
     }
 
     async fn fetch_older(&mut self, folder_id: i64) -> Result<usize> {
@@ -301,6 +491,9 @@ impl Worker {
             "archive" => "Archive",
             "trash" => "Trash",
             "junk" => "Junk",
+            "drafts" => "Drafts",
+            "snoozed" => "Snoozed",
+            "inbox" => "INBOX",
             other => return Err(anyhow!("No {other} folder")),
         };
         let s = self.ensure().await?;
@@ -410,6 +603,20 @@ impl Worker {
                 })
                 .collect();
             changed |= self.db.reconcile_flags(folder_id, min_uid, &flags)?;
+        }
+        // Search hits below the window: check just those.
+        let sparse = self.db.sparse_uids_below(folder_id, if min_uid > 0 { min_uid } else { u32::MAX })?;
+        if !sparse.is_empty() {
+            let s = self.session.as_mut().unwrap();
+            let flags: Vec<Fetch> = s.uid_fetch(imap::uid_set(&sparse), "(UID FLAGS)").await?.try_collect().await?;
+            let flags: Vec<(u32, bool, bool)> = flags
+                .iter()
+                .filter_map(|f| {
+                    let (seen, flagged) = imap::flags_of(f);
+                    Some((f.uid?, seen, flagged))
+                })
+                .collect();
+            changed |= self.db.reconcile_uids(folder_id, &sparse, &flags)?;
         }
         if changed {
             self.changed();

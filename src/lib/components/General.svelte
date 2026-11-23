@@ -1,6 +1,31 @@
 <script lang="ts">
   import { BADGE_MODES, badge, setBadgeMode } from "../badge.svelte";
+  import { ui, setUndoSend, setThreaded } from "../state.svelte";
+
+  const UNDO = [0, 5, 10, 20, 30];
 </script>
+
+<div class="group">
+  <div class="gname">Messages</div>
+  <label class="row">
+    <input type="checkbox" checked={ui.threaded} onchange={(e) => setThreaded(e.currentTarget.checked)} />
+    <span class="text">
+      <span class="label">Group into conversations</span>
+      <span class="detail">Show a message and its replies as one row, and read them together.</span>
+    </span>
+  </label>
+  <div class="row">
+    <span class="text">
+      <span class="label">Undo send</span>
+      <span class="detail">How long a sent message waits, so you can take it back.</span>
+    </span>
+    <select value={ui.undoSend} onchange={(e) => setUndoSend(Number(e.currentTarget.value))}>
+      {#each UNDO as s (s)}
+        <option value={s}>{s === 0 ? "Off" : `${s} seconds`}</option>
+      {/each}
+    </select>
+  </div>
+</div>
 
 <div class="group">
   <div class="gname">Dock badge</div>
@@ -26,7 +51,9 @@
     cursor: default;
   }
   input { margin: 2px 0 0; accent-color: var(--accent); }
-  .text { display: flex; flex-direction: column; gap: 2px; }
+  .text { flex: 1; display: flex; flex-direction: column; gap: 2px; }
+  .group + .group { margin-top: 22px; }
+  select { font: inherit; font-size: 13px; }
   .label { font-size: 13.5px; }
   .detail { font-size: 12.5px; color: var(--muted); }
 </style>

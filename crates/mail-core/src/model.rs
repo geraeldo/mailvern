@@ -48,6 +48,13 @@ pub struct MessageSummary {
     pub seen: bool,
     pub flagged: bool,
     pub has_attachments: bool,
+    pub thread_id: Option<String>,
+    /// Messages in the conversation (1 when not grouped).
+    pub count: i64,
+    /// Every message this row stands for in the current view: one, or a conversation's.
+    pub ids: Vec<i64>,
+    /// When a snoozed message comes back (unix seconds).
+    pub snoozed_until: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -72,15 +79,17 @@ pub struct MessageDetail {
     pub summary: MessageSummary,
     pub to: Vec<Addr>,
     pub cc: Vec<Addr>,
+    pub bcc: Vec<Addr>,
     pub reply_to: Vec<Addr>,
     pub message_id: Option<String>,
+    pub in_reply_to: Option<String>,
     pub references: Option<String>,
     pub html: Option<String>,
     pub text: Option<String>,
     pub attachments: Vec<AttachmentInfo>,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Outgoing {
     pub account_id: i64,
@@ -96,6 +105,21 @@ pub struct Outgoing {
     pub attachments: Vec<String>,
     pub in_reply_to: Option<String>,
     pub references: Option<String>,
+    /// Message-ID to use. A draft keeps one id across saves so each save replaces the last,
+    /// and sending it removes the draft.
+    #[serde(default)]
+    pub message_id: Option<String>,
+}
+
+/// A message waiting to be sent (undo window or scheduled), or one that failed.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct OutboxItem {
+    pub id: i64,
+    pub account_id: i64,
+    pub message: Outgoing,
+    pub send_at: i64,
+    pub error: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -117,7 +141,7 @@ fn inbox_role() -> String {
 }
 
 /// Folder roles a unified view may cover.
-pub const UNIFIED_ROLES: &[&str] = &["inbox", "drafts", "sent", "archive", "junk", "trash"];
+pub const UNIFIED_ROLES: &[&str] = &["inbox", "snoozed", "drafts", "sent", "archive", "junk", "trash"];
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -137,4 +161,8 @@ pub enum Event {
         subject: String,
         count: usize,
     },
+    /// The outbox changed: something was queued, sent, cancelled or failed.
+    Outbox,
+    #[serde(rename_all = "camelCase")]
+    SendFailed { subject: String, message: String },
 }

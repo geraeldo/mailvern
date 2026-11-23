@@ -1,9 +1,17 @@
-import { api, type Account, type Detail, type Folder, type Summary, type View } from "./api";
+import {
+  api, type Account, type Detail, type FileInfo, type Folder, type MailView, type OutboxItem, type Outgoing, type Summary, type View,
+} from "./api";
+import { formatAddr } from "./format";
+import { textToHtml, unwrapEmail } from "./html";
+import { toUnix, whenLabel } from "./when";
 
-export type ComposeMode = "new" | "reply" | "replyAll" | "forward";
-export type ComposeInit = { mode: ComposeMode; source?: Detail; accountId?: number; to?: string[]; key: number };
+export type ComposeMode = "new" | "reply" | "replyAll" | "forward" | "draft";
+/** A message to reopen in the composer: a saved draft, or one taken back out of the outbox. */
+export type Restore = { message: Outgoing; attachments: FileInfo[]; unsaved?: boolean };
+export type ComposeInit = { mode: ComposeMode; source?: Detail; accountId?: number; to?: string[]; restore?: Restore; key: number };
 export type SettingsSection = "general" | "shortcuts";
 export type SyncStatus = { state: "syncing" | "idle" | "error"; message: string | null };
+export type Picker = { kind: "snooze"; rows: Summary[] } | { kind: "move"; rows: Summary[]; accountId: number };
 
 const PAGE = 200;
 
@@ -15,19 +23,37 @@ export const ui = $state({
   hasMore: false,
   listReady: false,
   loadingOlder: false,
+  /** The open row (a message, or a conversation by its newest message). */
   selectedId: null as number | null,
+  /** Rows picked with ⌘- or ⇧-click. Zero or one means just `selectedId`. */
+  selectedIds: [] as number[],
+  /** The open message: what Reply, Forward and the menus act on. */
   detail: null as Detail | null,
+  /** The open conversation, oldest first. */
+  thread: [] as Summary[],
+  /** Loaded bodies of the open conversation's messages. */
+  details: {} as Record<number, Detail>,
+  /** Messages shown expanded when the conversation opened: the opened one and the unread ones. */
+  expandIds: [] as number[],
   detailLoading: false,
   detailError: null as string | null,
   query: "",
+  searchingServer: false,
   compose: null as ComposeInit | null,
   /** App settings (shortcuts and, later, other preferences). */
   settings: null as SettingsSection | null,
   /** Account settings: the account being edited, or "new". */
   accountSettings: null as number | "new" | null,
+  picker: null as Picker | null,
   status: {} as Record<number, SyncStatus>,
   toast: null as { text: string; undo?: () => void } | null,
   trustedSenders: [] as string[],
+  outbox: [] as OutboxItem[],
+  outboxSelected: null as number | null,
+  /** Group messages into conversations. */
+  threaded: true,
+  /** Seconds a sent message can be taken back. */
+  undoSend: 10,
 });
 
 export function openSettings(section: SettingsSection = "general") {
@@ -56,6 +82,7 @@ export function folderById(id: number): Folder | undefined {
 /** Standard folders shown under All Accounts, in sidebar order. */
 export const unifiedRoles = [
   { role: "inbox", name: "Inbox" },
+  { role: "snoozed", name: "Snoozed" },
   { role: "drafts", name: "Drafts" },
   { role: "sent", name: "Sent" },
   { role: "archive", name: "Archive" },
@@ -65,6 +92,7 @@ export const unifiedRoles = [
 
 export function viewTitle(): string {
   if (ui.query.trim()) return "Search";
+  if (ui.view.kind === "outbox") return "Scheduled";
   if (ui.view.kind === "unified") {
     const role = ui.view.role;
     return unifiedRoles.find((r) => r.role === role)?.name ?? "";
@@ -76,8 +104,31 @@ export function viewTitle(): string {
   return "";
 }
 
+/** The role of the folder a row is in ("snoozed", "drafts", "junk"…). */
+export function roleOf(row: { folderId: number } | null | undefined): string | null {
+  return row ? (folderById(row.folderId)?.role ?? null) : null;
+}
+
 export async function loadAccounts() {
   ui.accounts = await api.accounts();
+}
+
+export async function loadPrefs() {
+  const [undo, threads] = await Promise.all([api.getSetting("undo_send"), api.getSetting("threads")]);
+  const n = Number(undo);
+  if (undo != null && Number.isFinite(n)) ui.undoSend = n;
+  ui.threaded = threads !== "off";
+}
+
+export async function setUndoSend(seconds: number) {
+  ui.undoSend = seconds;
+  await api.setSetting("undo_send", String(seconds));
+}
+
+export async function setThreaded(on: boolean) {
+  ui.threaded = on;
+  await api.setSetting("threads", on ? "on" : "off");
+  if (ui.view.kind !== "outbox") setView(ui.view);
 }
 
 export async function reorderAccounts(ids: number[]) {
@@ -112,23 +163,56 @@ export async function loadFolders() {
   ui.folders = await api.folders();
 }
 
+export async function loadOutbox() {
+  try {
+    ui.outbox = await api.outbox();
+  } catch {}
+  if (ui.outboxSelected != null && !ui.outbox.some((o) => o.id === ui.outboxSelected)) ui.outboxSelected = null;
+  // Nothing left to show: leave the empty Scheduled view.
+  if (ui.view.kind === "outbox" && !ui.outbox.length) setView({ kind: "unified", role: "inbox" });
+}
+
+/** Server search results for the current query, kept so list refreshes don't ask again. */
+let remote: { q: string; rows: Summary[] } | null = null;
+
+function mergeRows(a: Summary[], b: Summary[]): Summary[] {
+  const seen = new Set(a.map((r) => r.id));
+  return [...a, ...b.filter((r) => !seen.has(r.id))].sort((x, y) => y.date - x.date || y.id - x.id);
+}
+
 let listSeq = 0;
 export async function loadList(reset = true) {
   const my = ++listSeq;
+  if (ui.view.kind === "outbox") {
+    await loadOutbox();
+    if (my !== listSeq) return;
+    ui.list = [];
+    ui.hasMore = false;
+    ui.listReady = true;
+    return;
+  }
+  const view = ui.view;
   const q = ui.query.trim();
   let rows: Summary[];
   if (q) {
     if (!reset) return;
     rows = await api.search(q);
+    if (remote?.q === q) rows = mergeRows(rows, remote.rows);
   } else {
     const limit = reset ? Math.max(PAGE, ui.list.length) : PAGE;
-    rows = await api.messages(ui.view, null, reset ? 0 : ui.list.length, limit);
+    rows = await api.messages(view, null, reset ? 0 : ui.list.length, limit, ui.threaded);
     if (my === listSeq) ui.hasMore = rows.length === limit;
   }
   if (my !== listSeq) return;
   ui.list = reset ? rows : [...ui.list, ...rows];
   ui.listReady = true;
   if (q) ui.hasMore = false;
+  // A conversation's row moves to its newest message when one arrives: follow it.
+  if (ui.selectedId != null && !ui.list.some((m) => m.id === ui.selectedId)) {
+    const holder = ui.list.find((m) => m.ids.includes(ui.selectedId!));
+    if (holder) ui.selectedId = holder.id;
+  }
+  ui.selectedIds = ui.selectedIds.filter((id) => ui.list.some((m) => m.id === id));
 }
 
 /** Views whose folders have no older mail left on the server. */
@@ -137,7 +221,7 @@ const viewKey = (v: View) => (v.kind === "folder" ? `f${v.folderId}` : v.kind ==
 
 /** Next page from the local cache; past its end, older mail from the server. */
 export async function loadMore() {
-  if (ui.query.trim() || ui.loadingOlder) return;
+  if (ui.query.trim() || ui.loadingOlder || ui.view.kind === "outbox") return;
   if (ui.hasMore) {
     await loadList(false);
     return;
@@ -161,32 +245,68 @@ export async function loadMore() {
   }
 }
 
+function clearOpen() {
+  ui.selectedId = null;
+  ui.selectedIds = [];
+  ui.detail = null;
+  ui.thread = [];
+  ui.details = {};
+  ui.outboxSelected = null;
+}
+
 export function setView(v: View) {
   reachedStart.delete(viewKey(v));
   ui.view = v;
   ui.query = "";
   ui.list = [];
   ui.listReady = false;
-  ui.selectedId = null;
-  ui.detail = null;
+  remote = null;
+  ui.searchingServer = false;
+  clearOpen();
   loadList(true);
 }
 
+let serverTimer: ReturnType<typeof setTimeout> | undefined;
 export function setQuery(q: string) {
   ui.query = q;
   ui.list = [];
-  ui.selectedId = null;
-  ui.detail = null;
+  remote = null;
+  ui.searchingServer = false;
+  clearOpen();
+  clearTimeout(serverTimer);
   loadList(true);
+  const t = q.trim();
+  // The server is slower and costlier: ask once typing settles.
+  if (t) serverTimer = setTimeout(() => searchServer(t), 600);
+}
+
+async function searchServer(q: string) {
+  if (!ui.accounts.length) return;
+  ui.searchingServer = true;
+  try {
+    const rows = await api.searchServer(q);
+    if (ui.query.trim() !== q) return;
+    remote = { q, rows };
+    ui.list = mergeRows(ui.list, rows);
+  } catch (e) {
+    if (ui.query.trim() === q) toast(`Server search failed: ${e}`);
+  } finally {
+    if (ui.query.trim() === q) ui.searchingServer = false;
+  }
 }
 
 let detailSeq = 0;
+/** Opens a row: its message, and the conversation around it. */
 export async function openMessage(id: number | null) {
   ui.selectedId = id;
+  ui.selectedIds = [];
+  cursor = null;
   const my = ++detailSeq;
   ui.detailError = null;
   if (id == null) {
     ui.detail = null;
+    ui.thread = [];
+    ui.details = {};
     ui.detailLoading = false;
     return;
   }
@@ -198,12 +318,17 @@ export async function openMessage(id: number | null) {
     }
   }, 120);
   try {
-    const d = await api.message(id);
+    const [d, thread] = await Promise.all([api.message(id), api.thread(id).catch(() => [] as Summary[])]);
     if (my !== detailSeq) return;
+    ui.details = { [id]: d };
     ui.detail = d;
+    const t = thread.length ? thread : [d];
+    ui.expandIds = [id, ...t.filter((m) => !m.seen).map((m) => m.id)];
+    ui.thread = t;
   } catch (e) {
     if (my === detailSeq) {
       ui.detail = null;
+      ui.thread = [];
       ui.detailError = String(e);
     }
   } finally {
@@ -214,8 +339,20 @@ export async function openMessage(id: number | null) {
   if (row && !row.seen && my === detailSeq) {
     row.seen = true;
     if (ui.detail) ui.detail.seen = true;
-    api.setSeen([id], true).then(loadFolders);
+    for (const t of ui.thread) if (row.ids.includes(t.id)) t.seen = true;
+    api.setSeen(row.ids, true).then(loadFolders);
   }
+}
+
+/** Picks up new or changed messages in the open conversation. */
+export async function refreshThread() {
+  const id = ui.selectedId;
+  if (id == null || ui.selectedIds.length > 1) return;
+  const anchor = ui.detail?.id ?? id;
+  try {
+    const t = await api.thread(anchor);
+    if (ui.selectedId === id && t.length) ui.thread = t;
+  } catch {}
 }
 
 export function move(delta: number) {
@@ -225,21 +362,102 @@ export function move(delta: number) {
   openMessage(ui.list[next].id);
 }
 
-function removeSelected(): number | null {
-  const id = ui.selectedId;
-  if (id == null) return null;
-  const i = ui.list.findIndex((m) => m.id === id);
-  ui.list = ui.list.filter((m) => m.id !== id);
-  const next = ui.list[i] ?? ui.list[i - 1] ?? null;
-  openMessage(next ? next.id : null);
-  return id;
+// ---------- selection ----------
+
+/** The moving end of a ⇧-selection; `selectedId` is where it started. */
+let cursor: number | null = null;
+
+function selectRange(fromId: number, toId: number) {
+  const a = ui.list.findIndex((m) => m.id === fromId);
+  const b = ui.list.findIndex((m) => m.id === toId);
+  if (a < 0 || b < 0) return;
+  ui.selectedIds = ui.list.slice(Math.min(a, b), Math.max(a, b) + 1).map((m) => m.id);
 }
 
+/** Click on a row: open it; ⌘ adds or removes it from the selection; ⇧ selects a range. */
+export function clickRow(m: Summary, e: MouseEvent) {
+  if (e.metaKey) {
+    const base = ui.selectedIds.length ? ui.selectedIds : ui.selectedId != null ? [ui.selectedId] : [];
+    const next = base.includes(m.id) ? base.filter((id) => id !== m.id) : [...base, m.id];
+    if (next.length <= 1) openMessage(next[0] ?? null);
+    else ui.selectedIds = next;
+  } else if (e.shiftKey && ui.selectedId != null) {
+    cursor = m.id;
+    selectRange(ui.selectedId, m.id);
+  } else {
+    openMessage(m.id);
+  }
+}
+
+/** ⇧↓ / ⇧↑: grow or shrink the selection. */
+export function extendSelection(delta: number) {
+  if (!ui.list.length) return;
+  if (ui.selectedId == null) {
+    openMessage(ui.list[0].id);
+    return;
+  }
+  const from = cursor ?? ui.selectedId;
+  const i = ui.list.findIndex((m) => m.id === from);
+  const next = ui.list[Math.min(ui.list.length - 1, Math.max(0, i + delta))];
+  cursor = next.id;
+  selectRange(ui.selectedId, next.id);
+}
+
+export function selectAll() {
+  if (ui.list.length) ui.selectedIds = ui.list.map((m) => m.id);
+}
+
+/** Leaves a multiple selection, back to the open row. */
+export function clearSelection() {
+  if (ui.selectedIds.length <= 1) return false;
+  ui.selectedIds = [];
+  cursor = null;
+  return true;
+}
+
+export const isSelected = (id: number) => (ui.selectedIds.length > 1 ? ui.selectedIds.includes(id) : ui.selectedId === id);
+
+/** The rows an action applies to: the selection, or the open row. */
+export function selectedRows(): Summary[] {
+  if (ui.selectedIds.length > 1) return ui.list.filter((m) => ui.selectedIds.includes(m.id));
+  const row = ui.list.find((m) => m.id === ui.selectedId);
+  if (row) return [row];
+  return ui.detail ? [{ ...ui.detail, ids: [ui.detail.id], count: 1 }] : [];
+}
+
+/** Every message behind some rows (a conversation row stands for all its messages in the view). */
+export const idsOf = (rows: Summary[]) => [...new Set(rows.flatMap((r) => (r.ids?.length ? r.ids : [r.id])))];
+
+/** Takes rows off the list and opens the next one. Returns their message ids. */
+function removeRows(rows: Summary[]): number[] {
+  const gone = new Set(rows.map((r) => r.id));
+  const first = ui.list.findIndex((m) => gone.has(m.id));
+  ui.list = ui.list.filter((m) => !gone.has(m.id));
+  ui.selectedIds = [];
+  const next = first < 0 ? null : (ui.list[first] ?? ui.list[first - 1] ?? null);
+  openMessage(next ? next.id : null);
+  return idsOf(rows);
+}
+
+// ---------- actions ----------
+
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
-export function toast(text: string) {
-  ui.toast = { text };
+export function toast(text: string, opts: { undo?: () => void; ms?: number } = {}) {
+  ui.toast = { text, undo: opts.undo };
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => (ui.toast = null), 3200);
+  toastTimer = setTimeout(() => (ui.toast = null), opts.ms ?? 3200);
+}
+
+export function dismissToast() {
+  clearTimeout(toastTimer);
+  ui.toast = null;
+}
+
+/** Runs the toast's Undo and closes it. */
+export function undoToast() {
+  const undo = ui.toast?.undo;
+  dismissToast();
+  undo?.();
 }
 
 async function run(p: Promise<unknown>) {
@@ -252,8 +470,18 @@ async function run(p: Promise<unknown>) {
   loadFolders();
 }
 
+const counted = (verb: string, n: number) => (n > 1 ? `${verb} ${n} items` : verb);
+
+/** Removes the selected rows and runs `call` on their messages. */
+function bulk(verb: string, call: (ids: number[]) => Promise<unknown>) {
+  const rows = selectedRows();
+  if (!rows.length) return;
+  const ids = removeRows(rows);
+  run(call(ids)).then(() => toast(counted(verb, rows.length)));
+}
+
 /** Checks the server for new mail in just this folder (or unified folder). */
-export function checkForMail(view: View) {
+export function checkForMail(view: MailView) {
   api.syncView(view).catch((e) => toast(String(e)));
 }
 
@@ -262,41 +490,46 @@ export function checkAccountForMail(accountId: number) {
   api.syncAccount(accountId).catch((e) => toast(String(e)));
 }
 
-export function archiveSelected() {
-  const id = removeSelected();
-  if (id != null) run(api.archive([id])).then(() => toast("Archived"));
-}
+export const archiveSelected = () => bulk("Archived", api.archive);
+export const trashSelected = () => bulk("Deleted", api.trash);
 
-export function trashSelected() {
-  const id = removeSelected();
-  if (id != null) run(api.trash([id])).then(() => toast("Deleted"));
-}
-
-/** True when the open message sits in a Junk folder, so the junk action means "Not Junk". */
+/** True when the selection sits in a Junk folder, so the junk action means "Not Junk". */
 export function selectedIsJunk(): boolean {
-  const row = ui.list.find((m) => m.id === ui.selectedId);
-  const fid = row?.folderId ?? ui.detail?.folderId;
-  return fid != null && folderById(fid)?.role === "junk";
+  return roleOf(selectedRows()[0]) === "junk";
 }
 
-/** Moves the open message to Junk, or back to the Inbox if it's already in Junk. */
+/** Moves the selection to Junk, or back to the Inbox if it's already in Junk. */
 export function toggleJunk() {
-  const notJunk = selectedIsJunk();
-  const id = removeSelected();
-  if (id == null) return;
-  if (notJunk) run(api.notJunk([id])).then(() => toast("Moved to Inbox"));
-  else run(api.junk([id])).then(() => toast("Moved to Junk"));
+  if (selectedIsJunk()) bulk("Moved to Inbox", api.notJunk);
+  else bulk("Moved to Junk", api.junk);
 }
 
+/** Read / unread. Marking read covers whole conversations; unread marks just their newest message. */
 export function toggleSeen() {
-  const row = ui.list.find((m) => m.id === ui.selectedId);
-  if (!row) return;
-  row.seen = !row.seen;
-  run(api.setSeen([row.id], row.seen));
+  const rows = selectedRows();
+  if (!rows.length) return;
+  const seen = rows.some((r) => !r.seen);
+  for (const r of rows) r.seen = seen;
+  const ids = seen ? idsOf(rows) : rows.map((r) => r.id);
+  for (const t of ui.thread) if (ids.includes(t.id)) t.seen = seen;
+  if (ui.detail && ids.includes(ui.detail.id)) ui.detail.seen = seen;
+  run(api.setSeen(ids, seen));
+}
+
+/** Flags the newest message of each conversation; unflagging clears every message. */
+export function toggleFlag() {
+  const rows = selectedRows();
+  if (!rows.length) return;
+  const flagged = rows.some((r) => !r.flagged);
+  for (const r of rows) r.flagged = flagged;
+  const ids = flagged ? rows.map((r) => r.id) : idsOf(rows);
+  for (const t of ui.thread) if (ids.includes(t.id)) t.flagged = flagged;
+  if (ui.detail && ids.includes(ui.detail.id)) ui.detail.flagged = flagged;
+  run(api.setFlagged(ids, flagged));
 }
 
 /** Marks everything in a folder (or a unified folder) as read, here and on the server. */
-export async function markAllRead(view: View) {
+export async function markAllRead(view: MailView) {
   const inView = (fid: number) =>
     view.kind === "folder" ? fid === view.folderId : view.kind === "unified" && folderById(fid)?.role === view.role;
   for (const m of ui.list) if (inView(m.folderId)) m.seen = true;
@@ -305,13 +538,41 @@ export async function markAllRead(view: View) {
   await run(api.markRead(view));
 }
 
-export function toggleFlag() {
-  const row = ui.list.find((m) => m.id === ui.selectedId);
-  if (!row) return;
-  row.flagged = !row.flagged;
-  if (ui.detail) ui.detail.flagged = row.flagged;
-  run(api.setFlagged([row.id], row.flagged));
+export function snoozeSelected() {
+  const rows = selectedRows();
+  if (rows.length) ui.picker = { kind: "snooze", rows };
 }
+
+export function snoozeRows(rows: Summary[], until: Date) {
+  const gone = new Set(rows.map((r) => r.id));
+  const shown = ui.list.filter((m) => gone.has(m.id));
+  const ids = shown.length ? removeRows(shown) : idsOf(rows);
+  run(api.snooze(ids, toUnix(until))).then(() => toast(`Snoozed until ${whenLabel(until)}`));
+}
+
+export function unsnoozeSelected() {
+  bulk("Unsnoozed", api.unsnooze);
+}
+
+export function moveSelected() {
+  const rows = selectedRows();
+  if (!rows.length) return;
+  const accounts = new Set(rows.map((r) => r.accountId));
+  if (accounts.size > 1) {
+    toast("Select messages from one account to move them");
+    return;
+  }
+  ui.picker = { kind: "move", rows, accountId: rows[0].accountId };
+}
+
+export function moveRows(rows: Summary[], folder: Folder) {
+  const gone = new Set(rows.map((r) => r.id));
+  const shown = ui.list.filter((m) => gone.has(m.id));
+  const ids = shown.length ? removeRows(shown) : idsOf(rows);
+  run(api.moveTo(ids, folder.id)).then(() => toast(`Moved to ${folder.name}`));
+}
+
+// ---------- writing ----------
 
 let composeKey = 0;
 export function compose(mode: ComposeMode = "new", extra: Partial<ComposeInit> = {}) {
@@ -319,9 +580,69 @@ export function compose(mode: ComposeMode = "new", extra: Partial<ComposeInit> =
     openAccountSettings("new");
     return;
   }
-  const source = mode === "new" ? undefined : (ui.detail ?? undefined);
-  if (mode !== "new" && !source) return;
+  const source = mode === "new" || mode === "draft" ? undefined : (ui.detail ?? undefined);
+  if ((mode === "reply" || mode === "replyAll" || mode === "forward") && !(extra.source ?? source)) return;
   ui.compose = { mode, source, key: ++composeKey, ...extra };
+}
+
+/** Opens a saved draft in the composer. */
+export async function editDraft(d: Detail) {
+  let attachments: FileInfo[] = [];
+  if (d.attachments.length) {
+    try {
+      attachments = await api.attachmentFiles(d.id);
+    } catch (e) {
+      toast(String(e));
+    }
+  }
+  compose("draft", {
+    restore: {
+      message: {
+        accountId: d.accountId,
+        to: d.to.map(formatAddr),
+        cc: d.cc.map(formatAddr),
+        bcc: d.bcc.map(formatAddr),
+        subject: d.subject,
+        html: d.html ? unwrapEmail(d.html) : textToHtml(d.text ?? ""),
+        text: "",
+        attachments: [],
+        inReplyTo: d.inReplyTo,
+        references: d.references,
+        messageId: d.messageId,
+      },
+      attachments,
+    },
+  });
+}
+
+/** Takes a message out of the outbox and reopens it in the composer (undo send, or edit). */
+export async function editQueued(id: number) {
+  try {
+    const c = await api.cancelSend(id);
+    compose("draft", { restore: { message: { ...c.message, html: unwrapEmail(c.message.html) }, attachments: c.attachments, unsaved: true } });
+  } catch (e) {
+    toast(String(e));
+  }
+  loadOutbox();
+}
+
+export async function deleteQueued(id: number) {
+  try {
+    await api.cancelSend(id);
+    toast("Deleted");
+  } catch (e) {
+    toast(String(e));
+  }
+  loadOutbox();
+}
+
+export async function sendQueuedNow(id: number) {
+  try {
+    await api.sendNow(id);
+  } catch (e) {
+    toast(String(e));
+  }
+  loadOutbox();
 }
 
 export async function loadTrusted() {

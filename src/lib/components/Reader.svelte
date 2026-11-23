@@ -1,54 +1,45 @@
 <script lang="ts">
   import Icon from "./Icon.svelte";
   import MailFrame from "./MailFrame.svelte";
-  import { ui, compose, archiveSelected, trashSelected, toggleJunk, folderById, toggleSeen, toggleFlag, accountById, accountLabel, trustSender, toast } from "../state.svelte";
+  import ThreadMessage from "./ThreadMessage.svelte";
+  import {
+    ui, compose, archiveSelected, trashSelected, toggleJunk, toggleSeen, toggleFlag, selectedRows, roleOf, clearSelection,
+    snoozeSelected, unsnoozeSelected, moveSelected, accountById, editQueued, deleteQueued, sendQueuedNow,
+  } from "../state.svelte";
   import { hint } from "../shortcuts.svelte";
-  import { api, type Addr } from "../api";
-  import { longDate, displayName, initials, colorFor, fileSize } from "../format";
-  import { hasRemoteContent, textToHtml } from "../html";
+  import { whenLabel } from "../when";
 
-  let showImagesFor = $state<number | null>(null);
-
+  const multi = $derived(ui.selectedIds.length > 1);
   const d = $derived(ui.detail);
-  const body = $derived(d ? (d.html ?? textToHtml(d.text ?? "")) : "");
-  const remote = $derived(!!d?.html && hasRemoteContent(d.html));
-  const trusted = $derived(!!d && ui.trustedSenders.includes(d.fromAddr.toLowerCase()));
-  const allowRemote = $derived(!!d && (trusted || showImagesFor === d.id));
-  const row = $derived(ui.list.find((m) => m.id === ui.selectedId));
-  const isJunk = $derived(!!d && folderById(d.folderId)?.role === "junk");
-
-  function names(list: Addr[]) {
-    const me = new Set(ui.accounts.map((a) => a.email.toLowerCase()));
-    return list.map((a) => (me.has(a.email.toLowerCase()) ? "me" : displayName(a.name, a.email))).join(", ");
-  }
-
-  async function save(index: number) {
-    if (!d) return;
-    try {
-      await api.saveAttachment(d.id, index);
-    } catch (e) {
-      toast(String(e));
-    }
-  }
-
-  async function open(index: number) {
-    if (!d) return;
-    try {
-      await api.openAttachment(d.id, index);
-    } catch (e) {
-      toast(String(e));
-    }
-  }
+  const outboxItem = $derived(ui.view.kind === "outbox" ? ui.outbox.find((o) => o.id === ui.outboxSelected) : undefined);
+  /** The rows the toolbar acts on. */
+  const rows = $derived(selectedRows());
+  const isJunk = $derived(rows.length > 0 && roleOf(rows[0]) === "junk");
+  const snoozed = $derived(rows.length > 0 && rows.every((r) => roleOf(r) === "snoozed"));
+  const unread = $derived(rows.some((r) => !r.seen));
+  const flagged = $derived(rows.length > 0 && rows.every((r) => r.flagged));
+  const oneAccount = $derived(new Set(rows.map((r) => r.accountId)).size === 1);
+  const showTools = $derived(ui.view.kind !== "outbox" && (multi || !!d));
+  /** Scroll to the first unread message of a longer conversation, else stay at the top. */
+  const focusId = $derived(ui.thread.length > 3 ? (ui.thread.find((m) => ui.expandIds.includes(m.id) && !m.seen)?.id ?? null) : null);
 </script>
 
 <section class="reader">
   <header data-tauri-drag-region>
-    {#if d}
+    {#if outboxItem}
       <div class="tools">
-        <button class="icon-btn" title={hint("Reply", "reply")} onclick={() => compose("reply")}><Icon name="reply" size={17} /></button>
-        <button class="icon-btn" title={hint("Reply all", "replyAll")} onclick={() => compose("replyAll")}><Icon name="replyAll" size={17} /></button>
-        <button class="icon-btn" title={hint("Forward", "forward")} onclick={() => compose("forward")}><Icon name="forward" size={17} /></button>
-        <span class="sep"></span>
+        <button class="btn" onclick={() => sendQueuedNow(outboxItem.id)}>Send now</button>
+        <button class="btn" onclick={() => editQueued(outboxItem.id)}>Edit</button>
+        <button class="icon-btn" title="Delete" onclick={() => deleteQueued(outboxItem.id)}><Icon name="trash" size={17} /></button>
+      </div>
+    {:else if showTools}
+      <div class="tools">
+        {#if !multi}
+          <button class="icon-btn" title={hint("Reply", "reply")} onclick={() => compose("reply")}><Icon name="reply" size={17} /></button>
+          <button class="icon-btn" title={hint("Reply all", "replyAll")} onclick={() => compose("replyAll")}><Icon name="replyAll" size={17} /></button>
+          <button class="icon-btn" title={hint("Forward", "forward")} onclick={() => compose("forward")}><Icon name="forward" size={17} /></button>
+          <span class="sep"></span>
+        {/if}
         <button class="icon-btn" title={hint("Archive", "archive")} onclick={archiveSelected}><Icon name="archive" size={17} /></button>
         <button class="icon-btn" title={hint("Delete", "delete")} onclick={trashSelected}><Icon name="trash" size={17} /></button>
         {#if isJunk}
@@ -56,68 +47,61 @@
         {:else}
           <button class="icon-btn" title={hint("Move to junk", "junk")} onclick={toggleJunk}><Icon name="junk" size={17} /></button>
         {/if}
+        <button class="icon-btn" title={hint("Move to folder", "move")} disabled={!oneAccount} onclick={moveSelected}><Icon name="move" size={17} /></button>
+        {#if snoozed}
+          <button class="icon-btn on" title="Unsnooze" onclick={unsnoozeSelected}><Icon name="clock" size={17} /></button>
+        {:else}
+          <button class="icon-btn" title={hint("Snooze", "snooze")} onclick={snoozeSelected}><Icon name="clock" size={17} /></button>
+        {/if}
         <span class="sep"></span>
-        <button class="icon-btn" class:on={row && !row.seen} title={hint("Mark as unread", "toggleUnread")} onclick={toggleSeen}><Icon name="unread" size={17} /></button>
-        <button class="icon-btn" class:flagged={row?.flagged} title={hint("Flag", "toggleFlag")} onclick={toggleFlag}><Icon name="flag" size={17} /></button>
+        <button class="icon-btn" class:on={unread} title={hint(unread ? "Mark as read" : "Mark as unread", "toggleUnread")} onclick={toggleSeen}><Icon name="unread" size={17} /></button>
+        <button class="icon-btn" class:flagged title={hint("Flag", "toggleFlag")} onclick={toggleFlag}><Icon name="flag" size={17} /></button>
       </div>
     {/if}
   </header>
 
-  {#if d}
-    {@const acc = accountById(d.accountId)}
+  {#if outboxItem}
+    {@const o = outboxItem}
+    {@const acc = accountById(o.accountId)}
+    <div class="scroll content">
+      <article>
+        <h2>{o.message.subject || "(no subject)"}</h2>
+        <div class="queued" class:failed={!!o.error}>
+          <Icon name={o.error ? "alert" : "clock"} size={15} />
+          {#if o.error}
+            <span>Not sent yet, trying again {whenLabel(new Date(o.sendAt * 1000))}. {o.error}</span>
+          {:else}
+            <span>Sends {whenLabel(new Date(o.sendAt * 1000))}{acc ? ` from ${acc.email}` : ""}</span>
+          {/if}
+        </div>
+        <div class="rcpt">
+          <div><span class="k">To</span>{o.message.to.join(", ") || "—"}</div>
+          {#if o.message.cc.length}<div><span class="k">Cc</span>{o.message.cc.join(", ")}</div>{/if}
+          {#if o.message.bcc.length}<div><span class="k">Bcc</span>{o.message.bcc.join(", ")}</div>{/if}
+          {#if o.message.attachments.length}<div><span class="k">Files</span>{o.message.attachments.map((p) => p.split("/").pop()).join(", ")}</div>{/if}
+        </div>
+        <div class="paper">
+          {#key o.id}
+            <MailFrame html={o.message.html} allowRemote={false} />
+          {/key}
+        </div>
+      </article>
+    </div>
+  {:else if multi}
+    <div class="center bulk">
+      <div class="big">{ui.selectedIds.length}</div>
+      <div>selected</div>
+      <button class="link" onclick={clearSelection}>Clear selection</button>
+    </div>
+  {:else if d}
     <div class="scroll content">
       <article>
         <h2>{d.subject || "(no subject)"}</h2>
-        <div class="meta">
-          <span class="avatar" style:background={colorFor(d.fromAddr)}>{initials(d.fromName, d.fromAddr)}</span>
-          <div class="who">
-            <div class="line">
-              <span class="name">{displayName(d.fromName, d.fromAddr)}</span>
-              {#if d.fromName}<span class="addr">{d.fromAddr}</span>{/if}
-            </div>
-            <div class="to">
-              to {names(d.to) || "undisclosed recipients"}{#if d.cc.length}, cc {names(d.cc)}{/if}
-            </div>
-          </div>
-          <div class="when">
-            <div>{longDate(d.date)}</div>
-            {#if acc && ui.accounts.length > 1}
-              <div class="acc" title={acc.email}><span class="dot" style:background={acc.color || "var(--muted)"}></span>{accountLabel(acc)}</div>
-            {/if}
-          </div>
-        </div>
-
-        {#if d.attachments.length}
-          <div class="files">
-            {#each d.attachments as a (a.index)}
-              <div class="file">
-                <button class="open" onclick={() => open(a.index)} title="Open">
-                  <span class="ficon"><Icon name="file" size={16} /></span>
-                  <span class="fname">{a.filename}</span>
-                  <span class="fsize">{fileSize(a.size)}</span>
-                </button>
-                <button class="icon-btn dl" title="Save to Downloads" onclick={() => save(a.index)}>
-                  <Icon name="download" size={15} />
-                </button>
-              </div>
-            {/each}
-          </div>
-        {/if}
-
-        {#if remote && !allowRemote}
-          <div class="images">
-            <Icon name="image" size={15} />
-            <span>Images hidden</span>
-            <button class="link" onclick={() => (showImagesFor = d.id)}>Show</button>
-            <button class="link" onclick={() => trustSender(d.fromAddr)}>Always from this sender</button>
-          </div>
-        {/if}
-
-        <div class="paper">
-          {#key d.id}
-            <MailFrame html={body} {allowRemote} />
-          {/key}
-        </div>
+        {#key ui.selectedId}
+          {#each ui.thread as m, i (m.id)}
+            <ThreadMessage {m} expanded={ui.expandIds.includes(m.id) || i === ui.thread.length - 1} focus={m.id === focusId} />
+          {/each}
+        {/key}
       </article>
     </div>
   {:else if ui.detailLoading}
@@ -148,12 +132,14 @@
     padding: 0 14px;
   }
   .tools { display: flex; align-items: center; gap: 2px; }
+  .tools .btn { margin-left: 6px; }
   .sep { width: 1px; height: 18px; background: var(--line); margin: 0 6px; }
   .icon-btn.flagged { color: #e0882a; }
+  .icon-btn:disabled { opacity: 0.35; }
   .content { flex: 1; }
   article { max-width: 860px; margin: 0 auto; padding: 14px 36px 48px; animation: fade 0.12s ease-out; }
   h2 {
-    margin: 0 0 20px;
+    margin: 0 0 14px;
     font-size: 22px;
     line-height: 1.25;
     font-weight: 650;
@@ -161,70 +147,28 @@
     -webkit-user-select: text;
     user-select: text;
   }
-  .meta { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 22px; }
-  .avatar {
-    width: 38px;
-    height: 38px;
-    flex: none;
-    border-radius: 50%;
-    display: grid;
-    place-items: center;
-    color: #fff;
-    font-size: 13.5px;
-    font-weight: 600;
-    letter-spacing: 0.02em;
-  }
-  .who { flex: 1; min-width: 0; -webkit-user-select: text; user-select: text; }
-  .line { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
-  .name { font-weight: 600; white-space: nowrap; }
-  .addr { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .to { color: var(--muted); font-size: 13px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .when { flex: none; text-align: right; color: var(--muted); font-size: 12.5px; }
-  .acc { display: flex; align-items: center; justify-content: flex-end; gap: 6px; margin-top: 3px; }
-  .dot { width: 6px; height: 6px; border-radius: 50%; }
-  .files { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
-  .file {
-    display: flex;
-    align-items: center;
-    border: 1px solid var(--line-strong);
-    border-radius: 9px;
-    max-width: 300px;
-    overflow: hidden;
-  }
-  .file:hover { border-color: var(--muted); }
-  .open {
+  .queued {
     display: flex;
     align-items: center;
     gap: 8px;
-    min-width: 0;
-    height: 38px;
-    padding: 0 4px 0 11px;
-    border: 0;
-    background: transparent;
-    text-align: left;
-  }
-  .ficon { color: var(--muted); display: grid; }
-  .fname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 500; }
-  .fsize { color: var(--muted); font-size: 12px; white-space: nowrap; }
-  .dl { margin-right: 4px; width: 28px; height: 28px; }
-  .images {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin-bottom: 16px;
-    padding: 8px 12px;
+    margin-bottom: 14px;
+    padding: 9px 12px;
     border-radius: 8px;
     background: var(--hover);
-    color: var(--muted);
+    color: var(--text-2);
     font-size: 13px;
   }
-  .images span { flex: 1; }
-  .link { border: 0; background: none; padding: 0; color: var(--accent); font-size: 13px; font-weight: 500; }
+  .queued.failed { color: var(--danger); }
+  .rcpt { display: flex; flex-direction: column; gap: 4px; margin-bottom: 18px; font-size: 13px; color: var(--text-2); -webkit-user-select: text; user-select: text; }
+  .k { display: inline-block; width: 44px; color: var(--muted); }
   .paper { border-radius: 10px; overflow: hidden; }
   @media (prefers-color-scheme: dark) {
     .paper { padding: 16px 18px; background: #fff; }
   }
   .center { flex: 1; display: grid; place-items: center; color: var(--muted); }
+  .bulk { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; font-size: 14px; }
+  .big { font-size: 40px; font-weight: 650; color: var(--text-2); font-variant-numeric: tabular-nums; }
+  .link { margin-top: 10px; border: 0; background: none; padding: 0; color: var(--accent); font-size: 13px; font-weight: 500; }
   .blank { color: var(--line-strong); }
   .error { padding: 40px; text-align: center; font-size: 13px; }
   .spinner {

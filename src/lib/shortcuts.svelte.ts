@@ -2,12 +2,16 @@ import { api } from "./api";
 
 export type Action =
   | "next" | "prev" | "reply" | "replyAll" | "forward" | "compose" | "archive" | "delete" | "junk"
-  | "toggleUnread" | "toggleFlag" | "search" | "sync" | "settings" | "send";
+  | "toggleUnread" | "toggleFlag" | "search" | "sync" | "settings" | "send"
+  | "move" | "snooze" | "selectAll" | "extendDown" | "extendUp";
 
 export const ACTIONS: { id: Action; label: string; group: string }[] = [
   { id: "next", label: "Next message", group: "Navigate" },
   { id: "prev", label: "Previous message", group: "Navigate" },
   { id: "search", label: "Search", group: "Navigate" },
+  { id: "extendDown", label: "Select next too", group: "Navigate" },
+  { id: "extendUp", label: "Select previous too", group: "Navigate" },
+  { id: "selectAll", label: "Select all", group: "Navigate" },
   { id: "compose", label: "New message", group: "Write" },
   { id: "reply", label: "Reply", group: "Write" },
   { id: "replyAll", label: "Reply all", group: "Write" },
@@ -16,6 +20,8 @@ export const ACTIONS: { id: Action; label: string; group: string }[] = [
   { id: "archive", label: "Archive", group: "Organize" },
   { id: "delete", label: "Delete", group: "Organize" },
   { id: "junk", label: "Junk / Not junk", group: "Organize" },
+  { id: "move", label: "Move to folder", group: "Organize" },
+  { id: "snooze", label: "Snooze", group: "Organize" },
   { id: "toggleUnread", label: "Mark read / unread", group: "Organize" },
   { id: "toggleFlag", label: "Flag", group: "Organize" },
   { id: "sync", label: "Check for mail", group: "App" },
@@ -34,6 +40,11 @@ export const DEFAULTS: Record<Action, string[]> = {
   archive: ["e"],
   delete: ["#", "backspace", "delete", "mod+backspace"],
   junk: ["mod+shift+j"],
+  move: ["v"],
+  snooze: ["b"],
+  selectAll: ["mod+a"],
+  extendDown: ["shift+j", "shift+arrowdown"],
+  extendUp: ["shift+k", "shift+arrowup"],
   toggleUnread: ["u"],
   toggleFlag: ["s"],
   sync: ["mod+r"],

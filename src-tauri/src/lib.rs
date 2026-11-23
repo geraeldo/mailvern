@@ -1,4 +1,4 @@
-use mail_core::model::{Account, Folder, MessageDetail, MessageSummary, Outgoing, View};
+use mail_core::model::{Account, Folder, MessageDetail, MessageSummary, Outgoing, OutboxItem, View};
 use mail_core::Engine;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -43,8 +43,33 @@ fn folders(engine: E) -> R<Vec<Folder>> {
 }
 
 #[tauri::command]
-fn messages(engine: E, view: View, query: Option<String>, offset: i64, limit: i64) -> R<Vec<MessageSummary>> {
-    engine.messages(&view, query.as_deref(), offset, limit).map_err(err)
+fn messages(engine: E, view: View, query: Option<String>, offset: i64, limit: i64, threaded: Option<bool>) -> R<Vec<MessageSummary>> {
+    engine.messages(&view, query.as_deref(), offset, limit, threaded.unwrap_or(true)).map_err(err)
+}
+
+#[tauri::command]
+fn thread(engine: E, id: i64) -> R<Vec<MessageSummary>> {
+    engine.thread(id).map_err(err)
+}
+
+#[tauri::command]
+async fn search_server(engine: E<'_>, query: String) -> R<Vec<MessageSummary>> {
+    engine.search_server(&query).await.map_err(err)
+}
+
+#[tauri::command]
+fn move_to(engine: E, ids: Vec<i64>, folder_id: i64) -> R<()> {
+    engine.move_to(&ids, folder_id).map_err(err)
+}
+
+#[tauri::command]
+fn snooze(engine: E, ids: Vec<i64>, until: i64) -> R<()> {
+    engine.snooze(&ids, until).map_err(err)
+}
+
+#[tauri::command]
+fn unsnooze(engine: E, ids: Vec<i64>) -> R<()> {
+    engine.unsnooze(&ids).map_err(err)
 }
 
 #[tauri::command]
@@ -107,9 +132,52 @@ fn not_junk(engine: E, ids: Vec<i64>) -> R<()> {
     engine.not_junk(&ids).map_err(err)
 }
 
+/// Queues a message: after the undo window, or at `send_at` (unix seconds). Returns its outbox id.
 #[tauri::command]
-async fn send(engine: E<'_>, message: Outgoing) -> R<()> {
-    engine.send(message).await.map_err(err)
+fn send(engine: E, message: Outgoing, send_at: Option<i64>) -> R<i64> {
+    engine.send(message, send_at).map_err(err)
+}
+
+#[derive(serde::Serialize)]
+struct Cancelled {
+    message: Outgoing,
+    attachments: Vec<FileInfo>,
+}
+
+/// Takes a message back out of the outbox to edit it. Its attachments are written to a
+/// temp folder so the composer can attach them again.
+#[tauri::command]
+fn cancel_send(engine: E, id: i64) -> R<Cancelled> {
+    let (message, files) = engine.cancel_send(id).map_err(err)?;
+    let dir = std::env::temp_dir().join("Mailvern").join(format!("outbox-{id}"));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let mut attachments = Vec::new();
+    for (name, bytes) in files {
+        let path = unique_path(&dir, &safe_name(&name));
+        std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+        attachments.push(FileInfo { path: path.to_string_lossy().into(), name: safe_name(&name), size: bytes.len() as u64 });
+    }
+    Ok(Cancelled { message, attachments })
+}
+
+#[tauri::command]
+fn send_now(engine: E, id: i64) -> R<()> {
+    engine.send_now(id).map_err(err)
+}
+
+#[tauri::command]
+fn outbox(engine: E) -> R<Vec<OutboxItem>> {
+    engine.outbox().map_err(err)
+}
+
+#[tauri::command]
+async fn save_draft(engine: E<'_>, message: Outgoing) -> R<String> {
+    engine.save_draft(message).await.map_err(err)
+}
+
+#[tauri::command]
+fn delete_draft(engine: E, account_id: i64, message_id: String) -> R<()> {
+    engine.delete_draft(account_id, &message_id).map_err(err)
 }
 
 #[tauri::command]
@@ -329,7 +397,17 @@ pub fn run() {
             reorder_folders,
             folders,
             messages,
+            thread,
             search,
+            search_server,
+            move_to,
+            snooze,
+            unsnooze,
+            cancel_send,
+            send_now,
+            outbox,
+            save_draft,
+            delete_draft,
             load_older,
             badge_count,
             mark_badge_seen,

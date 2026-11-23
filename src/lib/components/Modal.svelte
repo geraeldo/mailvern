@@ -2,11 +2,13 @@
   import type { Snippet } from "svelte";
   import { keymap } from "../shortcuts.svelte";
 
-  let { label, onclose, onkeydown, children }: {
+  let { label, onclose, onkeydown, children, small = false }: {
     label: string;
     onclose: () => void;
     onkeydown?: (e: KeyboardEvent) => void;
     children: Snippet;
+    /** A small dialog sized to its content, instead of the settings sheet. */
+    small?: boolean;
   } = $props();
 
   let sheet = $state<HTMLDivElement>();
@@ -33,7 +35,7 @@
     if (downOnScrim && e.target === e.currentTarget) onclose();
     downOnScrim = false;
   }}>
-  <div class="sheet" role="dialog" aria-label={label} tabindex="-1" bind:this={sheet}>
+  <div class="sheet" class:small role="dialog" aria-label={label} tabindex="-1" bind:this={sheet}>
     {@render children()}
   </div>
 </div>
@@ -58,5 +60,11 @@
     overflow: hidden;
     outline: none;
     animation: rise 0.16s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  .sheet.small {
+    flex-direction: column;
+    width: min(340px, calc(100vw - 48px));
+    height: auto;
+    max-height: min(520px, calc(100vh - 64px));
   }
 </style>

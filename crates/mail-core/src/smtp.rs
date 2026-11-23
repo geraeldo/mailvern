@@ -2,9 +2,10 @@ use crate::model::{Account, Outgoing};
 use anyhow::{anyhow, Context, Result};
 use lettre::message::header::ContentType;
 use base64::Engine as _;
+use lettre::address::Envelope;
 use lettre::message::{Attachment, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
-use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+use lettre::{Address, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use std::path::Path;
 use std::time::Duration;
 
@@ -76,13 +77,38 @@ pub fn extract_inline_images(html: &str, domain: &str) -> (String, Vec<InlineIma
     (out, images)
 }
 
-/// Builds and sends the message. Returns (Message-ID, raw bytes).
-pub async fn send(acc: &Account, password: &str, out: &Outgoing) -> Result<(String, Vec<u8>)> {
+/// A fresh Message-ID on the account's domain.
+pub fn new_message_id(acc: &Account) -> String {
     let domain = acc.email.split('@').nth(1).unwrap_or("mailvern.local");
-    let message_id = format!("<{}@{}>", uuid::Uuid::new_v4(), domain);
+    format!("<{}@{}>", uuid::Uuid::new_v4(), domain)
+}
 
-    let from = Mailbox::new(Some(acc.name.clone()).filter(|n| !n.is_empty()), acc.email.parse()?);
-    let mut b = Message::builder().from(from).subject(&out.subject).message_id(Some(message_id.clone()));
+/// Who the SMTP server is told the message is from and for (Bcc included).
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct SimpleEnvelope {
+    pub from: String,
+    pub to: Vec<String>,
+}
+
+/// A message ready to queue: its bytes and envelope.
+pub struct Built {
+    pub raw: Vec<u8>,
+    pub envelope: SimpleEnvelope,
+}
+
+/// Builds the MIME message. Attachments are read now, so a queued message doesn't
+/// depend on files that may be gone by the time it is sent.
+///
+/// A draft keeps its Bcc header (so reopening it shows Bcc) and may have no recipients yet.
+pub fn build(acc: &Account, out: &Outgoing, message_id: &str, draft: bool) -> Result<Built> {
+    let domain = acc.email.split('@').nth(1).unwrap_or("mailvern.local");
+    let from_addr: Address = acc.email.parse()?;
+    let from = Mailbox::new(Some(acc.name.clone()).filter(|n| !n.is_empty()), from_addr.clone());
+    let mut b = Message::builder().from(from).subject(&out.subject).message_id(Some(message_id.to_string()));
+    if draft {
+        // Lettre needs an envelope to build; a draft is never sent, so any will do.
+        b = b.keep_bcc().envelope(Envelope::new(Some(from_addr.clone()), vec![from_addr])?);
+    }
     for t in &out.to {
         b = b.to(mailbox(t)?);
     }
@@ -125,9 +151,47 @@ pub async fn send(acc: &Account, password: &str, out: &Outgoing) -> Result<(Stri
         b.multipart(mixed)?
     };
 
-    let raw = msg.formatted();
-    transport(acc, password)?.send(msg).await.context("Couldn't send")?;
-    Ok((message_id, raw))
+    let env = msg.envelope();
+    let envelope = SimpleEnvelope {
+        from: env.from().map(|a| a.to_string()).unwrap_or_default(),
+        to: env.to().iter().map(|a| a.to_string()).collect(),
+    };
+    Ok(Built { raw: msg.formatted(), envelope })
+}
+
+/// Sends already-built bytes.
+pub async fn send_raw(acc: &Account, password: &str, envelope: &SimpleEnvelope, raw: &[u8]) -> Result<()> {
+    let from: Address = envelope.from.parse()?;
+    let to = envelope.to.iter().map(|a| a.parse::<Address>()).collect::<Result<Vec<_>, _>>()?;
+    let env = Envelope::new(Some(from), to)?;
+    transport(acc, password)?.send_raw(&env, raw).await.context("Couldn't send")?;
+    Ok(())
+}
+
+/// Replaces the Date header, so a message queued earlier carries the time it is actually sent.
+pub fn redate(raw: &[u8], date: chrono::DateTime<chrono::Local>) -> Vec<u8> {
+    let header_end = raw.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 2).unwrap_or(raw.len());
+    let new_line = format!("Date: {}\r\n", date.to_rfc2822());
+    let mut pos = 0;
+    while pos < header_end {
+        let line_end = raw[pos..header_end].windows(2).position(|w| w == b"\r\n").map(|p| pos + p + 2).unwrap_or(header_end);
+        if raw[pos..line_end].len() >= 5 && raw[pos..pos + 5].eq_ignore_ascii_case(b"date:") {
+            // Include folded continuation lines.
+            let mut end = line_end;
+            while end < header_end && matches!(raw[end], b' ' | b'\t') {
+                end = raw[end..header_end].windows(2).position(|w| w == b"\r\n").map(|p| end + p + 2).unwrap_or(header_end);
+            }
+            let mut out = Vec::with_capacity(raw.len() + 8);
+            out.extend_from_slice(&raw[..pos]);
+            out.extend_from_slice(new_line.as_bytes());
+            out.extend_from_slice(&raw[end..]);
+            return out;
+        }
+        pos = line_end;
+    }
+    let mut out = new_line.into_bytes();
+    out.extend_from_slice(raw);
+    out
 }
 
 #[cfg(test)]
@@ -145,6 +209,66 @@ mod tests {
         assert!(out.contains(&format!("src=\"cid:{}\"", imgs[0].cid)));
         assert!(out.contains("https://x.com/a.png"));
         assert!(!out.contains("data:image"));
+    }
+
+    fn acc() -> Account {
+        Account {
+            id: 1,
+            name: "Me".into(),
+            email: "me@example.com".into(),
+            imap_host: String::new(),
+            imap_port: 993,
+            smtp_host: String::new(),
+            smtp_port: 465,
+            color: String::new(),
+            signature: String::new(),
+            position: 0,
+            label: String::new(),
+        }
+    }
+
+    fn out(to: &[&str], bcc: &[&str]) -> Outgoing {
+        Outgoing {
+            account_id: 1,
+            to: to.iter().map(|s| s.to_string()).collect(),
+            cc: vec![],
+            bcc: bcc.iter().map(|s| s.to_string()).collect(),
+            subject: "Hi".into(),
+            html: "<p>Hi</p>".into(),
+            text: "Hi".into(),
+            attachments: vec![],
+            in_reply_to: None,
+            references: None,
+            message_id: None,
+        }
+    }
+
+    #[test]
+    fn sent_mail_hides_bcc_but_envelope_has_it() {
+        let b = build(&acc(), &out(&["a@x.com"], &["secret@x.com"]), "<1@example.com>", false).unwrap();
+        let raw = String::from_utf8_lossy(&b.raw);
+        assert!(!raw.contains("secret@x.com"));
+        assert!(raw.contains("Message-ID: <1@example.com>"));
+        assert_eq!(b.envelope.to, vec!["a@x.com", "secret@x.com"]);
+        assert_eq!(b.envelope.from, "me@example.com");
+    }
+
+    #[test]
+    fn drafts_keep_bcc_and_need_no_recipients() {
+        let b = build(&acc(), &out(&[], &["secret@x.com"]), "<2@example.com>", true).unwrap();
+        assert!(String::from_utf8_lossy(&b.raw).contains("Bcc: secret@x.com"));
+        build(&acc(), &out(&[], &[]), "<3@example.com>", true).unwrap();
+    }
+
+    #[test]
+    fn redate_replaces_the_date_header_only() {
+        let raw = b"From: a@x.com\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\nSubject: Date: not this\r\n\r\nDate: body".to_vec();
+        let when = chrono::Local::now();
+        let out = String::from_utf8(redate(&raw, when)).unwrap();
+        assert!(out.contains(&format!("Date: {}\r\n", when.to_rfc2822())));
+        assert!(!out.contains("2024"));
+        assert!(out.contains("Subject: Date: not this"));
+        assert!(out.ends_with("\r\n\r\nDate: body"));
     }
 
     #[test]

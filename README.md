@@ -41,6 +41,17 @@ Append a new entry to `MIGRATIONS` in `crates/mail-core/src/db.rs`, for example 
 - The newest 500 headers per folder sync first. Recent bodies download in the background.
 - Scrolling past the end of the local cache fetches the next 500 older headers from the server.
 - Read, flag, archive and delete update locally first, then go to the server.
+- Search shows local results at once, then asks each server (IMAP SEARCH) and merges in mail that was never downloaded. Those hits are stored as "sparse" rows outside the synced window.
+
+## Writing and sending
+
+- The composer saves a draft to the account's Drafts folder a moment after each change, and when you close it. Double-click a draft, or use Edit, to keep writing.
+- Sending puts the message in a local outbox. It goes out after the undo window (Settings › General, default 10 seconds) or at the time picked with Send Later (the arrow next to Send). Scheduled and failed messages show under All Accounts › Scheduled, where they can be sent now, edited or deleted. The outbox survives restarts.
+
+## Conversations and snooze
+
+- Messages and their replies are grouped into one row by their References / In-Reply-To headers, across folders of the same account. Turn this off in Settings › General.
+- Snooze moves a conversation to a "Snoozed" folder on the server and brings it back to the Inbox as unread at the chosen time, so other devices don't show it meanwhile. The app has to be running at that time to move it back.
 
 ## Sidebar
 
@@ -58,6 +69,9 @@ Defaults below. Rebind anything in Settings › Shortcuts.
 | `⌫` / `#` | Delete |
 | `u` | Mark unread |
 | `s` | Flag |
+| `v` | Move to folder |
+| `b` | Snooze (Unsnooze in Snoozed) |
+| `⌘`-click, `⇧`-click, `⇧J` / `⇧K`, `⌘A` | Select several |
 | `c`, `⌘N` | New message |
 | `/`, `⌘F` | Search |
 | `⌘R` | Check for mail |

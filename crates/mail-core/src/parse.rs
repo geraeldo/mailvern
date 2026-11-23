@@ -150,6 +150,7 @@ fn html_body(m: &Message) -> Option<String> {
 }
 
 pub struct ParsedBody {
+    pub bcc: Vec<Addr>,
     pub html: Option<String>,
     pub text: Option<String>,
     pub attachments: Vec<AttachmentInfo>,
@@ -158,7 +159,7 @@ pub struct ParsedBody {
 /// Prepares a stored message for display. Inline `cid:` images become data URIs.
 pub fn display(raw: &[u8]) -> ParsedBody {
     let Some(m) = MessageParser::default().parse(raw) else {
-        return ParsedBody { html: None, text: Some(String::from_utf8_lossy(raw).into()), attachments: vec![] };
+        return ParsedBody { bcc: vec![], html: None, text: Some(String::from_utf8_lossy(raw).into()), attachments: vec![] };
     };
     let mut html = html_body(&m);
     if let Some(h) = html.as_mut() {
@@ -184,7 +185,7 @@ pub fn display(raw: &[u8]) -> ParsedBody {
             size: p.contents().len(),
         })
         .collect();
-    ParsedBody { html, text, attachments }
+    ParsedBody { bcc: addrs(m.bcc()), html, text, attachments }
 }
 
 /// Returns (filename, bytes) for attachment `index` (as numbered by `display`).

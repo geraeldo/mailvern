@@ -1,18 +1,31 @@
-use crate::db::Db;
+use crate::db::{Db, DueSnooze, OutboxRow};
 use crate::model::*;
-use crate::worker::{idle_loop, Cmd, Worker};
+use crate::worker::{idle_loop, Cmd, Target, Worker};
 use crate::{imap, parse, secrets, smtp};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, Notify};
+use tokio::task::JoinHandle;
 
 /// Setting keys for the Dock badge.
 const BADGE_MODE: &str = "badge_mode";
 const BADGE_SEEN: &str = "badge_seen_id";
-use tokio::task::JoinHandle;
+/// Seconds a sent message waits in the outbox so it can be undone ("0" sends at once).
+const UNDO_SEND: &str = "undo_send";
+const UNDO_SEND_DEFAULT: i64 = 10;
+
+type Workers = Arc<Mutex<HashMap<i64, Handle>>>;
+
+fn now() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+fn worker_tx(workers: &Workers, account_id: i64) -> Option<mpsc::UnboundedSender<Cmd>> {
+    workers.lock().unwrap().get(&account_id).map(|h| h.tx.clone())
+}
 
 struct Handle {
     tx: mpsc::UnboundedSender<Cmd>,
@@ -31,13 +44,20 @@ impl Drop for Handle {
 pub struct Engine {
     db: Arc<Db>,
     events: broadcast::Sender<Event>,
-    workers: Mutex<HashMap<i64, Handle>>,
+    workers: Workers,
+    /// Wakes the scheduler when the outbox or snoozes change.
+    wake: Arc<Notify>,
 }
 
 impl Engine {
     pub fn open(db_path: &Path) -> Result<Self> {
         let (events, _) = broadcast::channel(256);
-        Ok(Engine { db: Arc::new(Db::open(db_path)?), events, workers: Mutex::new(HashMap::new()) })
+        Ok(Engine {
+            db: Arc::new(Db::open(db_path)?),
+            events,
+            workers: Arc::new(Mutex::new(HashMap::new())),
+            wake: Arc::new(Notify::new()),
+        })
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
@@ -49,6 +69,7 @@ impl Engine {
         for acc in self.db.accounts()? {
             self.start_account(acc);
         }
+        tokio::spawn(scheduler(self.db.clone(), self.events.clone(), self.workers.clone(), self.wake.clone()));
         Ok(())
     }
 
@@ -169,8 +190,17 @@ impl Engine {
         self.db.folders()
     }
 
-    pub fn messages(&self, view: &View, query: Option<&str>, offset: i64, limit: i64) -> Result<Vec<MessageSummary>> {
-        self.db.list(view, query, offset, limit)
+    /// A page of a view. `threaded` gives one row per conversation.
+    pub fn messages(&self, view: &View, query: Option<&str>, offset: i64, limit: i64, threaded: bool) -> Result<Vec<MessageSummary>> {
+        match query {
+            None if threaded => self.db.list_threads(view, offset, limit),
+            _ => self.db.list(view, query, offset, limit),
+        }
+    }
+
+    /// The whole conversation a message belongs to, oldest first.
+    pub fn thread(&self, id: i64) -> Result<Vec<MessageSummary>> {
+        self.db.thread(id)
     }
 
     /// Fetches older mail from the server for the folders behind a view.
@@ -221,6 +251,43 @@ impl Engine {
         self.db.search_all(query, 300)
     }
 
+    /// Asks every account's server, which also finds mail never downloaded and words in
+    /// bodies not cached yet. Hits are stored locally; returns them newest first.
+    pub async fn search_server(&self, query: &str) -> Result<Vec<MessageSummary>> {
+        let terms: Vec<String> = query.split_whitespace().map(|t| t.trim_matches('"').to_string()).filter(|t| !t.is_empty()).collect();
+        if terms.is_empty() {
+            return Ok(vec![]);
+        }
+        let accounts: Vec<i64> = self.workers.lock().unwrap().keys().copied().collect();
+        let waits = accounts.into_iter().filter_map(|acc| {
+            let (tx, rx) = oneshot::channel();
+            self.send_cmd(acc, Cmd::Search { terms: terms.clone(), reply: tx }).ok()?;
+            Some(async move {
+                match tokio::time::timeout(Duration::from_secs(60), rx).await {
+                    Ok(Ok(r)) => r,
+                    _ => Err(anyhow!("Timed out searching the server")),
+                }
+            })
+        });
+        let mut ids = Vec::new();
+        let mut first_err = None;
+        for r in futures::future::join_all(waits).await {
+            match r {
+                Ok(found) => ids.extend(found),
+                Err(e) => first_err = first_err.or(Some(e)),
+            }
+        }
+        if ids.is_empty() {
+            if let Some(e) = first_err {
+                return Err(e);
+            }
+        }
+        let mut rows = self.db.summaries(&ids)?;
+        rows.sort_by(|a, b| b.date.cmp(&a.date).then(b.id.cmp(&a.id)));
+        rows.dedup_by_key(|r| r.id);
+        Ok(rows)
+    }
+
     /// The Dock badge number, per the "badge_mode" setting:
     /// "new" (default) counts unread inbox mail that arrived since the app was last focused,
     /// so mail you mark unread to handle later doesn't badge; "all" counts all unread inbox
@@ -268,14 +335,16 @@ impl Engine {
 
     pub async fn message(&self, id: i64) -> Result<MessageDetail> {
         let raw = self.raw(id).await?;
-        let (summary, to, cc, reply_to, message_id, references, _) = self.db.summary(id)?;
+        let (summary, to, cc, reply_to, message_id, references, in_reply_to) = self.db.summary(id)?;
         let p = parse::display(&raw);
         Ok(MessageDetail {
             summary,
             to,
             cc,
+            bcc: p.bcc,
             reply_to,
             message_id,
+            in_reply_to,
             references,
             html: p.html,
             text: p.text,
@@ -300,10 +369,15 @@ impl Engine {
     // ---------- changes (local first, server in background) ----------
 
     fn group(&self, ids: &[i64]) -> Result<HashMap<(i64, i64), Vec<u32>>> {
-        let mut g: HashMap<(i64, i64), Vec<u32>> = HashMap::new();
+        Ok(self.group_ids(ids)?.into_iter().map(|(k, v)| (k, v.into_iter().map(|(_, uid)| uid).collect())).collect())
+    }
+
+    /// Messages by (account, folder), as (id, uid).
+    fn group_ids(&self, ids: &[i64]) -> Result<HashMap<(i64, i64), Vec<(i64, u32)>>> {
+        let mut g: HashMap<(i64, i64), Vec<(i64, u32)>> = HashMap::new();
         for id in ids {
             let (acc, folder, _, uid) = self.db.locate(*id)?;
-            g.entry((acc, folder)).or_default().push(uid);
+            g.entry((acc, folder)).or_default().push((*id, uid));
         }
         Ok(g)
     }
@@ -356,7 +430,7 @@ impl Engine {
                     continue;
                 }
             } else {
-                self.send_cmd(acc, Cmd::Move { folder_id, uids, to_role: role })?;
+                self.send_cmd(acc, Cmd::Move { folder_id, uids, to: Target::Role(role) })?;
             }
             to_delete.push(acc);
         }
@@ -385,6 +459,75 @@ impl Engine {
         self.move_role(ids, "inbox")
     }
 
+    /// Moves messages to a folder of their own account.
+    pub fn move_to(&self, ids: &[i64], folder_id: i64) -> Result<()> {
+        let (target_acc, _, _) = self.db.folder(folder_id)?;
+        let g = self.group_ids(ids)?;
+        if g.keys().any(|(acc, _)| *acc != target_acc) {
+            return Err(anyhow!("Messages can only be moved to a folder in their own account"));
+        }
+        let mut moved = Vec::new();
+        for ((acc, from), msgs) in g {
+            if from == folder_id {
+                continue;
+            }
+            let uids = msgs.iter().map(|m| m.1).collect();
+            self.send_cmd(acc, Cmd::Move { folder_id: from, uids, to: Target::Folder(folder_id) })?;
+            moved.extend(msgs.iter().map(|m| m.0));
+        }
+        self.db.delete_messages(&moved)?;
+        let _ = self.events.send(Event::Changed { account_id: target_acc });
+        Ok(())
+    }
+
+    /// Takes messages out of their folder until `until`, then brings them back to the
+    /// Inbox as unread. They wait in a "Snoozed" folder on the server, so other devices
+    /// don't show them either.
+    pub fn snooze(&self, ids: &[i64], until: i64) -> Result<()> {
+        if until <= now() {
+            return Err(anyhow!("Pick a time in the future"));
+        }
+        let g = self.group_ids(ids)?;
+        let mut moved = Vec::new();
+        let mut accounts = Vec::new();
+        for ((acc, folder_id), msgs) in g {
+            let (_, path, role) = self.db.folder(folder_id)?;
+            let back_to = self.db.folder_by_role(acc, "inbox")?.map(|f| f.1).unwrap_or(path);
+            for (id, _) in &msgs {
+                let mid = self.db.message_id_of(*id)?.ok_or_else(|| anyhow!("This message can't be snoozed (it has no Message-ID)"))?;
+                self.db.add_snooze(acc, &mid, &back_to, until)?;
+            }
+            if role.as_deref() != Some("snoozed") {
+                let uids = msgs.iter().map(|m| m.1).collect();
+                self.send_cmd(acc, Cmd::Move { folder_id, uids, to: Target::Role("snoozed") })?;
+                moved.extend(msgs.iter().map(|m| m.0));
+            }
+            accounts.push(acc);
+        }
+        self.db.delete_messages(&moved)?;
+        self.wake.notify_one();
+        for account_id in accounts {
+            let _ = self.events.send(Event::Changed { account_id });
+        }
+        Ok(())
+    }
+
+    /// Brings snoozed messages back now.
+    pub fn unsnooze(&self, ids: &[i64]) -> Result<()> {
+        let t = now();
+        for id in ids {
+            let (acc, ..) = self.db.locate(*id)?;
+            let Some(mid) = self.db.message_id_of(*id)? else { continue };
+            if !self.db.set_wake(acc, &mid, t)? {
+                // Snoozed by another app: send it to the Inbox.
+                let inbox = self.db.folder_by_role(acc, "inbox")?.map(|f| f.1).unwrap_or_else(|| "INBOX".into());
+                self.db.add_snooze(acc, &mid, &inbox, t)?;
+            }
+        }
+        self.wake.notify_one();
+        Ok(())
+    }
+
     fn notify_changed(&self, ids: &[i64]) {
         if let Some(id) = ids.first() {
             if let Ok((acc, ..)) = self.db.locate(*id) {
@@ -395,23 +538,100 @@ impl Engine {
 
     // ---------- sending ----------
 
-    pub async fn send(&self, out: Outgoing) -> Result<()> {
+    /// Queues a message in the outbox: for `send_at`, or after the undo window.
+    /// It is built now, so a bad address or missing file shows up in the composer.
+    /// Returns the outbox id, for undo.
+    pub fn send(&self, mut out: Outgoing, send_at: Option<i64>) -> Result<i64> {
         if out.to.is_empty() && out.cc.is_empty() && out.bcc.is_empty() {
             return Err(anyhow!("Add a recipient"));
         }
         let acc = self.db.account(out.account_id)?;
-        let pw = secrets::get(&acc.email)?;
-        let (message_id, raw) = smtp::send(&acc, &pw, &out).await?;
-        // Most servers file SMTP mail into Sent themselves. Give them a moment,
-        // then append a copy only if it didn't show up.
-        let tx = self.workers.lock().unwrap().get(&acc.id).map(|h| h.tx.clone());
-        if let Some(tx) = tx {
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                let _ = tx.send(Cmd::EnsureSent { message_id, raw });
-            });
+        let was_draft = out.message_id.is_some();
+        let message_id = out.message_id.clone().unwrap_or_else(|| smtp::new_message_id(&acc));
+        out.message_id = Some(message_id.clone());
+        let built = smtp::build(&acc, &out, &message_id, false)?;
+        let at = match send_at {
+            Some(t) => t,
+            None => now() + self.undo_seconds(),
+        };
+        let id = self.db.add_outbox(
+            acc.id,
+            &message_id,
+            &serde_json::to_string(&out)?,
+            &built.raw,
+            &serde_json::to_string(&built.envelope)?,
+            at,
+        )?;
+        // It lives in the outbox now; a draft of it would be a second copy.
+        if was_draft {
+            let _ = self.delete_draft(acc.id, &message_id);
         }
+        self.wake.notify_one();
+        let _ = self.events.send(Event::Outbox);
+        Ok(id)
+    }
+
+    fn undo_seconds(&self) -> i64 {
+        self.db
+            .setting(UNDO_SEND)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(UNDO_SEND_DEFAULT)
+            .clamp(0, 120)
+    }
+
+    /// Takes a message back out of the outbox (undo send, or editing a scheduled one).
+    /// Returns it with its attachments, to reopen in the composer.
+    pub fn cancel_send(&self, id: i64) -> Result<(Outgoing, Vec<(String, Vec<u8>)>)> {
+        let row = self.db.take_outbox(id)?.ok_or_else(|| anyhow!("Too late, it's on its way"))?;
+        let out: Outgoing = serde_json::from_str(&row.payload)?;
+        let files = parse::all_attachments(&row.raw);
+        let _ = self.events.send(Event::Outbox);
+        Ok((out, files))
+    }
+
+    pub fn send_now(&self, id: i64) -> Result<()> {
+        self.db.reschedule_outbox(id, now())?;
+        self.wake.notify_one();
         Ok(())
+    }
+
+    pub fn outbox(&self) -> Result<Vec<OutboxItem>> {
+        Ok(self
+            .db
+            .outbox()?
+            .into_iter()
+            .filter_map(|(id, account_id, payload, send_at, error)| {
+                let message = serde_json::from_str(&payload).ok()?;
+                Some(OutboxItem { id, account_id, message, send_at, error })
+            })
+            .collect())
+    }
+
+    /// Saves a draft to the account's Drafts folder, replacing its previous version.
+    /// Returns the draft's Message-ID, to pass back on the next save.
+    pub async fn save_draft(&self, mut out: Outgoing) -> Result<String> {
+        let acc = self.db.account(out.account_id)?;
+        let message_id = out.message_id.clone().unwrap_or_else(|| smtp::new_message_id(&acc));
+        out.message_id = Some(message_id.clone());
+        let built = smtp::build(&acc, &out, &message_id, true)?;
+        let (tx, rx) = oneshot::channel();
+        self.send_cmd(acc.id, Cmd::SaveDraft { message_id: message_id.clone(), raw: built.raw, reply: tx })?;
+        tokio::time::timeout(Duration::from_secs(60), rx)
+            .await
+            .map_err(|_| anyhow!("Timed out saving the draft"))?
+            .map_err(|_| anyhow!("Account worker stopped"))??;
+        Ok(message_id)
+    }
+
+    pub fn delete_draft(&self, account_id: i64, message_id: &str) -> Result<()> {
+        if let Some((folder_id, _)) = self.db.folder_by_role(account_id, "drafts")? {
+            if self.db.delete_by_message_id(folder_id, message_id)? > 0 {
+                let _ = self.events.send(Event::Changed { account_id });
+            }
+        }
+        self.send_cmd(account_id, Cmd::DeleteDraft { message_id: message_id.to_string() })
     }
 
     // ---------- settings ----------
@@ -422,5 +642,85 @@ impl Engine {
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         self.db.set_setting(key, value)
+    }
+}
+
+/// Sends outbox messages and wakes snoozes when they come due.
+async fn scheduler(db: Arc<Db>, events: broadcast::Sender<Event>, workers: Workers, wake: Arc<Notify>) {
+    let _ = db.reset_outbox_claims();
+    loop {
+        let t = now();
+        match db.claim_due_outbox(t) {
+            Ok(rows) => {
+                for row in rows {
+                    tokio::spawn(deliver(db.clone(), events.clone(), workers.clone(), row));
+                }
+            }
+            Err(e) => eprintln!("outbox: {e:#}"),
+        }
+        if let Ok(due) = db.due_snoozes(t) {
+            for s in due {
+                // Hold it back while the move runs; if that fails it's retried then.
+                let _ = db.set_wake(s.account_id, &s.message_id, t + 120);
+                tokio::spawn(wake_snooze(db.clone(), events.clone(), workers.clone(), s));
+            }
+        }
+        let next_ms = db.next_due().ok().flatten().map(|n| n * 1000);
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let wait = next_ms.map(|n| (n - now_ms).clamp(0, 60_000)).unwrap_or(60_000);
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(wait as u64)) => {}
+            _ = wake.notified() => {}
+        }
+    }
+}
+
+async fn deliver(db: Arc<Db>, events: broadcast::Sender<Event>, workers: Workers, row: OutboxRow) {
+    let res = async {
+        let acc = db.account(row.account_id)?;
+        let pw = secrets::get(&acc.email)?;
+        let envelope: smtp::SimpleEnvelope = serde_json::from_str(&row.envelope)?;
+        let raw = smtp::redate(&row.raw, chrono::Local::now());
+        smtp::send_raw(&acc, &pw, &envelope, &raw).await?;
+        Ok::<_, anyhow::Error>(raw)
+    }
+    .await;
+    match res {
+        Ok(raw) => {
+            let _ = db.delete_outbox(row.id);
+            let _ = events.send(Event::Outbox);
+            if let Some(tx) = worker_tx(&workers, row.account_id) {
+                // Most servers file SMTP mail into Sent themselves. Give them a moment,
+                // then append a copy only if it didn't show up.
+                let message_id = row.message_id;
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    let _ = tx.send(Cmd::EnsureSent { message_id, raw });
+                });
+            }
+        }
+        Err(e) => {
+            let message = format!("{e:#}");
+            let backoff = 60 * (1i64 << row.attempts.min(5));
+            let _ = db.outbox_failed(row.id, &message, now() + backoff);
+            if row.attempts == 0 {
+                let subject = serde_json::from_str::<Outgoing>(&row.payload).map(|o| o.subject).unwrap_or_default();
+                let _ = events.send(Event::SendFailed { subject, message });
+            }
+            let _ = events.send(Event::Outbox);
+        }
+    }
+}
+
+async fn wake_snooze(db: Arc<Db>, events: broadcast::Sender<Event>, workers: Workers, s: DueSnooze) {
+    let Some(tx) = worker_tx(&workers, s.account_id) else { return };
+    let (rtx, rrx) = oneshot::channel();
+    if tx.send(Cmd::Unsnooze { message_id: s.message_id.clone(), to_path: s.return_path.clone(), reply: rtx }).is_err() {
+        return;
+    }
+    // Back in the Inbox as unread, it notifies like any new mail.
+    if let Ok(Ok(Ok(_))) = tokio::time::timeout(Duration::from_secs(90), rrx).await {
+        let _ = db.mark_woke(s.id, now());
+        let _ = events.send(Event::Changed { account_id: s.account_id });
     }
 }

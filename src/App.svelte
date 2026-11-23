@@ -9,13 +9,18 @@
   import Composer from "./lib/components/Composer.svelte";
   import Settings from "./lib/components/Settings.svelte";
   import AccountSettings from "./lib/components/AccountSettings.svelte";
+  import WhenPicker from "./lib/components/WhenPicker.svelte";
+  import MovePicker from "./lib/components/MovePicker.svelte";
   import { api, type MailEvent } from "./lib/api";
   import { allowNativeMenu } from "./lib/menus";
   import { refreshBadge, loadBadgeMode } from "./lib/badge.svelte";
   import {
-    ui, loadAccounts, loadFolders, loadList, loadTrusted, move, compose,
+    ui, loadAccounts, loadFolders, loadList, loadTrusted, loadPrefs, loadOutbox, refreshThread, move, compose,
     archiveSelected, trashSelected, toggleJunk, toggleSeen, toggleFlag, accountById, openSettings, openAccountSettings,
+    moveSelected, snoozeSelected, unsnoozeSelected, selectAll, extendSelection, clearSelection, snoozeRows, moveRows,
+    selectedRows, roleOf, toast, undoToast,
   } from "./lib/state.svelte";
+  import { snoozePresets } from "./lib/when";
   import { keymap, comboOf, match, canFireWhileTyping, usesModifier, loadShortcuts, type Action } from "./lib/shortcuts.svelte";
 
   let list: MessageList;
@@ -26,6 +31,7 @@
     clearTimeout(pending);
     pending = setTimeout(async () => {
       await Promise.all([loadFolders(), loadList(true)]);
+      refreshThread();
       refreshBadge();
     }, 150);
   }
@@ -33,7 +39,8 @@
   onMount(() => {
     (async () => {
       await loadAccounts();
-      await Promise.all([loadFolders(), loadList(true), loadTrusted(), loadShortcuts(), loadBadgeMode()]);
+      await loadPrefs();
+      await Promise.all([loadFolders(), loadList(true), loadTrusted(), loadShortcuts(), loadBadgeMode(), loadOutbox()]);
       refreshBadge();
       if (!ui.accounts.length) openAccountSettings("new");
       notify = (await isPermissionGranted()) || (await requestPermission()) === "granted";
@@ -49,6 +56,11 @@
           body: e.count > 1 ? `${e.from} · ${e.subject}` : e.subject || "(no subject)",
           ...(acc && ui.accounts.length > 1 ? { subtitle: acc.email } : {}),
         } as any);
+      } else if (e.kind === "outbox") {
+        loadOutbox();
+      } else if (e.kind === "sendFailed") {
+        toast(`Couldn't send “${e.subject || "(no subject)"}”. It's in Scheduled and will be retried.`, { ms: 6000 });
+        if (notify) sendNotification({ title: "Message not sent", body: `${e.subject || "(no subject)"}: ${e.message}` });
       }
     });
     // Bringing the window forward counts as looking at your mail: clear "new" from the badge.
@@ -78,6 +90,11 @@
     junk: toggleJunk,
     toggleUnread: toggleSeen,
     toggleFlag: toggleFlag,
+    move: moveSelected,
+    snooze: () => (selectedRows().every((r) => roleOf(r) === "snoozed") && selectedRows().length ? unsnoozeSelected() : snoozeSelected()),
+    selectAll,
+    extendDown: () => extendSelection(1),
+    extendUp: () => extendSelection(-1),
     search: () => list?.focusSearch(),
     sync: () => api.syncNow(),
     settings: () => openSettings(),
@@ -88,9 +105,14 @@
     if (keymap.recording) return;
     const combo = comboOf(e);
     if (!combo) return;
+    // Composer, pickers and the settings popups handle their own keys.
+    if (ui.compose || ui.settings || ui.accountSettings || ui.picker) return;
+    if (combo === "escape" && !typing(e) && clearSelection()) {
+      e.preventDefault();
+      return;
+    }
     const action = match(combo);
-    // Composer and the settings popups handle their own keys.
-    if (!action || action === "send" || ui.compose || ui.settings || ui.accountSettings) return;
+    if (!action || action === "send") return;
     if (typing(e) && !(canFireWhileTyping(action) && usesModifier(combo))) return;
     e.preventDefault();
     run[action]();
@@ -119,8 +141,28 @@
   <AccountSettings />
 {/if}
 
+{#if ui.picker?.kind === "snooze"}
+  <WhenPicker
+    title="Snooze until"
+    action="Snooze"
+    presets={snoozePresets()}
+    onpick={(at) => ui.picker?.kind === "snooze" && snoozeRows(ui.picker.rows, at)}
+    onclose={() => (ui.picker = null)} />
+{:else if ui.picker?.kind === "move"}
+  <MovePicker
+    accountId={ui.picker.accountId}
+    exclude={[...new Set(ui.picker.rows.map((r) => r.folderId))]}
+    onpick={(f) => ui.picker?.kind === "move" && moveRows(ui.picker.rows, f)}
+    onclose={() => (ui.picker = null)} />
+{/if}
+
 {#if ui.toast}
-  <div class="toast" role="status">{ui.toast.text}</div>
+  <div class="toast" role="status">
+    <span>{ui.toast.text}</span>
+    {#if ui.toast.undo}
+      <button class="undo" onclick={undoToast}>Undo</button>
+    {/if}
+  </div>
 {/if}
 
 <style>
@@ -149,6 +191,17 @@
     animation: rise 0.16s ease-out;
     -webkit-user-select: text;
     user-select: text;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+  .undo {
+    border: 0;
+    padding: 0;
+    background: none;
+    color: #8fb4ff;
+    font: inherit;
+    font-weight: 600;
   }
   @media (prefers-color-scheme: dark) {
     .toast { background: #3a3936; }

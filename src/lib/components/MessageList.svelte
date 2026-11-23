@@ -1,15 +1,17 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import Icon from "./Icon.svelte";
-  import { ui, openMessage, loadMore, viewTitle, setQuery, openAccountSettings } from "../state.svelte";
+  import { ui, openMessage, loadMore, viewTitle, setQuery, openAccountSettings, clickRow, isSelected, roleOf, editDraft, accountById } from "../state.svelte";
   import { hint } from "../shortcuts.svelte";
   import { messageMenu } from "../menus";
   import { shortDate, displayName } from "../format";
+  import { whenLabel } from "../when";
+  import { api } from "../api";
 
   const ROW = 76;
   const OVERSCAN = 8;
 
-  let scroller: HTMLDivElement;
+  let scroller = $state<HTMLDivElement>();
   let scrollTop = $state(0);
   let height = $state(600);
   let searchEl = $state<HTMLInputElement>();
@@ -22,6 +24,7 @@
   const visible = $derived(ui.list.slice(start, end));
 
   async function onScroll() {
+    if (!scroller) return;
     scrollTop = scroller.scrollTop;
     if (!loadingMore && scrollTop + height > ui.list.length * ROW - ROW * 20) {
       loadingMore = true;
@@ -45,6 +48,17 @@
       else if (top + ROW > scroller.scrollTop + height) scroller.scrollTop = top + ROW - height;
     });
   });
+
+  /** Double-click a draft to keep writing it. */
+  async function onDouble(id: number) {
+    const row = ui.list.find((m) => m.id === id);
+    if (roleOf(row) !== "drafts") return;
+    try {
+      editDraft(ui.detail?.id === id ? ui.detail : await api.message(id));
+    } catch {}
+  }
+
+  const outboxTo = (to: string[]) => to.map((t) => t.replace(/\s*<.*>$/, "").replace(/^"|"$/g, "")).join(", ") || "(no recipients)";
 
   // Reset scroll when the view changes.
   $effect(() => {
@@ -97,8 +111,27 @@
     {/if}
   </header>
 
+  {#if ui.view.kind === "outbox"}
+    <div class="scroll body">
+      {#each ui.outbox as o (o.id)}
+        <button class="row out" class:selected={o.id === ui.outboxSelected} onclick={() => (ui.outboxSelected = o.id)}>
+          <span class="mark">{#if o.error}<span class="err-dot" title={o.error}></span>{/if}</span>
+          <span class="main">
+            <span class="line1">
+              <span class="from">To: {outboxTo(o.message.to.concat(o.message.cc))}</span>
+              <span class="date" class:late={!!o.error}><Icon name="clock" size={11} stroke={2} /> {whenLabel(new Date(o.sendAt * 1000))}</span>
+            </span>
+            <span class="subject">{o.message.subject || "(no subject)"}</span>
+            <span class="snippet"><span class="snip">{o.error ? `Not sent: ${o.error}` : (accountById(o.accountId)?.email ?? "")}</span></span>
+          </span>
+        </button>
+      {:else}
+        <div class="empty"><Icon name="check" size={22} /></div>
+      {/each}
+    </div>
+  {:else}
   <div class="scroll body" bind:this={scroller} bind:clientHeight={height} onscroll={onScroll}>
-    {#if ui.listReady && !ui.list.length}
+    {#if ui.listReady && !ui.list.length && !ui.searchingServer}
       <div class="empty">
         {#if ui.query}
           No results
@@ -109,27 +142,39 @@
         {/if}
       </div>
     {/if}
-    <div style:height="{ui.list.length * ROW + (ui.loadingOlder ? 56 : 0)}px" style:position="relative">
+    <div style:height="{ui.list.length * ROW + (ui.loadingOlder || ui.searchingServer ? 56 : 0)}px" style:position="relative">
       {#if ui.loadingOlder}
         <div class="older" style:top="{ui.list.length * ROW}px"><span class="spinner"></span></div>
+      {:else if ui.searchingServer}
+        <div class="older" style:top="{ui.list.length * ROW}px"><span class="spinner"></span><span class="searching">Searching servers…</span></div>
       {/if}
       {#each visible as m, i (m.id)}
         <button
           class="row"
           class:unread={!m.seen}
-          class:selected={m.id === ui.selectedId}
+          class:selected={isSelected(m.id)}
+          class:multi={ui.selectedIds.length > 1}
           style:transform="translateY({(start + i) * ROW}px)"
-          onclick={() => openMessage(m.id)}
+          onclick={(e) => clickRow(m, e)}
+          ondblclick={() => onDouble(m.id)}
           oncontextmenu={(e) => { e.preventDefault(); messageMenu(m); }}>
           <span class="mark">
             {#if !m.seen}<span class="unread-dot"></span>{/if}
           </span>
           <span class="main">
             <span class="line1">
-              <span class="from">{displayName(m.fromName, m.fromAddr) || "(no sender)"}</span>
+              <span class="from">
+                {#if roleOf(m) === "drafts"}<span class="draft">Draft</span>{/if}
+                {displayName(m.fromName, m.fromAddr) || "(no sender)"}
+              </span>
+              {#if m.count > 1}<span class="count">{m.count}</span>{/if}
               {#if m.flagged}<span class="flag"><Icon name="flag" size={12} stroke={2} /></span>{/if}
               {#if m.hasAttachments}<span class="clip"><Icon name="clip" size={12} stroke={2} /></span>{/if}
-              <span class="date">{shortDate(m.date)}</span>
+              {#if m.snoozedUntil}
+                <span class="date snoozed" title="Comes back {whenLabel(new Date(m.snoozedUntil * 1000))}"><Icon name="clock" size={11} stroke={2} /> {whenLabel(new Date(m.snoozedUntil * 1000))}</span>
+              {:else}
+                <span class="date">{shortDate(m.date)}</span>
+              {/if}
             </span>
             <span class="subject">{m.subject || "(no subject)"}</span>
             <span class="snippet">
@@ -140,6 +185,7 @@
       {/each}
     </div>
   </div>
+  {/if}
 </section>
 
 <style>
@@ -209,6 +255,27 @@
   }
   .row:hover { background: var(--hover); }
   .row.selected { background: var(--selected); }
+  .row.selected.multi { box-shadow: inset 3px 0 0 var(--accent); }
+  .out { position: relative; width: 100%; }
+  .err-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--danger); }
+  .count {
+    flex: none;
+    min-width: 18px;
+    height: 16px;
+    padding: 0 5px;
+    border-radius: 8px;
+    background: var(--hover);
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 16px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+  }
+  .draft { color: var(--danger); font-weight: 600; margin-right: 4px; }
+  .date.snoozed, .date.late { display: inline-flex; align-items: center; gap: 3px; color: #b8741a; }
+  .date.late { color: var(--danger); }
+  .searching { margin-left: 8px; font-size: 12px; color: var(--muted); }
   .row.selected::after { opacity: 0; }
   .mark { width: 14px; flex: none; display: flex; justify-content: center; padding-top: 6px; }
   .unread-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
@@ -232,7 +299,7 @@
   .unread .subject { color: var(--text); font-weight: 500; }
   .snippet { font-size: 12.5px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
   .snip { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .older { position: absolute; left: 0; right: 0; height: 56px; display: grid; place-items: center; }
+  .older { position: absolute; left: 0; right: 0; height: 56px; display: flex; align-items: center; justify-content: center; }
   .spinner {
     width: 16px;
     height: 16px;

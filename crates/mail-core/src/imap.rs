@@ -39,6 +39,9 @@ fn role_for(path: &str, attrs: &str) -> Option<&'static str> {
     if p == "inbox" {
         return Some("inbox");
     }
+    if leaf == "snoozed" {
+        return Some("snoozed");
+    }
     let checks: [(&str, &[&str], &'static str); 6] = [
         ("sent", &["sent", "sent items", "sent mail", "sent messages"], "sent"),
         ("drafts", &["drafts", "draft"], "drafts"),
@@ -86,6 +89,23 @@ pub fn flags_of(f: &Fetch) -> (bool, bool) {
     (seen, flagged)
 }
 
+/// An IMAP quoted string. Non-ASCII text needs CHARSET UTF-8 on the command (see `search_criteria`).
+pub fn quote(s: &str) -> String {
+    let clean: String = s.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+    format!("\"{}\"", clean.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// SEARCH criteria matching every term anywhere in a message (headers or body).
+pub fn search_criteria(terms: &[String]) -> String {
+    let parts: Vec<String> = terms.iter().map(|t| format!("TEXT {}", quote(t))).collect();
+    let q = parts.join(" ");
+    if terms.iter().any(|t| !t.is_ascii()) {
+        format!("CHARSET UTF-8 {q}")
+    } else {
+        q
+    }
+}
+
 /// Compresses a sorted uid list into an IMAP sequence set ("1:5,9,12:14").
 pub fn uid_set(uids: &[u32]) -> String {
     let mut v = uids.to_vec();
@@ -104,4 +124,22 @@ pub fn uid_set(uids: &[u32]) -> String {
         i += 1;
     }
     parts.join(",")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quoting_and_criteria() {
+        assert_eq!(quote(r#"a"b\c"#), r#""a\"b\\c""#);
+        assert_eq!(search_criteria(&["invoice".into(), "acme".into()]), r#"TEXT "invoice" TEXT "acme""#);
+        assert_eq!(search_criteria(&["café".into()]), r#"CHARSET UTF-8 TEXT "café""#);
+    }
+
+    #[test]
+    fn snoozed_folder_role() {
+        assert_eq!(role_for("Snoozed", ""), Some("snoozed"));
+        assert_eq!(role_for("INBOX.Snoozed", ""), Some("snoozed"));
+    }
 }
