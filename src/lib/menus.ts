@@ -143,8 +143,8 @@ export function addressMenu(e: MouseEvent, a: Addr, d?: Detail, sender = false) 
  * WebKit's own menu (Reload, Inspect…) makes no sense in an app. Keep it only where it
  * helps: text fields (paste, spelling) and selected text (copy, look up).
  */
-export function allowNativeMenu(e: MouseEvent, doc: Document = document): boolean {
+export function allowNativeMenu(e: MouseEvent): boolean {
   const t = e.target as HTMLElement | null;
   if (t && (t.isContentEditable || ["INPUT", "TEXTAREA"].includes(t.tagName))) return true;
-  return !!doc.getSelection()?.toString().trim();
+  return !!document.getSelection()?.toString().trim();
 }

@@ -10,6 +10,8 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
 
 mod agents;
+#[cfg(target_os = "macos")]
+mod context_menu;
 
 type E<'a> = State<'a, Arc<Engine>>;
 type R<T> = Result<T, String>;
@@ -484,6 +486,7 @@ fn is_app_url(app: &tauri::AppHandle, url: &tauri::Url) -> bool {
 
 /// Links in a message would otherwise load inside its sandboxed frame (blank, since most sites
 /// refuse to be framed). Any navigation away from the app is cancelled and opened in the browser.
+/// On macOS it also trims WebKit's right-click menu in each webview (see `context_menu`).
 fn external_links() -> tauri::plugin::TauriPlugin<tauri::Wry> {
     tauri::plugin::Builder::new("external-links")
         .on_navigation(|webview, url| {
@@ -495,6 +498,12 @@ fn external_links() -> tauri::plugin::TauriPlugin<tauri::Wry> {
                 let _ = app.opener().open_url(url.as_str(), None::<&str>);
             }
             false
+        })
+        .on_webview_ready(|webview| {
+            #[cfg(target_os = "macos")]
+            let _ = webview.with_webview(|w| context_menu::install(w.inner()));
+            #[cfg(not(target_os = "macos"))]
+            let _ = webview;
         })
         .build()
 }

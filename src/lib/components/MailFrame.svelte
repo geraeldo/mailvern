@@ -1,7 +1,5 @@
 <script lang="ts">
-  import { api } from "../api";
   import { frameDoc } from "../html";
-  import { allowNativeMenu } from "../menus";
 
   let { html, allowRemote }: { html: string; allowRemote: boolean } = $props();
   let frame: HTMLIFrameElement;
@@ -19,17 +17,8 @@
     ro?.disconnect();
     ro = new ResizeObserver(fit);
     ro.observe(d.body);
-    d.querySelectorAll("img").forEach((img) => img.addEventListener("load", fit));
-    d.addEventListener("contextmenu", (e) => {
-      if (!allowNativeMenu(e, d)) e.preventDefault();
-    });
-    d.addEventListener("click", (e) => {
-      const a = (e.target as Element).closest?.("a");
-      if (!a) return;
-      e.preventDefault();
-      const href = a.getAttribute("href") || "";
-      if (/^(https?:|mailto:)/i.test(href)) api.openUrl(href);
-    });
+    // No listeners go on `d`: WebKit runs none in a frame sandboxed without scripts. Links reach
+    // the browser through the app's navigation hook, and the native menu is trimmed natively.
   }
 
   $effect(() => () => ro?.disconnect());
