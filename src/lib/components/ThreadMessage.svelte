@@ -93,7 +93,7 @@
       <div class="own">
         {#if isDraft}
           <button class="btn small" disabled={!d} onclick={() => d && editDraft(d)}><Icon name="pencil" size={13} /> Edit</button>
-        {:else}
+        {:else if ui.thread.length > 1}
           <button class="icon-btn small" title="Reply" disabled={!d} onclick={() => compose("reply", { source: d })}><Icon name="reply" size={15} /></button>
           <button class="icon-btn small" title="Reply all" disabled={!d} onclick={() => compose("replyAll", { source: d })}><Icon name="replyAll" size={15} /></button>
           <button class="icon-btn small" title="Forward" disabled={!d} onclick={() => compose("forward", { source: d })}><Icon name="forward" size={15} /></button>
