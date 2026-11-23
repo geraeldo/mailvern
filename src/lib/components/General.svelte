@@ -1,6 +1,6 @@
 <script lang="ts">
   import { BADGE_MODES, badge, setBadgeMode } from "../badge.svelte";
-  import { ui, setUndoSend, setThreaded } from "../state.svelte";
+  import { ui, setUndoSend, setThreaded, setSenderIcons } from "../state.svelte";
   import Select from "./Select.svelte";
 
   const UNDO = [0, 5, 10, 20, 30];
@@ -13,6 +13,13 @@
     <span class="text">
       <span class="label">Group into conversations</span>
       <span class="detail">Show a message and its replies as one row, and read them together.</span>
+    </span>
+  </label>
+  <label class="row">
+    <input type="checkbox" checked={ui.senderIcons} onchange={(e) => setSenderIcons(e.currentTarget.checked)} />
+    <span class="text">
+      <span class="label">Show sender logos</span>
+      <span class="detail">Get a company's logo or site icon from its own website. Personal addresses like Gmail keep their initials.</span>
     </span>
   </label>
   <div class="row">

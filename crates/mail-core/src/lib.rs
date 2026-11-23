@@ -1,6 +1,7 @@
 mod db;
 mod engine;
 mod extract;
+pub mod icons;
 mod imap;
 pub mod model;
 mod parse;

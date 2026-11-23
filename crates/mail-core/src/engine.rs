@@ -1,6 +1,7 @@
 use crate::db::{Db, DueSnooze, OutboxRow};
 use crate::model::*;
 use crate::worker::{idle_loop, Cmd, Target, Worker};
+use crate::icons::{self, Icon, Outcome};
 use crate::{imap, parse, secrets, smtp};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -16,6 +17,8 @@ const BADGE_SEEN: &str = "badge_seen_id";
 /// Seconds a sent message waits in the outbox so it can be undone ("0" sends at once).
 const UNDO_SEND: &str = "undo_send";
 const UNDO_SEND_DEFAULT: i64 = 10;
+/// "off" stops Mailvern from looking up sender pictures.
+const SENDER_ICONS: &str = "sender_icons";
 
 type Workers = Arc<Mutex<HashMap<i64, Handle>>>;
 
@@ -47,6 +50,8 @@ pub struct Engine {
     workers: Workers,
     /// Wakes the scheduler when the outbox or snoozes change.
     wake: Arc<Notify>,
+    /// Fetches sender pictures; made on first use (None if the system DNS setup can't be read).
+    icons: std::sync::OnceLock<Option<Arc<icons::Fetcher>>>,
 }
 
 impl Engine {
@@ -57,6 +62,7 @@ impl Engine {
             events,
             workers: Arc::new(Mutex::new(HashMap::new())),
             wake: Arc::new(Notify::new()),
+            icons: std::sync::OnceLock::new(),
         })
     }
 
@@ -735,6 +741,51 @@ impl Engine {
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         self.db.set_setting(key, value)
+    }
+
+    // ---------- sender pictures ----------
+
+    /// The picture for a sender: their domain's BIMI logo or website icon. None for
+    /// personal mail providers, domains without one, and when the setting is off.
+    ///
+    /// Served from the database; a domain is looked up on first sight and again once its
+    /// entry is due. A known picture comes back at once and is refreshed in the background.
+    pub async fn sender_icon(&self, addr: &str) -> Result<Option<Icon>> {
+        let Some(domain) = icons::icon_domain(addr) else { return Ok(None) };
+        if self.db.setting(SENDER_ICONS)?.as_deref() == Some("off") {
+            return Ok(None);
+        }
+        let cached = self.db.sender_icon(&domain)?;
+        if let Some((icon, retry_at)) = &cached {
+            if *retry_at > now() {
+                return Ok(icon.clone());
+            }
+        }
+        let Some(fetcher) = self.icons.get_or_init(|| icons::Fetcher::new().ok().map(Arc::new)).clone() else {
+            return Ok(cached.and_then(|c| c.0));
+        };
+        let old = cached.and_then(|c| c.0);
+        // Hold back a second lookup of the same domain while this one runs.
+        self.db.set_sender_icon(&domain, old.as_ref(), now() + 60)?;
+        let db = self.db.clone();
+        let lookup = {
+            let old = old.clone();
+            async move {
+                let (icon, wait) = match fetcher.fetch(&domain).await {
+                    Outcome::Found(icon) => (Some(icon), 30 * 86_400),
+                    Outcome::Missing => (None, 14 * 86_400),
+                    Outcome::Failed => (old, 6 * 3_600),
+                };
+                let _ = db.set_sender_icon(&domain, icon.as_ref(), now() + wait);
+                icon
+            }
+        };
+        if old.is_some() {
+            tokio::spawn(lookup);
+            Ok(old)
+        } else {
+            Ok(lookup.await)
+        }
     }
 }
 

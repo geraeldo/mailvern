@@ -21,6 +21,13 @@ const people = [
   ["Priya Nair", "priya@acme.co"], ["Tom Okafor", "tom@okafor.dev"], ["Linear", "notifications@linear.app"],
   ["Sofia Rossi", "sofia@rossi.it"], ["GitHub", "noreply@github.com"], ["Daniel Kim", "dan@kim.vc"],
 ];
+/** Stand-in sender pictures: a BIMI-style logo (fills the avatar) and website icons (on a plate). */
+const senderIcons: Record<string, { svg: string; logo: boolean }> = {
+  "linear.app": { logo: true, svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" fill="#5E6AD2"/><path d="M18 40 40 18M22 46 46 22M30 48 48 30" stroke="#fff" stroke-width="5" stroke-linecap="round"/></svg>` },
+  "stripe.com": { logo: false, svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect x="2" y="2" width="28" height="28" rx="7" fill="#635BFF"/><circle cx="16" cy="16" r="6" fill="#fff"/></svg>` },
+  "github.com": { logo: false, svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><circle cx="16" cy="16" r="14" fill="#1f2328"/><path d="M10 20c3 3 9 3 12 0" stroke="#fff" stroke-width="2.5" fill="none" stroke-linecap="round"/></svg>` },
+};
+
 const subjects = [
   ["Q4 planning — draft agenda", "Sharing the agenda for Thursday. Main topics are hiring, roadmap and the offsite."],
   ["Invoice #2041 for November", "Your invoice is attached. Payment is due within 14 days of receipt."],
@@ -323,6 +330,11 @@ export function installMock() {
         refreshCounts();
         return null;
       case "contacts": return people.filter((p) => (p[0] + p[1]).toLowerCase().includes(args.query.toLowerCase())).slice(0, 6).map(([name, email]) => ({ name, email }));
+      case "sender_icon": {
+        if (settings.sender_icons === "off") return null;
+        const icon = senderIcons[args.email.split("@").pop()];
+        return icon ? { url: `data:image/svg+xml,${encodeURIComponent(icon.svg)}`, logo: icon.logo } : null;
+      }
       case "get_setting": return settings[args.key] ?? null;
       case "set_setting": settings[args.key] = args.value; return null;
       case "save_account": {

@@ -75,6 +75,9 @@ export type SearchScope =
 
 export type FileInfo = { path: string; name: string; size: number };
 
+/** A sender picture as a data: URL. `logo` (BIMI) fills the avatar; website icons sit on a plate. */
+export type SenderIcon = { url: string; logo: boolean };
+
 /** A structured search (AI tools). Every field that is set must match. */
 export type MailQuery = {
   /** Words anywhere in subject, sender or body. */
@@ -188,6 +191,8 @@ export const api = {
   fileInfo: (paths: string[]) => invoke<FileInfo[]>("file_info", { paths }),
   attachmentFiles: (id: number) => invoke<FileInfo[]>("attachment_files", { id }),
   contacts: (query: string) => invoke<Addr[]>("contacts", { query }),
+  /** The sender's domain logo or website icon, null to show initials. */
+  senderIcon: (email: string) => invoke<SenderIcon | null>("sender_icon", { email }),
   openUrl: (url: string) => invoke<void>("open_url", { url }),
   readImage: (path: string) => invoke<string>("read_image", { path }),
   agentAccess: () => invoke<AgentAccess>("agent_access"),

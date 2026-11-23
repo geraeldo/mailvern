@@ -88,6 +88,8 @@ export const ui = $state({
   threaded: true,
   /** Seconds a sent message can be taken back. */
   undoSend: 10,
+  /** Show sender logos and website icons, looked up from the sender's own domain. */
+  senderIcons: true,
 });
 
 export function openSettings(section: SettingsSection = "general") {
@@ -197,10 +199,20 @@ export async function loadAccounts() {
 }
 
 export async function loadPrefs() {
-  const [undo, threads] = await Promise.all([api.getSetting("undo_send"), api.getSetting("threads")]);
+  const [undo, threads, icons] = await Promise.all([
+    api.getSetting("undo_send"),
+    api.getSetting("threads"),
+    api.getSetting("sender_icons"),
+  ]);
   const n = Number(undo);
   if (undo != null && Number.isFinite(n)) ui.undoSend = n;
   ui.threaded = threads !== "off";
+  ui.senderIcons = icons !== "off";
+}
+
+export async function setSenderIcons(on: boolean) {
+  ui.senderIcons = on;
+  await api.setSetting("sender_icons", on ? "on" : "off");
 }
 
 export async function setUndoSend(seconds: number) {

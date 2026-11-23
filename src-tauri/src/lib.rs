@@ -380,6 +380,24 @@ fn read_image(path: String) -> R<String> {
     Ok(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)))
 }
 
+#[derive(serde::Serialize)]
+struct SenderIcon {
+    /// A data: URL.
+    url: String,
+    /// A BIMI logo, made to fill the avatar. Otherwise a website icon.
+    logo: bool,
+}
+
+/// The sender's domain logo or website icon, None to show initials.
+#[tauri::command]
+async fn sender_icon(engine: E<'_>, email: String) -> R<Option<SenderIcon>> {
+    use base64::Engine as _;
+    Ok(engine.sender_icon(&email).await.map_err(err)?.map(|i| SenderIcon {
+        url: format!("data:{};base64,{}", i.mime, base64::engine::general_purpose::STANDARD.encode(&i.data)),
+        logo: i.logo,
+    }))
+}
+
 #[tauri::command]
 fn contacts(engine: E, query: String) -> R<Vec<mail_core::model::Addr>> {
     engine.contacts(&query).map_err(err)
@@ -515,6 +533,7 @@ pub fn run() {
             file_info,
             attachment_files,
             contacts,
+            sender_icon,
             read_image,
             open_url,
             agents::agent_access,

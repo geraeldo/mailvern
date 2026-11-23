@@ -1,3 +1,4 @@
+use crate::icons::Icon;
 use crate::model::*;
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -36,6 +37,21 @@ pub struct BodyInfo {
 
 /// Per-connection settings. Not part of the schema; applied on every open.
 const PRAGMAS: &str = "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;";
+
+/// Caches that can be rebuilt from the network at any time, so they stay out of the
+/// versioned schema: created on open, and dropping one only costs a refetch.
+///
+/// `sender_icons`: one row per sender domain. `mime` is NULL when the domain has no
+/// picture. `retry_at` is when to look again.
+const CACHES: &str = r#"
+CREATE TABLE IF NOT EXISTS sender_icons (
+  domain TEXT PRIMARY KEY,
+  mime TEXT,
+  data BLOB,
+  logo INTEGER NOT NULL DEFAULT 0,
+  retry_at INTEGER NOT NULL
+);
+"#;
 
 /// Schema history. `PRAGMA user_version` records how many of these have run.
 ///
@@ -434,6 +450,7 @@ impl Db {
         let mut conn = Connection::open(path)?;
         conn.execute_batch(PRAGMAS)?;
         migrate(&mut conn, path)?;
+        conn.execute_batch(CACHES)?;
         let db = Db { conn: Mutex::new(conn) };
         db.assign_threads()?;
         Ok(db)
@@ -1350,6 +1367,32 @@ impl Db {
         c.execute(
             "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, value],
+        )?;
+        Ok(())
+    }
+
+    // ---------- sender pictures ----------
+
+    /// The cached picture for a domain (None inside when it has none) and when to look again.
+    pub fn sender_icon(&self, domain: &str) -> Result<Option<(Option<Icon>, i64)>> {
+        let c = self.c();
+        Ok(c.query_row("SELECT mime, data, logo, retry_at FROM sender_icons WHERE domain = ?", [domain], |r| {
+            let mime: Option<String> = r.get(0)?;
+            let icon = match mime {
+                Some(mime) => Some(Icon { mime, data: r.get(1)?, logo: r.get(2)? }),
+                None => None,
+            };
+            Ok((icon, r.get(3)?))
+        })
+        .optional()?)
+    }
+
+    pub fn set_sender_icon(&self, domain: &str, icon: Option<&Icon>, retry_at: i64) -> Result<()> {
+        let c = self.c();
+        c.execute(
+            "INSERT INTO sender_icons (domain, mime, data, logo, retry_at) VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(domain) DO UPDATE SET mime = excluded.mime, data = excluded.data, logo = excluded.logo, retry_at = excluded.retry_at",
+            params![domain, icon.map(|i| &i.mime), icon.map(|i| &i.data), icon.is_some_and(|i| i.logo), retry_at],
         )?;
         Ok(())
     }

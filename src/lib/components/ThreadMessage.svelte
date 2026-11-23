@@ -4,7 +4,8 @@
   import MailFrame from "./MailFrame.svelte";
   import { ui, compose, accountById, accountLabel, trustSender, toast, roleOf, editDraft } from "../state.svelte";
   import { api, type Addr, type Summary } from "../api";
-  import { longDate, shortDate, displayName, initials, colorFor, fileSize } from "../format";
+  import { longDate, shortDate, displayName, fileSize } from "../format";
+  import Avatar from "./Avatar.svelte";
   import { hasRemoteContent, textToHtml } from "../html";
 
   let { m, expanded, focus = false }: { m: Summary; expanded: boolean; focus?: boolean } = $props();
@@ -61,7 +62,7 @@
 <div class="msg" class:open bind:this={el}>
   {#if !open}
     <button class="collapsed" onclick={() => (open = true)}>
-      <span class="avatar small" style:background={colorFor(m.fromAddr)}>{initials(m.fromName, m.fromAddr)}</span>
+      <Avatar name={m.fromName} email={m.fromAddr} size={26} lookup={roleOf(m) !== "junk"} />
       <span class="cname" class:unread={!m.seen}>
         {#if isDraft}<span class="draft">Draft</span>{/if}
         {displayName(m.fromName, m.fromAddr)}
@@ -71,7 +72,7 @@
     </button>
   {:else}
     <div class="meta">
-      <button class="avatar" style:background={colorFor(m.fromAddr)} onclick={() => (open = false)} title="Collapse">{initials(m.fromName, m.fromAddr)}</button>
+      <button class="avatar" onclick={() => (open = false)} title="Collapse"><Avatar name={m.fromName} email={m.fromAddr} size={38} lookup={roleOf(m) !== "junk"} /></button>
       <div class="who">
         <div class="line">
           {#if isDraft}<span class="draft">Draft</span>{/if}
@@ -162,21 +163,7 @@
   .cdate { flex: none; color: var(--muted); font-size: 12px; }
   .draft { color: var(--danger); font-weight: 600; margin-right: 4px; }
   .meta { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 18px; }
-  .avatar {
-    width: 38px;
-    height: 38px;
-    flex: none;
-    border: 0;
-    padding: 0;
-    border-radius: 50%;
-    display: grid;
-    place-items: center;
-    color: #fff;
-    font-size: 13.5px;
-    font-weight: 600;
-    letter-spacing: 0.02em;
-  }
-  .avatar.small { width: 26px; height: 26px; font-size: 10.5px; }
+  .avatar { flex: none; border: 0; padding: 0; background: none; border-radius: 50%; display: grid; }
   .who { flex: 1; min-width: 80px; -webkit-user-select: text; user-select: text; }
   .line { display: flex; align-items: baseline; gap: 8px; min-width: 0; overflow: hidden; }
   .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: none; max-width: 100%; }

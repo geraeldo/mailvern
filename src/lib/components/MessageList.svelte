@@ -1,12 +1,14 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import Icon from "./Icon.svelte";
+  import Avatar from "./Avatar.svelte";
   import { ui, openMessage, loadMore, viewTitle, setQuery, openAccountSettings, openSettings, clickRow, isSelected, roleOf, editDraft, accountById,
     beginSearch, searchScopes, scopeKey, scopeLabel, setSearchScope, setView } from "../state.svelte";
   import { hint } from "../shortcuts.svelte";
   import { messageMenu } from "../menus";
   import { shortDate, displayName } from "../format";
   import { whenLabel } from "../when";
+  import { addrOf } from "../avatars.svelte";
   import { api } from "../api";
   import { ai, searchReady } from "../ai/config.svelte";
   import { runAiSearch, stopAiSearch } from "../ai/search.svelte";
@@ -180,6 +182,7 @@
       {#each ui.outbox as o (o.id)}
         <button class="row out" class:selected={o.id === ui.outboxSelected} onclick={() => (ui.outboxSelected = o.id)}>
           <span class="mark">{#if o.error}<span class="err-dot" title={o.error}></span>{/if}</span>
+          <span class="pic"><Avatar name={outboxTo(o.message.to.slice(0, 1))} email={addrOf(o.message.to[0] ?? o.message.cc[0] ?? "")} size={34} /></span>
           <span class="main">
             <span class="line1">
               <span class="from">To: {outboxTo(o.message.to.concat(o.message.cc))}</span>
@@ -227,6 +230,7 @@
           <span class="mark" class:num={ui.ai && numbered}>
             {#if ui.ai && numbered}<span class="n">{start + i + 1}</span>{:else if !m.seen}<span class="unread-dot"></span>{/if}
           </span>
+          <span class="pic"><Avatar name={m.fromName} email={m.fromAddr} size={34} lookup={roleOf(m) !== "junk"} /></span>
           <span class="main">
             <span class="line1">
               <span class="from">
@@ -417,6 +421,7 @@
   }
   .sources-head :global(svg) { color: var(--accent); }
   .spinner.small { width: 11px; height: 11px; border-width: 1.5px; }
+  .pic { flex: none; padding-top: 1px; margin-right: 10px; }
   .main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
   .line1 { display: flex; align-items: center; gap: 6px; }
   .from {
