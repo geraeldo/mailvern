@@ -625,6 +625,12 @@ pub fn run() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
                     api.prevent_close();
+                    // On macOS hide the app rather than the window: ⌘Tab only activates
+                    // an app, it doesn't send Reopen, so a hidden window would stay gone.
+                    // A hidden app comes back on ⌘Tab and Dock clicks alike.
+                    #[cfg(target_os = "macos")]
+                    let _ = window.app_handle().hide();
+                    #[cfg(not(target_os = "macos"))]
                     let _ = window.hide();
                 }
             }
