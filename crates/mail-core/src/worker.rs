@@ -53,7 +53,7 @@ pub enum Cmd {
     Unsnooze { message_id: String, to_path: String, reply: oneshot::Sender<Result<bool>> },
     /// Searches the server, in `folders` or wherever the mail could be.
     /// Replies with the local ids of the hits (stored if they weren't).
-    Search { terms: Vec<String>, folders: Option<Vec<i64>>, reply: oneshot::Sender<Result<Vec<i64>>> },
+    Search { criteria: String, folders: Option<Vec<i64>>, reply: oneshot::Sender<Result<Vec<i64>>> },
 }
 
 impl Cmd {
@@ -179,10 +179,10 @@ impl Worker {
                 let _ = reply.send(res);
                 return;
             }
-            Cmd::Search { terms, folders, reply } => {
+            Cmd::Search { criteria, folders, reply } => {
                 let res = self
                     .retry(false, |w| {
-                        let (t, f) = (terms.clone(), folders.clone());
+                        let (t, f) = (criteria.clone(), folders.clone());
                         Box::pin(async move { w.search(&t, f.as_deref()).await })
                     })
                     .await;
@@ -429,7 +429,7 @@ impl Worker {
 
     /// Searches `only`, or else every folder that could hold the mail (just All Mail where
     /// there is one), newest hits first, storing the ones not cached yet.
-    async fn search(&mut self, terms: &[String], only: Option<&[i64]>) -> Result<Vec<i64>> {
+    async fn search(&mut self, criteria: &str, only: Option<&[i64]>) -> Result<Vec<i64>> {
         let folders = self.db.account_folders(self.account.id)?;
         let all_mail: Vec<_> = folders.iter().filter(|f| f.2.as_deref() == Some("all")).cloned().collect();
         let targets: Vec<_> = if let Some(only) = only {
@@ -439,12 +439,11 @@ impl Worker {
         } else {
             all_mail
         };
-        let criteria = imap::search_criteria(terms);
         let mut ids = Vec::new();
         for (folder_id, path, _) in targets {
             self.select(&path).await?;
             let s = self.ensure().await?;
-            let mut uids: Vec<u32> = s.uid_search(&criteria).await?.into_iter().collect();
+            let mut uids: Vec<u32> = s.uid_search(criteria).await?.into_iter().collect();
             uids.sort_unstable_by(|a, b| b.cmp(a));
             uids.truncate(SEARCH_HITS);
             let missing = self.db.missing_uids(folder_id, &uids)?;

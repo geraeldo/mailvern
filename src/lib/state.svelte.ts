@@ -9,8 +9,21 @@ export type ComposeMode = "new" | "reply" | "replyAll" | "forward" | "draft";
 /** A message to reopen in the composer: a saved draft, or one taken back out of the outbox. */
 export type Restore = { message: Outgoing; attachments: FileInfo[]; unsaved?: boolean };
 export type ComposeInit = { mode: ComposeMode; source?: Detail; accountId?: number; to?: string[]; restore?: Restore; key: number };
-export type SettingsSection = "general" | "shortcuts";
+export type SettingsSection = "general" | "ai" | "shortcuts";
 export type SyncStatus = { state: "syncing" | "idle" | "error"; message: string | null };
+/** One thing AI search did, shown while it works. */
+export type AiStep = { kind: "search" | "read" | "attachment" | "count" | "thread" | "folders" | "note"; text: string; done: boolean; error?: boolean };
+/** An AI search: the question, what it did, its answer and the messages it picked. */
+export type AiSearch = {
+  question: string;
+  running: boolean;
+  steps: AiStep[];
+  answer: string;
+  ids: number[];
+  error: string | null;
+  cost: number;
+  model: string;
+};
 export type Picker = { kind: "snooze"; rows: Summary[] } | { kind: "move"; rows: Summary[]; accountId: number };
 
 const PAGE = 200;
@@ -41,6 +54,8 @@ export const ui = $state({
   /** Where the search looks: starts at the open folder. */
   searchScope: { kind: "all" } as SearchScope,
   searchingServer: false,
+  /** AI search results, shown in the list instead of the word search while set. */
+  ai: null as AiSearch | null,
   compose: null as ComposeInit | null,
   /** App settings (shortcuts and, later, other preferences). */
   settings: null as SettingsSection | null,
@@ -245,7 +260,17 @@ export async function loadList(reset = true) {
   const view = ui.view;
   const q = ui.query.trim();
   let rows: Summary[];
-  if (q) {
+  if (ui.ai) {
+    if (!reset) return;
+    // The messages AI search picked, in its order.
+    const ids = ui.ai.ids;
+    rows = ids.length ? await api.summaries(ids) : [];
+    if (my !== listSeq) return;
+    ui.list = rows;
+    ui.hasMore = false;
+    ui.listReady = true;
+    return;
+  } else if (q) {
     if (!reset) return;
     const scope = ui.searchScope;
     rows = await api.search(q, scope);
@@ -316,6 +341,7 @@ export function setView(v: View) {
     return;
   }
   ui.query = "";
+  ui.ai = null;
   ui.list = [];
   ui.listReady = false;
   remote = null;
@@ -324,8 +350,20 @@ export function setView(v: View) {
   loadList(true);
 }
 
+/** Shows an AI search's results (or its progress) in the list. */
+export function showAi(a: AiSearch | null) {
+  ui.ai = a;
+  ui.list = [];
+  remote = null;
+  ui.searchingServer = false;
+  clearTimeout(serverTimer);
+  clearOpen();
+  loadList(true);
+}
+
 let serverTimer: ReturnType<typeof setTimeout> | undefined;
 export function setQuery(q: string) {
+  ui.ai = null;
   ui.query = q;
   ui.list = [];
   remote = null;
@@ -342,7 +380,7 @@ async function searchServer(q: string) {
   if (!ui.accounts.length) return;
   const scope = ui.searchScope;
   const key = scopeKey(scope);
-  const current = () => ui.query.trim() === q && scopeKey(ui.searchScope) === key;
+  const current = () => !ui.ai && ui.query.trim() === q && scopeKey(ui.searchScope) === key;
   ui.searchingServer = true;
   try {
     const rows = await api.searchServer(q, scope);

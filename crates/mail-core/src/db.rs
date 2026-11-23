@@ -307,6 +307,93 @@ fn fts_query(q: &str) -> Option<String> {
     }
 }
 
+/// A LIKE pattern matching `s` anywhere (with `ESCAPE '\'`).
+fn like_any(s: &str) -> String {
+    format!("%{}%", s.trim().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
+}
+
+/// The WHERE clause (over `messages m`) and its parameters for a structured query.
+fn query_where(q: &MailQuery) -> Result<(String, Vec<rusqlite::types::Value>)> {
+    use rusqlite::types::Value;
+    let mut args: Vec<Value> = Vec::new();
+    let mut arg = |v: Value| {
+        args.push(v);
+        format!("?{}", args.len())
+    };
+    let nonempty = |s: &Option<String>| s.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+
+    // Conditions on words, sender and recipients: a server hit already matched these.
+    let mut words = Vec::new();
+    let mut fts = Vec::new();
+    if let Some(t) = q.text.as_deref().and_then(fts_query) {
+        fts.push(t);
+    }
+    if let Some(t) = q.subject.as_deref().and_then(fts_query) {
+        fts.push(format!("subject : ({t})"));
+    }
+    if !fts.is_empty() {
+        let p = arg(Value::Text(fts.join(" AND ")));
+        words.push(format!("m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH {p})"));
+    }
+    if let Some(f) = nonempty(&q.from) {
+        let p = arg(Value::Text(like_any(&f)));
+        words.push(format!("(m.from_name LIKE {p} ESCAPE '\\' OR m.from_addr LIKE {p} ESCAPE '\\')"));
+    }
+    if let Some(t) = nonempty(&q.to) {
+        let p = arg(Value::Text(like_any(&t)));
+        words.push(format!("(m.to_json LIKE {p} ESCAPE '\\' OR m.cc_json LIKE {p} ESCAPE '\\')"));
+    }
+
+    let mut w = Vec::new();
+    if !words.is_empty() {
+        let all = words.join(" AND ");
+        if q.server_hits.is_empty() {
+            w.push(all);
+        } else {
+            let ids: Vec<String> = q.server_hits.iter().map(|i| i.to_string()).collect();
+            w.push(format!("(({all}) OR m.id IN ({}))", ids.join(",")));
+        }
+    }
+    if let Some(t) = q.after {
+        w.push(format!("m.date >= {}", arg(Value::Integer(t))));
+    }
+    if let Some(t) = q.before {
+        w.push(format!("m.date < {}", arg(Value::Integer(t))));
+    }
+    if let Some(u) = q.unread {
+        w.push(format!("m.seen = {}", if u { 0 } else { 1 }));
+    }
+    if let Some(f) = q.flagged {
+        w.push(format!("m.flagged = {}", f as i32));
+    }
+    if let Some(a) = q.has_attachments {
+        w.push(format!("m.has_attachments = {}", a as i32));
+    }
+    if let Some(a) = q.account_id {
+        w.push(format!("m.account_id = {}", arg(Value::Integer(a))));
+    }
+    if let Some(f) = q.folder_id {
+        w.push(format!("m.folder_id = {}", arg(Value::Integer(f))));
+    }
+    if let Some(role) = nonempty(&q.role) {
+        let role = role.to_ascii_lowercase();
+        if role != "all" && !UNIFIED_ROLES.contains(&role.as_str()) {
+            return Err(anyhow!("Unknown folder role {role:?}: use inbox, sent, drafts, archive, junk, trash, snoozed or all"));
+        }
+        w.push(format!("m.folder_id IN (SELECT id FROM folders WHERE role = {})", arg(Value::Text(role))));
+    }
+    // The same message can sit in several folders (Gmail keeps everything in All Mail too).
+    // Without a folder filter, count it once, preferring a folder other than All Mail.
+    if q.folder_id.is_none() && nonempty(&q.role).is_none() {
+        w.push(
+            "(m.message_id IS NULL OR m.id = (SELECT d.id FROM messages d JOIN folders df ON df.id = d.folder_id
+              WHERE d.account_id = m.account_id AND d.message_id = m.message_id ORDER BY df.role IS 'all', d.id LIMIT 1))"
+                .into(),
+        );
+    }
+    Ok((if w.is_empty() { "1".into() } else { w.join(" AND ") }, args))
+}
+
 #[cfg(test)]
 const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
@@ -909,6 +996,73 @@ impl Db {
         Ok(rows)
     }
 
+    /// Structured search: one page of matches, newest first (or oldest first), and the total.
+    pub fn query_mail(&self, q: &MailQuery) -> Result<MailQueryResult> {
+        let (filter, args) = query_where(q)?;
+        let c = self.c();
+        let total: i64 = c.query_row(
+            &format!("SELECT COUNT(*) FROM messages m WHERE {filter}"),
+            rusqlite::params_from_iter(args.iter()),
+            |r| r.get(0),
+        )?;
+        let limit = q.limit.unwrap_or(25).clamp(1, 200);
+        let offset = q.offset.unwrap_or(0).max(0);
+        let order = if q.oldest_first { "ASC" } else { "DESC" };
+        let sql = format!(
+            "SELECT {SUMMARY_COLS} FROM messages m WHERE {filter} ORDER BY m.date {order}, m.id {order} LIMIT {limit} OFFSET {offset}"
+        );
+        let mut st = c.prepare(&sql)?;
+        let rows = st.query_map(rusqlite::params_from_iter(args.iter()), row_to_summary)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(MailQueryResult { total, rows })
+    }
+
+    /// Counts matches per group, biggest groups first (at most 50), and the total.
+    /// `by`: sender, domain, recipient, month, year, folder or account.
+    pub fn group_mail(&self, q: &MailQuery, by: &str) -> Result<(i64, Vec<MailGroup>)> {
+        let (filter, args) = query_where(q)?;
+        let (from, key, label) = match by {
+            "sender" => ("messages m", "lower(m.from_addr)", "MAX(NULLIF(m.from_name, ''))"),
+            "domain" => ("messages m", "lower(substr(m.from_addr, instr(m.from_addr, '@') + 1))", "NULL"),
+            "recipient" => (
+                "messages m, json_each(m.to_json) j",
+                "lower(json_extract(j.value, '$.email'))",
+                "MAX(json_extract(j.value, '$.name'))",
+            ),
+            "month" => ("messages m", "strftime('%Y-%m', m.date, 'unixepoch', 'localtime')", "NULL"),
+            "year" => ("messages m", "strftime('%Y', m.date, 'unixepoch', 'localtime')", "NULL"),
+            "folder" => (
+                "messages m",
+                "CAST(m.folder_id AS TEXT)",
+                "(SELECT f.name || ' · ' || a.email FROM folders f JOIN accounts a ON a.id = f.account_id WHERE f.id = m.folder_id)",
+            ),
+            "account" => ("messages m", "CAST(m.account_id AS TEXT)", "(SELECT a.email FROM accounts a WHERE a.id = m.account_id)"),
+            _ => return Err(anyhow!("Unknown grouping {by:?}: use sender, domain, recipient, month, year, folder or account")),
+        };
+        let c = self.c();
+        let total: i64 = c.query_row(
+            &format!("SELECT COUNT(*) FROM messages m WHERE {filter}"),
+            rusqlite::params_from_iter(args.iter()),
+            |r| r.get(0),
+        )?;
+        let sql = format!(
+            "SELECT {key} AS k, {label}, COUNT(*), SUM(m.seen = 0), MAX(m.date)
+             FROM {from} WHERE {filter} GROUP BY k ORDER BY COUNT(*) DESC, MAX(m.date) DESC LIMIT 50"
+        );
+        let mut st = c.prepare(&sql)?;
+        let groups = st
+            .query_map(rusqlite::params_from_iter(args.iter()), |r| {
+                Ok(MailGroup {
+                    key: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    label: r.get(1)?,
+                    count: r.get(2)?,
+                    unread: r.get(3)?,
+                    latest: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((total, groups))
+    }
+
     pub fn summary(&self, id: i64) -> Result<(MessageSummary, Vec<Addr>, Vec<Addr>, Vec<Addr>, Option<String>, Option<String>, Option<String>)> {
         let c = self.c();
         let sql = format!(
@@ -1347,6 +1501,69 @@ mod tests {
         assert_eq!(hits(SearchScope::Unified { role: "inbox".into() }), vec![a_inbox, b_inbox]);
         assert_eq!(hits(SearchScope::Folder { folder_id: a_work }), vec![a_work]);
         assert!(db.search("invoice", &SearchScope::Unified { role: "bogus".into() }, 50).is_err());
+    }
+
+    #[test]
+    fn structured_queries_filter_count_and_group() {
+        let db = Db::open(&temp_db()).unwrap();
+        let a = db.save_account(&account()).unwrap();
+        let inbox = db.upsert_folder(a, "INBOX", "Inbox", Some("inbox")).unwrap();
+        let all = db.upsert_folder(a, "[Gmail]/All Mail", "All Mail", Some("all")).unwrap();
+        let sent = db.upsert_folder(a, "Sent", "Sent", Some("sent")).unwrap();
+        let from = |uid, name: &str, addr: &str, subject: &str, date| NewMessage {
+            message_id: Some(format!("<m{uid}>")),
+            from_name: name.into(),
+            from_addr: addr.into(),
+            subject: subject.into(),
+            date,
+            ..msg(uid, uid % 2 == 0)
+        };
+        db.insert_messages(a, inbox, &[
+            from(1, "Tokopedia", "noreply@tokopedia.com", "Invoice INV/2026/11", 100),
+            from(2, "Tokopedia", "noreply@tokopedia.com", "Pesanan dikirim", 200),
+            NewMessage { has_attachments: true, ..from(3, "Budi", "budi@contoh.id", "Notulen rapat", 300) },
+        ]).unwrap();
+        // The same message again in All Mail: counted once.
+        db.insert_messages(a, all, &[from(1, "Tokopedia", "noreply@tokopedia.com", "Invoice INV/2026/11", 100)]).unwrap();
+        db.insert_messages(a, sent, &[NewMessage {
+            to: vec![Addr { name: Some("Budi".into()), email: "budi@contoh.id".into() }],
+            ..from(9, "Me", "me@example.com", "Re: Notulen rapat", 400)
+        }]).unwrap();
+        db.store_body(inbox, 3, b"", &BodyInfo { snippet: "".into(), search_text: "agenda anggaran kuartal".into(), has_attachments: true }).unwrap();
+
+        let q = |q: MailQuery| db.query_mail(&q).unwrap();
+        let subjects = |r: MailQueryResult| r.rows.into_iter().map(|m| m.subject).collect::<Vec<_>>();
+
+        let r = q(MailQuery { from: Some("tokopedia".into()), ..Default::default() });
+        assert_eq!(r.total, 2);
+        assert_eq!(subjects(r), vec!["Pesanan dikirim", "Invoice INV/2026/11"]);
+        assert_eq!(q(MailQuery { text: Some("anggaran".into()), ..Default::default() }).total, 1, "body words");
+        assert_eq!(q(MailQuery { subject: Some("rapat".into()), ..Default::default() }).total, 2);
+        assert_eq!(q(MailQuery { subject: Some("anggaran".into()), ..Default::default() }).total, 0, "subject only");
+        assert_eq!(q(MailQuery { to: Some("budi".into()), ..Default::default() }).total, 1);
+        assert_eq!(q(MailQuery { after: Some(150), before: Some(300), ..Default::default() }).total, 1);
+        assert_eq!(q(MailQuery { has_attachments: Some(true), ..Default::default() }).total, 1);
+        assert_eq!(q(MailQuery { unread: Some(true), role: Some("inbox".into()), ..Default::default() }).total, 2);
+        assert_eq!(q(MailQuery { role: Some("all".into()), ..Default::default() }).total, 1);
+        assert_eq!(q(MailQuery { from: Some("100%_".into()), ..Default::default() }).total, 0, "LIKE wildcards are literal");
+        // A server hit counts as matching the words even when the local copy has no body.
+        let id = q(MailQuery { subject: Some("pesanan".into()), ..Default::default() }).rows[0].id;
+        let r = q(MailQuery { text: Some("resi".into()), server_hits: vec![id], ..Default::default() });
+        assert_eq!(subjects(r), vec!["Pesanan dikirim"]);
+        // Paging and order.
+        let r = q(MailQuery { limit: Some(2), offset: Some(1), oldest_first: true, ..Default::default() });
+        assert_eq!(r.total, 4);
+        assert_eq!(subjects(r), vec!["Pesanan dikirim", "Notulen rapat"]);
+        assert!(db.query_mail(&MailQuery { role: Some("bogus".into()), ..Default::default() }).is_err());
+
+        let (total, groups) = db.group_mail(&MailQuery::default(), "sender").unwrap();
+        assert_eq!(total, 4);
+        assert_eq!((groups[0].key.as_str(), groups[0].count, groups[0].label.as_deref()), ("noreply@tokopedia.com", 2, Some("Tokopedia")));
+        let (_, groups) = db.group_mail(&MailQuery { role: Some("sent".into()), ..Default::default() }, "recipient").unwrap();
+        assert_eq!((groups[0].key.as_str(), groups[0].count), ("budi@contoh.id", 1));
+        let (_, groups) = db.group_mail(&MailQuery::default(), "domain").unwrap();
+        assert_eq!(groups[0].key, "tokopedia.com");
+        assert!(db.group_mail(&MailQuery::default(), "bogus").is_err());
     }
 
     #[test]

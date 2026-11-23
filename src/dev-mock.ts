@@ -93,8 +93,81 @@ const html = `<div style="font-family:-apple-system,Helvetica,sans-serif">
 const settings: Record<string, string> = {};
 let olderCalls = 0;
 
+// ---- AI: OpenRouter answered by a script, so the agent loop and rephrasing run end to end. ----
+
+function sse(chunks: object[]): Response {
+  const enc = new TextEncoder();
+  const body = new ReadableStream({
+    async start(c) {
+      for (const ch of chunks) {
+        c.enqueue(enc.encode(`data: ${JSON.stringify({ id: "gen-mock", object: "chat.completion.chunk", created: 0, model: "mock", ...ch })}\n\n`));
+        await new Promise((r) => setTimeout(r, 120));
+      }
+      c.enqueue(enc.encode("data: [DONE]\n\n"));
+      c.close();
+    },
+  });
+  return new Response(body, { headers: { "content-type": "text/event-stream" } });
+}
+
+const textChunks = (text: string) => text.match(/.{1,18}/gs)!.map((t) => ({ choices: [{ index: 0, delta: { content: t }, finish_reason: null }] }));
+const toolChunks = (calls: { name: string; args: object }[]) =>
+  calls.map((c, i) => ({ choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: `call_${c.name}_${i}`, type: "function", function: { name: c.name, arguments: JSON.stringify(c.args) } }] }, finish_reason: null }] }));
+const end = (reason: string) => ({ choices: [{ index: 0, delta: {}, finish_reason: reason }], usage: { prompt_tokens: 1800, completion_tokens: 120, total_tokens: 1920, cost: 0.0021 } });
+
+function mockOpenRouter(url: string, init?: RequestInit): Response | null {
+  if (url.endsWith("/key")) return Response.json({ data: { label: "mock key", usage: 0.42, limit: null } });
+  if (url.endsWith("/models")) {
+    const m = (id: string, name: string, p: number, c: number) => ({
+      id, name, context_length: 1_000_000, architecture: { input_modalities: ["text", "image"], output_modalities: ["text"] },
+      pricing: { prompt: String(p / 1e6), completion: String(c / 1e6) }, top_provider: { max_completion_tokens: 64000 }, supported_parameters: ["tools", "reasoning"],
+    });
+    return Response.json({ data: [m("anthropic/claude-haiku-5.5", "Anthropic: Claude Haiku 5.5", 0.1, 0.5), m("anthropic/claude-sonnet-5.5", "Anthropic: Claude Sonnet 5.5", 2, 10), m("google/gemini-3.8-flash", "Google: Gemini 3.8 Flash", 0.83, 4.12)] });
+  }
+  if (!url.endsWith("/chat/completions")) return null;
+  const req = JSON.parse(String(init?.body ?? "{}"));
+  (window as any).__lastAiRequest = req;
+  const msgs: any[] = req.messages ?? [];
+  const textOf = (c: any): string => (typeof c === "string" ? c : Array.isArray(c) ? c.map((p) => p.text ?? "").join("") : "");
+  if (!req.tools) {
+    const user = textOf(msgs[msgs.length - 1]?.content);
+    const short = user.includes("shorter");
+    return sse([...textChunks(short ? "<div>Hi Maya,</div><div><br></div><div>The agenda looks good. Could we add 15 minutes for the offsite budget?</div>" : "<div>Hi Maya,</div><div><br></div><div>Thanks for sharing the agenda. It looks great to me. Could we add 15 minutes to discuss the offsite budget?</div><div><br></div><div>See you Thursday.</div>"), end("stop")]);
+  }
+  const results = msgs.filter((m) => m.role === "tool");
+  if (results.length === 0) {
+    return sse([...textChunks("Looking for Stripe invoices."), ...toolChunks([{ name: "search_mail", args: { text: "invoice", from: "stripe" } }]), end("tool_calls")]);
+  }
+  if (results.length === 1) {
+    const id = Number(/#(\d+)/.exec(textOf(results[0].content))?.[1] ?? 2);
+    (window as any).__aiPick = id;
+    return sse([...toolChunks([{ name: "read_message", args: { id } }, { name: "read_attachment", args: { messageId: id, index: 0 } }]), end("tool_calls")]);
+  }
+  const id = (window as any).__aiPick ?? 2;
+  return sse([...toolChunks([{ name: "show_results", args: { messageIds: [id], answer: `Your latest Stripe invoice is #2041 for November, **due within 14 days** [#${id}].\n- Amount: $1,240.00\n- Paid from: Acme card` } }]), end("tool_calls")]);
+}
+
+function matches(m: M, q: any): boolean {
+  const has = (hay: string, needle?: string) => !needle || needle.toLowerCase().split(/\s+/).every((w) => hay.toLowerCase().includes(w));
+  return has(`${m.subject} ${m.snippet} ${m.fromName} ${m.fromAddr}`, q.text) && has(m.subject, q.subject) && has(`${m.fromName} ${m.fromAddr}`, q.from)
+    && (q.after == null || m.date >= q.after) && (q.before == null || m.date < q.before) && (q.unread == null || m.seen === !q.unread)
+    && (q.flagged == null || m.flagged === q.flagged) && (q.hasAttachments == null || m.hasAttachments === q.hasAttachments)
+    && (q.accountId == null || m.accountId === q.accountId) && (q.folderId == null || m.folderId === q.folderId)
+    && (q.role == null || folders.find((f) => f.id === m.folderId)?.role === q.role);
+}
+
 export function installMock() {
   mockWindows("main");
+  const realFetch = window.fetch.bind(window);
+  window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (url.startsWith("https://openrouter.ai/")) {
+      const body = init?.body ?? (input instanceof Request ? await input.clone().text() : undefined);
+      const r = mockOpenRouter(url, { ...init, body });
+      if (r) return r;
+    }
+    return realFetch(input, init);
+  };
   mockIPC(async (cmd, args: any) => {
     switch (cmd) {
       case "accounts": return accounts;
@@ -181,6 +254,27 @@ export function installMock() {
         return 30;
       }
       case "search": return messages.filter((m) => inScope(m, args.scope) && (m.subject + m.fromName + m.snippet).toLowerCase().includes(args.query.toLowerCase()));
+      case "query_mail": {
+        const q = args.query;
+        const hits = messages.filter((m) => matches(m, q)).sort((a, b) => (q.oldestFirst ? a.date - b.date : b.date - a.date));
+        return { total: hits.length, rows: hits.slice(q.offset ?? 0, (q.offset ?? 0) + (q.limit ?? 25)), serverError: null };
+      }
+      case "group_mail": {
+        const hits = messages.filter((m) => matches(m, args.query));
+        const g = new Map<string, any>();
+        for (const m of hits) {
+          const k = m.fromAddr;
+          const e = g.get(k) ?? { key: k, label: m.fromName, count: 0, unread: 0, latest: 0 };
+          e.count++; e.unread += m.seen ? 0 : 1; e.latest = Math.max(e.latest, m.date);
+          g.set(k, e);
+        }
+        return { total: hits.length, groups: [...g.values()].sort((a, b) => b.count - a.count) };
+      }
+      case "summaries": return args.ids.map((id: number) => messages.find((m) => m.id === id)).filter(Boolean);
+      case "attachment_content":
+        return { kind: "text", filename: "Q4-agenda.pdf", mime: "application/pdf", format: "pdf", text: "--- Page 1 ---\nINVOICE #2041\nAmount due: $1,240.00\nDue: 14 days from receipt", totalChars: 72, offset: 0, parts: 1 };
+      case "ai_key": return settings.__ai_key ?? null;
+      case "set_ai_key": if (args.key) settings.__ai_key = args.key; else delete settings.__ai_key; return null;
       case "badge_count": return messages.filter((m) => !m.seen).length;
       case "mark_badge_seen": return null;
       case "message": {

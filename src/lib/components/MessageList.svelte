@@ -1,13 +1,16 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import Icon from "./Icon.svelte";
-  import { ui, openMessage, loadMore, viewTitle, setQuery, openAccountSettings, clickRow, isSelected, roleOf, editDraft, accountById,
+  import { ui, openMessage, loadMore, viewTitle, setQuery, openAccountSettings, openSettings, clickRow, isSelected, roleOf, editDraft, accountById,
     beginSearch, searchScopes, scopeKey, scopeLabel, setSearchScope, setView } from "../state.svelte";
   import { hint } from "../shortcuts.svelte";
   import { messageMenu } from "../menus";
   import { shortDate, displayName } from "../format";
   import { whenLabel } from "../when";
   import { api } from "../api";
+  import AiPanel from "./AiPanel.svelte";
+  import { ai, searchReady } from "../ai/config.svelte";
+  import { runAiSearch, stopAiSearch } from "../ai/search.svelte";
 
   const ROW = 76;
   const OVERSCAN = 8;
@@ -69,6 +72,7 @@
 
   let timer: ReturnType<typeof setTimeout>;
   function onInput() {
+    stopAiSearch();
     clearTimeout(timer);
     timer = setTimeout(() => setQuery(draft), 140);
   }
@@ -81,7 +85,27 @@
     queueMicrotask(() => searchEl?.focus());
   }
 
+  function askAi() {
+    const q = draft.trim();
+    if (!q) return;
+    if (!searchReady()) {
+      openSettings("ai");
+      return;
+    }
+    clearTimeout(timer);
+    // The words stay as the query, so closing the answer goes back to their results.
+    if (ui.query !== draft) setQuery(draft);
+    searchEl?.blur();
+    runAiSearch(q);
+  }
+
+  function closeAi() {
+    stopAiSearch();
+    setQuery(draft);
+  }
+
   function closeSearch() {
+    stopAiSearch();
     draft = "";
     searchOpen = false;
     if (ui.query) setQuery("");
@@ -99,6 +123,11 @@
           oninput={onInput}
           onkeydown={(e) => {
             if (e.key === "Escape") closeSearch();
+            if (e.key === "Enter" && e.metaKey) {
+              e.preventDefault();
+              askAi();
+              return;
+            }
             if (e.key === "ArrowDown" || e.key === "Enter") {
               e.preventDefault();
               searchEl?.blur();
@@ -126,6 +155,17 @@
     </div>
   {/if}
 
+  {#if searchOpen && draft.trim() && !(ui.ai && ui.ai.question === draft.trim())}
+    <button class="ask" onclick={askAi}>
+      <Icon name="sparkle" size={14} />
+      <span class="ask-text">{ai.hasKey ? "Ask AI" : "Set up AI search"}<span class="ask-q">{ai.hasKey ? ` “${draft.trim()}”` : ""}</span></span>
+      <span class="kbd">⌘↩</span>
+    </button>
+  {/if}
+  {#if ui.ai}
+    <AiPanel s={ui.ai} onclose={closeAi} />
+  {/if}
+
   {#if ui.view.kind === "outbox"}
     <div class="scroll body">
       {#each ui.outbox as o (o.id)}
@@ -146,9 +186,11 @@
     </div>
   {:else}
   <div class="scroll body" bind:this={scroller} bind:clientHeight={height} onscroll={onScroll}>
-    {#if ui.listReady && !ui.list.length && !ui.searchingServer}
+    {#if ui.listReady && !ui.list.length && !ui.searchingServer && !ui.ai?.running}
       <div class="empty">
-        {#if ui.query}
+        {#if ui.ai}
+          No messages
+        {:else if ui.query}
           No results
         {:else if !ui.accounts.length}
           <button class="btn primary" onclick={() => openAccountSettings("new")}>Add your first account</button>
@@ -271,6 +313,25 @@
   .scope:hover { background: var(--hover); color: var(--text); }
   .scope.on { background: var(--text); border-color: var(--text); color: var(--panel); }
   .scope .dot { width: 7px; height: 7px; border-radius: 50%; }
+  .ask {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 12px 10px;
+    padding: 0 10px;
+    height: 32px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--accent);
+    font-size: 13px;
+    text-align: left;
+  }
+  .ask:hover { background: var(--accent-soft); border-color: transparent; }
+  .ask-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+  .ask-q { color: var(--text-2); font-weight: 400; }
+  .kbd { flex: none; color: var(--muted); font-size: 11.5px; }
   .body { flex: 1; position: relative; }
   .row {
     position: absolute;

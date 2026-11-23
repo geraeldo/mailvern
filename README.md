@@ -53,6 +53,15 @@ Append a new entry to `MIGRATIONS` in `crates/mail-core/src/db.rs`, for example 
 - Messages and their replies are grouped into one row by their References / In-Reply-To headers, across folders of the same account. Turn this off in Settings › General.
 - Snooze moves a conversation to a "Snoozed" folder on the server and brings it back to the Inbox as unread at the chosen time, so other devices don't show it meanwhile. The app has to be running at that time to move it back.
 
+## AI
+
+Add an OpenRouter API key in Settings › AI and pick two models: one for search, one for writing. The key is stored in the Keychain (service "Mailvern", account "openrouter-api-key"). Calls go straight from the app to OpenRouter through [pi-ai](https://www.npmjs.com/package/@mariozechner/pi-ai). Only its OpenAI-compatible provider is used, and it loads the first time AI is used.
+
+- **Ask AI** (in search, `⌘↩`): the search model works through read-only tools until it can answer. It can search with filters (sender, recipient, dates, unread, flagged, attachments, folder), also on the mail servers, count and group mail, read messages and whole conversations, and open attachments: PDF, Word, PowerPoint, Excel/CSV, forwarded emails, HTML, text and images. The list then shows the messages it picked, with its answer above them. The tools are in `src/lib/ai/search.svelte.ts`; attachment text comes from `crates/mail-core/src/extract.rs`.
+- **Rephrase** (the sparkle in the composer): rewrites the selection, or your whole message (everything above the signature and the quoted text). When replying, it also sends the conversation as context. Replace goes through the editor's undo, so `⌘Z` brings your text back.
+- "Only use providers that don't store or train on requests" (on by default) asks OpenRouter to skip providers that keep data.
+- The AI can't send, move or delete mail. Mail content is treated as data, never as instructions.
+
 ## Sidebar
 
 Drag an account by its name, or a folder, to reorder. Custom folders below the last standard folder sit behind "More"; drag one higher to keep it visible. Right-click an account for Account Settings; right-click a message for reply, flag, archive and delete.

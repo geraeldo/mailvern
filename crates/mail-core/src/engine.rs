@@ -263,19 +263,31 @@ impl Engine {
         let targets: Vec<(i64, Option<Vec<i64>>)> = match scope {
             SearchScope::All => accounts.into_iter().map(|a| (a, None)).collect(),
             SearchScope::Account { account_id } => accounts.into_iter().filter(|a| a == account_id).map(|a| (a, None)).collect(),
-            SearchScope::Unified { role } => {
-                let view = View::Unified { role: role.clone() };
-                let mut by_account: HashMap<i64, Vec<i64>> = HashMap::new();
-                for (acc, folder) in self.view_folders(&view)? {
-                    by_account.entry(acc).or_default().push(folder);
-                }
-                by_account.into_iter().map(|(a, f)| (a, Some(f))).collect()
-            }
+            SearchScope::Unified { role } => self.role_targets(role)?,
             SearchScope::Folder { folder_id } => vec![(self.db.folder(*folder_id)?.0, Some(vec![*folder_id]))],
         };
+        let ids = self.ask_servers(&imap::search_criteria(&terms), targets).await?;
+        let mut rows = self.db.summaries(&ids)?;
+        rows.sort_by(|a, b| b.date.cmp(&a.date).then(b.id.cmp(&a.id)));
+        rows.dedup_by_key(|r| r.id);
+        Ok(rows)
+    }
+
+    /// Each account with the folders of a standard role there.
+    fn role_targets(&self, role: &str) -> Result<Vec<(i64, Option<Vec<i64>>)>> {
+        let mut by_account: HashMap<i64, Vec<i64>> = HashMap::new();
+        for f in self.db.folders()?.into_iter().filter(|f| f.role.as_deref() == Some(role)) {
+            by_account.entry(f.account_id).or_default().push(f.id);
+        }
+        Ok(by_account.into_iter().map(|(a, f)| (a, Some(f))).collect())
+    }
+
+    /// Runs a SEARCH on each target account (in its folders, or wherever the mail could be).
+    /// Hits not cached yet are stored. Fails only when every server failed.
+    async fn ask_servers(&self, criteria: &str, targets: Vec<(i64, Option<Vec<i64>>)>) -> Result<Vec<i64>> {
         let waits = targets.into_iter().filter_map(|(acc, folders)| {
             let (tx, rx) = oneshot::channel();
-            self.send_cmd(acc, Cmd::Search { terms: terms.clone(), folders, reply: tx }).ok()?;
+            self.send_cmd(acc, Cmd::Search { criteria: criteria.to_string(), folders, reply: tx }).ok()?;
             Some(async move {
                 match tokio::time::timeout(Duration::from_secs(60), rx).await {
                     Ok(Ok(r)) => r,
@@ -296,10 +308,52 @@ impl Engine {
                 return Err(e);
             }
         }
-        let mut rows = self.db.summaries(&ids)?;
-        rows.sort_by(|a, b| b.date.cmp(&a.date).then(b.id.cmp(&a.id)));
-        rows.dedup_by_key(|r| r.id);
-        Ok(rows)
+        Ok(ids)
+    }
+
+    /// Structured search over the local cache.
+    pub fn query_mail(&self, q: &MailQuery) -> Result<MailQueryResult> {
+        self.db.query_mail(q)
+    }
+
+    /// Structured search that first asks the mail servers, so mail never downloaded (and words in
+    /// bodies not cached yet) is found too. Returns the local query including those hits, and
+    /// the server error if every server failed (the local results are still returned).
+    pub async fn query_mail_server(&self, q: &MailQuery) -> Result<(MailQueryResult, Option<String>)> {
+        let mut q = q.clone();
+        let mut server_error = None;
+        if let Some(criteria) = imap::query_criteria(&q) {
+            let accounts: Vec<i64> = self.workers.lock().unwrap().keys().copied().collect();
+            let targets: Vec<(i64, Option<Vec<i64>>)> = if let Some(folder_id) = q.folder_id {
+                vec![(self.db.folder(folder_id)?.0, Some(vec![folder_id]))]
+            } else if let Some(role) = q.role.as_deref() {
+                self.role_targets(role)?.into_iter().filter(|(a, _)| q.account_id.map_or(true, |x| x == *a)).collect()
+            } else {
+                accounts.into_iter().filter(|a| q.account_id.map_or(true, |x| x == *a)).map(|a| (a, None)).collect()
+            };
+            match self.ask_servers(&criteria, targets).await {
+                Ok(ids) => q.server_hits = ids,
+                Err(e) => server_error = Some(format!("{e:#}")),
+            }
+        }
+        Ok((self.db.query_mail(&q)?, server_error))
+    }
+
+    /// Counts matching messages per sender, domain, month, year, folder or account.
+    pub fn group_mail(&self, q: &MailQuery, by: &str) -> Result<(i64, Vec<MailGroup>)> {
+        self.db.group_mail(q, by)
+    }
+
+    pub fn summaries(&self, ids: &[i64]) -> Result<Vec<MessageSummary>> {
+        self.db.summaries(ids)
+    }
+
+    /// The text (or image) inside an attachment, for the AI tools.
+    pub async fn attachment_content(&self, id: i64, index: usize, offset: usize, max_chars: usize) -> Result<AttachmentContent> {
+        let raw = self.raw(id).await?;
+        tokio::task::spawn_blocking(move || crate::extract::attachment_content(&raw, index, offset, max_chars))
+            .await
+            .map_err(|_| anyhow!("Reading the attachment failed"))?
     }
 
     /// The Dock badge number, per the "badge_mode" setting:

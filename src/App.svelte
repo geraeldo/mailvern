@@ -14,6 +14,7 @@
   import { api, type MailEvent } from "./lib/api";
   import { allowNativeMenu } from "./lib/menus";
   import { refreshBadge, loadBadgeMode } from "./lib/badge.svelte";
+  import { loadAi } from "./lib/ai/config.svelte";
   import {
     ui, loadAccounts, loadFolders, loadList, loadTrusted, loadPrefs, loadOutbox, refreshThread, move, compose,
     archiveSelected, trashSelected, toggleJunk, toggleSeen, toggleFlag, accountById, openSettings, openAccountSettings,
@@ -40,7 +41,7 @@
     (async () => {
       await loadAccounts();
       await loadPrefs();
-      await Promise.all([loadFolders(), loadList(true), loadTrusted(), loadShortcuts(), loadBadgeMode(), loadOutbox()]);
+      await Promise.all([loadFolders(), loadList(true), loadTrusted(), loadShortcuts(), loadBadgeMode(), loadOutbox(), loadAi()]);
       refreshBadge();
       if (!ui.accounts.length) openAccountSettings("new");
       notify = (await isPermissionGranted()) || (await requestPermission()) === "granted";

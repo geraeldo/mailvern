@@ -75,6 +75,39 @@ export type SearchScope =
 
 export type FileInfo = { path: string; name: string; size: number };
 
+/** A structured search (AI tools). Every field that is set must match. */
+export type MailQuery = {
+  /** Words anywhere in subject, sender or body. */
+  text?: string;
+  subject?: string;
+  /** Part of the sender's name or address. */
+  from?: string;
+  /** Part of a recipient's name or address (To or Cc). */
+  to?: string;
+  /** Unix seconds, inclusive. */
+  after?: number;
+  /** Unix seconds, exclusive. */
+  before?: number;
+  unread?: boolean;
+  flagged?: boolean;
+  hasAttachments?: boolean;
+  accountId?: number;
+  folderId?: number;
+  role?: string;
+  limit?: number;
+  offset?: number;
+  oldestFirst?: boolean;
+};
+
+export type QueryResult = { total: number; rows: Summary[]; serverError: string | null };
+
+export type MailGroup = { key: string; label: string | null; count: number; unread: number; latest: number };
+
+export type AttachmentContent =
+  | { kind: "text"; filename: string; mime: string; format: string; text: string; totalChars: number; offset: number; parts: number | null }
+  | { kind: "image"; filename: string; mime: string; data: string; size: number }
+  | { kind: "unsupported"; filename: string; mime: string; size: number; reason: string };
+
 export type Outgoing = {
   accountId: number;
   to: string[];
@@ -113,6 +146,13 @@ export const api = {
   thread: (id: number) => invoke<Summary[]>("thread", { id }),
   search: (query: string, scope: SearchScope) => invoke<Summary[]>("search", { query, scope }),
   searchServer: (query: string, scope: SearchScope) => invoke<Summary[]>("search_server", { query, scope }),
+  queryMail: (query: MailQuery, server = false) => invoke<QueryResult>("query_mail", { query, server }),
+  groupMail: (query: MailQuery, by: string) => invoke<{ total: number; groups: MailGroup[] }>("group_mail", { query, by }),
+  summaries: (ids: number[]) => invoke<Summary[]>("summaries", { ids }),
+  attachmentContent: (id: number, index: number, offset = 0, maxChars = 20000) =>
+    invoke<AttachmentContent>("attachment_content", { id, index, offset, maxChars }),
+  aiKey: () => invoke<string | null>("ai_key"),
+  setAiKey: (key: string) => invoke<void>("set_ai_key", { key }),
   loadOlder: (view: MailView) => invoke<number>("load_older", { view }),
   badgeCount: () => invoke<number>("badge_count"),
   markBadgeSeen: () => invoke<void>("mark_badge_seen"),

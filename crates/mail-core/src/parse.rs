@@ -199,6 +199,17 @@ pub fn attachment(raw: &[u8], index: usize) -> Option<(String, Vec<u8>)> {
     Some((attachment_name(p, index), bytes))
 }
 
+/// Returns (filename, mime type, bytes) for attachment `index` (as numbered by `display`).
+pub fn attachment_part(raw: &[u8], index: usize) -> Option<(String, String, Vec<u8>)> {
+    let m = MessageParser::default().parse(raw)?;
+    let p = m.attachments().nth(index)?;
+    let (mime, bytes) = match &p.body {
+        PartType::Message(inner) => ("message/rfc822".to_string(), inner.raw_message().to_vec()),
+        _ => (mime_of(p), p.contents().to_vec()),
+    };
+    Some((attachment_name(p, index), mime, bytes))
+}
+
 /// Every listed attachment as (filename, bytes), for forwarding.
 pub fn all_attachments(raw: &[u8]) -> Vec<(String, Vec<u8>)> {
     display(raw)

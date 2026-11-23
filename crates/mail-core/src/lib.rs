@@ -1,5 +1,6 @@
 mod db;
 mod engine;
+mod extract;
 mod imap;
 pub mod model;
 mod parse;

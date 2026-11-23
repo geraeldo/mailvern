@@ -1,4 +1,6 @@
-use mail_core::model::{Account, Folder, MessageDetail, MessageSummary, Outgoing, OutboxItem, SearchScope, View};
+use mail_core::model::{
+    Account, AttachmentContent, Folder, MailGroup, MailQuery, MessageDetail, MessageSummary, Outgoing, OutboxItem, SearchScope, View,
+};
 use mail_core::Engine;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -80,6 +82,69 @@ async fn load_older(engine: E<'_>, view: View) -> R<usize> {
 #[tauri::command]
 fn search(engine: E, query: String, scope: Option<SearchScope>) -> R<Vec<MessageSummary>> {
     engine.search(&query, &scope.unwrap_or_default()).map_err(err)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueryResult {
+    total: i64,
+    rows: Vec<MessageSummary>,
+    /// Set when `server` was asked for and every server failed (local results still come back).
+    server_error: Option<String>,
+}
+
+/// Structured search for the AI tools. With `server`, the mail servers are asked first.
+#[tauri::command]
+async fn query_mail(engine: E<'_>, query: MailQuery, server: Option<bool>) -> R<QueryResult> {
+    let (r, server_error) = if server.unwrap_or(false) {
+        engine.query_mail_server(&query).await.map_err(err)?
+    } else {
+        (engine.query_mail(&query).map_err(err)?, None)
+    };
+    Ok(QueryResult { total: r.total, rows: r.rows, server_error })
+}
+
+#[derive(serde::Serialize)]
+struct GroupResult {
+    total: i64,
+    groups: Vec<MailGroup>,
+}
+
+#[tauri::command]
+fn group_mail(engine: E, query: MailQuery, by: String) -> R<GroupResult> {
+    let (total, groups) = engine.group_mail(&query, &by).map_err(err)?;
+    Ok(GroupResult { total, groups })
+}
+
+#[tauri::command]
+fn summaries(engine: E, ids: Vec<i64>) -> R<Vec<MessageSummary>> {
+    engine.summaries(&ids).map_err(err)
+}
+
+#[tauri::command]
+async fn attachment_content(engine: E<'_>, id: i64, index: usize, offset: Option<usize>, max_chars: Option<usize>) -> R<AttachmentContent> {
+    let max = max_chars.unwrap_or(20_000).clamp(500, 200_000);
+    engine.attachment_content(id, index, offset.unwrap_or(0), max).await.map_err(err)
+}
+
+/// The OpenRouter API key lives in the Keychain, like account passwords.
+const AI_KEY: &str = "openrouter-api-key";
+
+#[tauri::command]
+fn ai_key() -> Option<String> {
+    mail_core::secrets::get(AI_KEY).ok().filter(|k| !k.is_empty())
+}
+
+/// Stores the key, or removes it when `key` is empty.
+#[tauri::command]
+fn set_ai_key(key: String) -> R<()> {
+    let key = key.trim();
+    if key.is_empty() {
+        mail_core::secrets::delete(AI_KEY);
+        Ok(())
+    } else {
+        mail_core::secrets::set(AI_KEY, key).map_err(err)
+    }
 }
 
 #[tauri::command]
@@ -400,6 +465,12 @@ pub fn run() {
             thread,
             search,
             search_server,
+            query_mail,
+            group_mail,
+            summaries,
+            attachment_content,
+            ai_key,
+            set_ai_key,
             move_to,
             snooze,
             unsnooze,

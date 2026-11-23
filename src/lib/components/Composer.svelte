@@ -6,6 +6,8 @@
   import Editor from "./Editor.svelte";
   import RecipientField from "./RecipientField.svelte";
   import WhenPicker from "./WhenPicker.svelte";
+  import Rephrase from "./Rephrase.svelte";
+  import type { RephraseContext } from "../ai/rephrase";
   import { ui, toast, folderById, editQueued, loadOutbox, type ComposeInit } from "../state.svelte";
   import { api, type FileInfo, type Outgoing } from "../api";
   import { sendPresets, toUnix, whenLabel } from "../when";
@@ -293,6 +295,17 @@
     }
   }
 
+  /** What rephrasing knows about this message: who it's between and what it replies to. */
+  function rephraseContext(): RephraseContext {
+    return {
+      subject,
+      from: account?.name ? `${account.name} <${account.email}>` : (account?.email ?? ""),
+      to,
+      cc,
+      source: src,
+    };
+  }
+
   function onKey(e: KeyboardEvent) {
     if (laterOpen) return;
     const combo = comboOf(e);
@@ -344,6 +357,7 @@
 
     <div class="body">
       <Editor bind:el={editorEl} html={initialHtml} oninput={changed}>
+        <Rephrase editor={editorEl} context={rephraseContext} onapplied={changed} />
         <button class="icon-btn" title="Attach files" onclick={pickFiles}><Icon name="clip" size={16} /></button>
         <span class="send-group">
           <button class="btn primary send" disabled={sending} onclick={() => send()} title={hint("Send", "send")}>
