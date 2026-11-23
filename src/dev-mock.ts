@@ -105,7 +105,8 @@ export function installMock() {
         return 30;
       }
       case "search": return messages.filter((m) => (m.subject + m.fromName + m.snippet).toLowerCase().includes(args.query.toLowerCase()));
-      case "unread_count": return messages.filter((m) => !m.seen).length;
+      case "badge_count": return messages.filter((m) => !m.seen).length;
+      case "mark_badge_seen": return null;
       case "message": {
         const m = messages.find((x) => x.id === args.id)!;
         return {

@@ -2,7 +2,7 @@ import { api, type Account, type Detail, type Folder, type Summary, type View } 
 
 export type ComposeMode = "new" | "reply" | "replyAll" | "forward";
 export type ComposeInit = { mode: ComposeMode; source?: Detail; accountId?: number; to?: string[]; key: number };
-export type SettingsSection = "shortcuts";
+export type SettingsSection = "general" | "shortcuts";
 export type SyncStatus = { state: "syncing" | "idle" | "error"; message: string | null };
 
 const PAGE = 200;
@@ -30,7 +30,7 @@ export const ui = $state({
   trustedSenders: [] as string[],
 });
 
-export function openSettings(section: SettingsSection = "shortcuts") {
+export function openSettings(section: SettingsSection = "general") {
   ui.accountSettings = null;
   ui.settings = section;
 }

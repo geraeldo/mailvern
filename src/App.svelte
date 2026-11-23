@@ -11,6 +11,7 @@
   import AccountSettings from "./lib/components/AccountSettings.svelte";
   import { api, type MailEvent } from "./lib/api";
   import { allowNativeMenu } from "./lib/menus";
+  import { refreshBadge, loadBadgeMode } from "./lib/badge.svelte";
   import {
     ui, loadAccounts, loadFolders, loadList, loadTrusted, move, compose,
     archiveSelected, trashSelected, toggleJunk, toggleSeen, toggleFlag, accountById, openSettings, openAccountSettings,
@@ -19,13 +20,6 @@
 
   let list: MessageList;
   let notify = false;
-
-  async function refreshBadge() {
-    try {
-      const n = await api.unreadCount();
-      await getCurrentWindow().setBadgeCount(n > 0 ? n : undefined);
-    } catch {}
-  }
 
   let pending: ReturnType<typeof setTimeout> | undefined;
   function scheduleRefresh() {
@@ -39,7 +33,7 @@
   onMount(() => {
     (async () => {
       await loadAccounts();
-      await Promise.all([loadFolders(), loadList(true), loadTrusted(), loadShortcuts()]);
+      await Promise.all([loadFolders(), loadList(true), loadTrusted(), loadShortcuts(), loadBadgeMode()]);
       refreshBadge();
       if (!ui.accounts.length) openAccountSettings("new");
       notify = (await isPermissionGranted()) || (await requestPermission()) === "granted";
@@ -57,8 +51,13 @@
         } as any);
       }
     });
+    // Bringing the window forward counts as looking at your mail: clear "new" from the badge.
+    const unFocus = getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+      if (focused) refreshBadge();
+    });
     return () => {
       un.then((f) => f());
+      unFocus.then((f) => f());
     };
   });
 

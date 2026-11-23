@@ -8,6 +8,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
+
+/// Setting keys for the Dock badge.
+const BADGE_MODE: &str = "badge_mode";
+const BADGE_SEEN: &str = "badge_seen_id";
 use tokio::task::JoinHandle;
 
 struct Handle {
@@ -217,8 +221,35 @@ impl Engine {
         self.db.search_all(query, 300)
     }
 
-    pub fn unread_count(&self) -> Result<i64> {
-        self.db.unified_unread()
+    /// The Dock badge number, per the "badge_mode" setting:
+    /// "new" (default) counts unread inbox mail that arrived since the app was last focused,
+    /// so mail you mark unread to handle later doesn't badge; "all" counts all unread inbox
+    /// mail; "off" shows nothing.
+    pub fn badge_count(&self) -> Result<i64> {
+        match self.db.setting(BADGE_MODE)?.as_deref() {
+            Some("off") => Ok(0),
+            Some("all") => self.db.unified_unread(),
+            _ => {
+                let max = self.db.max_message_id()?;
+                let seen = self.db.setting(BADGE_SEEN)?.and_then(|s| s.parse::<i64>().ok());
+                // No mark yet (first run): count only mail from here on. Ids can be reused
+                // after the newest row is deleted, so pull the mark back down to match.
+                let seen = match seen {
+                    Some(s) if s <= max => s,
+                    _ => {
+                        self.db.set_setting(BADGE_SEEN, &max.to_string())?;
+                        max
+                    }
+                };
+                self.db.unified_unread_after(seen)
+            }
+        }
+    }
+
+    /// Records that the user has looked at the app: everything stored so far stops being "new".
+    pub fn mark_badge_seen(&self) -> Result<()> {
+        let max = self.db.max_message_id()?;
+        self.db.set_setting(BADGE_SEEN, &max.to_string())
     }
 
     async fn raw(&self, id: i64) -> Result<Vec<u8>> {

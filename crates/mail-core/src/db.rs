@@ -617,6 +617,22 @@ impl Db {
         )?)
     }
 
+    /// Highest message id stored. Ids only grow as mail arrives, so this marks "now".
+    pub fn max_message_id(&self) -> Result<i64> {
+        let c = self.c();
+        Ok(c.query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |r| r.get(0))?)
+    }
+
+    /// Unread inbox messages stored after the given id.
+    pub fn unified_unread_after(&self, after_id: i64) -> Result<i64> {
+        let c = self.c();
+        Ok(c.query_row(
+            "SELECT COUNT(*) FROM messages WHERE seen = 0 AND id > ?1 AND folder_id IN (SELECT id FROM folders WHERE role = 'inbox')",
+            [after_id],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Address suggestions, ranked by how often you write to / hear from them.
     pub fn contacts(&self, q: &str) -> Result<Vec<Addr>> {
         let c = self.c();
@@ -686,6 +702,45 @@ mod tests {
             position: 0,
             label: "Work".into(),
         }
+    }
+
+    fn msg(uid: u32, seen: bool) -> NewMessage {
+        NewMessage {
+            uid,
+            message_id: None,
+            in_reply_to: None,
+            refs: None,
+            subject: format!("m{uid}"),
+            from_name: String::new(),
+            from_addr: "a@example.com".into(),
+            to: vec![],
+            cc: vec![],
+            reply_to: vec![],
+            date: uid as i64,
+            seen,
+            flagged: false,
+            has_attachments: false,
+            size: 0,
+        }
+    }
+
+    #[test]
+    fn badge_counts_only_unread_inbox_mail_after_the_mark() {
+        let db = Db::open(&temp_db()).unwrap();
+        let acc = db.save_account(&account()).unwrap();
+        let inbox = db.upsert_folder(acc, "INBOX", "Inbox", Some("inbox")).unwrap();
+        let other = db.upsert_folder(acc, "Lists", "Lists", None).unwrap();
+
+        db.insert_messages(acc, inbox, &[msg(1, false), msg(2, true)]).unwrap();
+        let mark = db.max_message_id().unwrap();
+        // Already-seen-in-app mail stays unread but isn't new.
+        assert_eq!(db.unified_unread().unwrap(), 1);
+        assert_eq!(db.unified_unread_after(mark).unwrap(), 0);
+
+        db.insert_messages(acc, inbox, &[msg(3, false), msg(4, true)]).unwrap();
+        db.insert_messages(acc, other, &[msg(5, false)]).unwrap();
+        assert_eq!(db.unified_unread_after(mark).unwrap(), 1);
+        assert_eq!(db.unified_unread_after(db.max_message_id().unwrap()).unwrap(), 0);
     }
 
     #[test]

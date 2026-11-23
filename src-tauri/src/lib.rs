@@ -58,8 +58,13 @@ fn search(engine: E, query: String) -> R<Vec<MessageSummary>> {
 }
 
 #[tauri::command]
-fn unread_count(engine: E) -> R<i64> {
-    engine.unread_count().map_err(err)
+fn badge_count(engine: E) -> R<i64> {
+    engine.badge_count().map_err(err)
+}
+
+#[tauri::command]
+fn mark_badge_seen(engine: E) -> R<()> {
+    engine.mark_badge_seen().map_err(err)
 }
 
 #[tauri::command]
@@ -326,7 +331,8 @@ pub fn run() {
             messages,
             search,
             load_older,
-            unread_count,
+            badge_count,
+            mark_badge_seen,
             message,
             set_seen,
             mark_read,

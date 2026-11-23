@@ -2,10 +2,12 @@
   import Icon from "./Icon.svelte";
   import Modal from "./Modal.svelte";
   import Shortcuts from "./Shortcuts.svelte";
+  import General from "./General.svelte";
   import { ui, type SettingsSection } from "../state.svelte";
 
   // App-wide preferences. Account settings live in AccountSettings.
   const sections: { id: SettingsSection; label: string; icon: string }[] = [
+    { id: "general", label: "General", icon: "settings" },
     { id: "shortcuts", label: "Shortcuts", icon: "keyboard" },
   ];
 
@@ -32,7 +34,9 @@
       <button class="icon-btn" title="Close  Esc" onclick={close}><Icon name="x" /></button>
     </header>
 
-    {#if current.id === "shortcuts"}
+    {#if current.id === "general"}
+      <General />
+    {:else if current.id === "shortcuts"}
       <Shortcuts />
     {/if}
   </main>
