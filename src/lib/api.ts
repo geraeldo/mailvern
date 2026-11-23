@@ -181,6 +181,7 @@ export const api = {
   setSetting: (key: string, value: string) => invoke<void>("set_setting", { key, value }),
   openAttachment: (id: number, index: number) => invoke<void>("open_attachment", { id, index }),
   saveAttachment: (id: number, index: number) => invoke<string>("save_attachment", { id, index }),
+  copyText: (text: string) => invoke<void>("copy_text", { text }),
   fileInfo: (paths: string[]) => invoke<FileInfo[]>("file_info", { paths }),
   attachmentFiles: (id: number) => invoke<FileInfo[]>("attachment_files", { id }),
   contacts: (query: string) => invoke<Addr[]>("contacts", { query }),

@@ -4,7 +4,7 @@
   import ThreadMessage from "./ThreadMessage.svelte";
   import {
     ui, compose, archiveSelected, trashSelected, toggleJunk, toggleSeen, toggleFlag, selectedRows, roleOf, clearSelection,
-    snoozeSelected, unsnoozeSelected, moveSelected, accountById, editQueued, deleteQueued, sendQueuedNow,
+    snoozeSelected, unsnoozeSelected, moveSelected, accountById, editQueued, deleteQueued, sendQueuedNow, copyThread,
   } from "../state.svelte";
   import { hint } from "../shortcuts.svelte";
   import { whenLabel } from "../when";
@@ -56,6 +56,10 @@
         <span class="sep"></span>
         <button class="icon-btn" class:on={unread} title={hint(unread ? "Mark as read" : "Mark as unread", "toggleUnread")} onclick={toggleSeen}><Icon name="unread" size={17} /></button>
         <button class="icon-btn" class:flagged title={hint("Flag", "toggleFlag")} onclick={toggleFlag}><Icon name="flag" size={17} /></button>
+        {#if !multi}
+          <span class="sep"></span>
+          <button class="icon-btn" title={hint(ui.thread.length > 1 ? "Copy conversation as text" : "Copy message as text", "copyThread")} onclick={copyThread}><Icon name="copy" size={17} /></button>
+        {/if}
       </div>
     {/if}
   </header>

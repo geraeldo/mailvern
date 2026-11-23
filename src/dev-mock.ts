@@ -317,6 +317,7 @@ export function installMock() {
       case "plugin:event|listen": return 1;
       case "plugin:menu|new": return [1, "menu"];
       case "plugin:menu|popup": (window as any).__lastMenu = args; return null;
+      case "copy_text": (window as any).__copied = args.text; return navigator.clipboard?.writeText(args.text).catch(() => {});
       default: return null;
     }
   });

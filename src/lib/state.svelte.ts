@@ -2,6 +2,7 @@ import {
   api, type Account, type Detail, type FileInfo, type Folder, type MailView, type OutboxItem, type Outgoing, type SearchScope, type Summary, type View,
 } from "./api";
 import { formatAddr } from "./format";
+import { threadText } from "./copy";
 import { textToHtml, unwrapEmail } from "./html";
 import { toUnix, whenLabel } from "./when";
 
@@ -545,6 +546,19 @@ export function toast(text: string, opts: { undo?: () => void; ms?: number } = {
   ui.toast = { text, undo: opts.undo };
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => (ui.toast = null), opts.ms ?? 3200);
+}
+
+/** Copies the open conversation as plain text (for an AI chat, notes, a ticket). */
+export async function copyThread() {
+  const d = ui.detail;
+  if (!d || ui.selectedIds.length > 1) return;
+  const thread = ui.thread.length ? ui.thread : [d];
+  try {
+    await api.copyText(await threadText(d.subject, thread, ui.details));
+    toast(thread.length > 1 ? `Copied ${thread.length} messages` : "Copied message");
+  } catch (e) {
+    toast(`Couldn't copy: ${e}`);
+  }
 }
 
 export function dismissToast() {

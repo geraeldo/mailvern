@@ -2,7 +2,7 @@ import { Menu } from "@tauri-apps/api/menu";
 import type { Account, MailView, Summary } from "./api";
 import {
   ui, openAccountSettings, openMessage, compose, archiveSelected, trashSelected, toggleJunk, selectedIsJunk, toggleSeen, toggleFlag, markAllRead,
-  checkForMail, checkAccountForMail, selectedRows, snoozeSelected, unsnoozeSelected, moveRows, moveSelected, roleOf, editDraft,
+  checkForMail, checkAccountForMail, copyThread, selectedRows, snoozeSelected, unsnoozeSelected, moveRows, moveSelected, roleOf, editDraft,
 } from "./state.svelte";
 
 type Item = { text: string; action: () => void; enabled?: boolean } | { text: string; items: Item[] } | "-";
@@ -59,6 +59,8 @@ export async function messageMenu(m: Summary) {
     { text: "Reply", action: () => compose("reply"), enabled: one && !!ui.detail },
     { text: "Reply All", action: () => compose("replyAll"), enabled: one && !!ui.detail },
     { text: "Forward", action: () => compose("forward"), enabled: one && !!ui.detail },
+    "-",
+    { text: ui.thread.length > 1 ? "Copy Conversation" : "Copy Message", action: copyThread, enabled: one && !!ui.detail },
     "-",
     { text: seenAll ? "Mark as Unread" : "Mark as Read", action: toggleSeen },
     { text: flaggedAll ? "Unflag" : "Flag", action: toggleFlag },

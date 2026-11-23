@@ -3,7 +3,7 @@ import { api } from "./api";
 export type Action =
   | "next" | "prev" | "reply" | "replyAll" | "forward" | "compose" | "archive" | "delete" | "junk"
   | "toggleUnread" | "toggleFlag" | "search" | "sync" | "settings" | "send"
-  | "move" | "snooze" | "selectAll" | "extendDown" | "extendUp";
+  | "move" | "snooze" | "selectAll" | "extendDown" | "extendUp" | "copyThread";
 
 export const ACTIONS: { id: Action; label: string; group: string }[] = [
   { id: "next", label: "Next message", group: "Navigate" },
@@ -17,6 +17,7 @@ export const ACTIONS: { id: Action; label: string; group: string }[] = [
   { id: "replyAll", label: "Reply all", group: "Write" },
   { id: "forward", label: "Forward", group: "Write" },
   { id: "send", label: "Send", group: "Write" },
+  { id: "copyThread", label: "Copy conversation as text", group: "Write" },
   { id: "archive", label: "Archive", group: "Organize" },
   { id: "delete", label: "Delete", group: "Organize" },
   { id: "junk", label: "Junk / Not junk", group: "Organize" },
@@ -37,6 +38,7 @@ export const DEFAULTS: Record<Action, string[]> = {
   replyAll: ["a"],
   forward: ["f"],
   send: ["mod+enter"],
+  copyThread: ["mod+shift+c"],
   archive: ["e"],
   delete: ["#", "backspace", "delete", "mod+backspace"],
   junk: ["mod+shift+j"],

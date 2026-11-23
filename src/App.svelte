@@ -19,7 +19,7 @@
     ui, loadAccounts, loadFolders, loadList, loadTrusted, loadPrefs, loadOutbox, refreshThread, move, compose,
     archiveSelected, trashSelected, toggleJunk, toggleSeen, toggleFlag, accountById, openSettings, openAccountSettings,
     moveSelected, snoozeSelected, unsnoozeSelected, selectAll, extendSelection, clearSelection, snoozeRows, moveRows,
-    selectedRows, roleOf, toast, undoToast,
+    selectedRows, roleOf, toast, undoToast, copyThread,
   } from "./lib/state.svelte";
   import { snoozePresets } from "./lib/when";
   import { keymap, comboOf, match, canFireWhileTyping, usesModifier, loadShortcuts, type Action } from "./lib/shortcuts.svelte";
@@ -100,6 +100,7 @@
     sync: () => api.syncNow(),
     settings: () => openSettings(),
     send: () => {},
+    copyThread,
   };
 
   function onKey(e: KeyboardEvent) {

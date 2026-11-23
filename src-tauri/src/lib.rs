@@ -5,6 +5,7 @@ use mail_core::Engine;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
+use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
 
 type E<'a> = State<'a, Arc<Engine>>;
@@ -313,6 +314,13 @@ async fn save_attachment(app: tauri::AppHandle, engine: E<'_>, id: i64, index: u
     Ok(path.to_string_lossy().into())
 }
 
+/// Puts text on the clipboard. Done natively: the webview's clipboard refuses writes that
+/// don't come straight from a click, such as after loading bodies or from a native menu.
+#[tauri::command]
+fn copy_text(app: tauri::AppHandle, text: String) -> R<()> {
+    app.clipboard().write_text(text).map_err(|e| e.to_string())
+}
+
 #[derive(serde::Serialize)]
 struct FileInfo {
     path: String,
@@ -418,6 +426,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(external_links())
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
@@ -498,6 +507,7 @@ pub fn run() {
             set_setting,
             open_attachment,
             save_attachment,
+            copy_text,
             file_info,
             attachment_files,
             contacts,
