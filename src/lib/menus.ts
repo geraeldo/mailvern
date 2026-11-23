@@ -1,5 +1,6 @@
 import { Menu } from "@tauri-apps/api/menu";
 import type { Account, MailView, Summary } from "./api";
+import { openRuleEditor, ruleFromMessage, type FromMessage } from "./rules.svelte";
 import {
   ui, openAccountSettings, openMessage, compose, archiveSelected, trashSelected, toggleJunk, selectedIsJunk, toggleSeen, toggleFlag, markAllRead,
   checkForMail, checkAccountForMail, copyThread, selectedRows, snoozeSelected, unsnoozeSelected, moveRows, moveSelected, roleOf, editDraft,
@@ -73,7 +74,23 @@ export async function messageMenu(m: Summary) {
       : { text: "Move to…", action: moveSelected, enabled: accounts.size === 1 },
     "-",
     snoozed ? { text: "Unsnooze", action: unsnoozeSelected } : { text: "Snooze…", action: snoozeSelected },
+    ...(one && ui.detail ? ["-" as const, { text: "Create Rule", items: ruleItems() }] : []),
   ]);
+}
+
+/** "Create Rule" choices for the open message: by its sender, domain, list or subject. */
+function ruleItems(): Item[] {
+  const d = ui.detail!;
+  const domain = d.fromAddr.split("@")[1] ?? "";
+  const make = (kind: FromMessage) => () => ui.detail && openRuleEditor(ruleFromMessage(ui.detail, kind));
+  return [
+    { text: `From ${d.fromAddr}…`, action: make("sender"), enabled: !!d.fromAddr },
+    { text: `From Anyone at ${domain}…`, action: make("domain"), enabled: !!domain },
+    ...(d.listId ? [{ text: "From This Mailing List…", action: make("list") }] : []),
+    { text: "With This Subject…", action: make("subject"), enabled: !!d.subject.trim() },
+    "-",
+    { text: "New Rule…", action: () => openRuleEditor() },
+  ];
 }
 
 /**

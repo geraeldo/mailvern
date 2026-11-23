@@ -2908,6 +2908,7 @@ dependencies = [
  "mime_guess",
  "pdf-extract",
  "psl",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",

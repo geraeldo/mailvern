@@ -26,6 +26,11 @@ pub struct NewMessage {
     pub flagged: bool,
     pub has_attachments: bool,
     pub size: u32,
+    /// The List-Id header of mailing lists and notifications.
+    pub list_id: Option<String>,
+    /// Set when the message says it was sent by a machine: its Auto-Submitted value, or
+    /// "bulk", "list" or "junk" from Precedence. Rules never auto-reply to these.
+    pub auto: Option<String>,
 }
 
 /// Summary fields computed from a full message body.
@@ -58,7 +63,64 @@ CREATE TABLE IF NOT EXISTS sender_icons (
 /// Rules: never edit or reorder a shipped entry. To change the schema, append a new
 /// entry (e.g. `ALTER TABLE messages ADD COLUMN ...`). Each one runs once, in a
 /// transaction, and the database is backed up before any upgrade.
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5];
+
+/// v5: rules.
+///
+/// `list_id` and `auto` come from headers, for rule conditions and loop protection.
+/// `rule_queue` holds new Inbox mail waiting for the rule runner. `rule_seen` records the
+/// Message-IDs rules have looked at, so a message that comes back to the Inbox (with a new
+/// UID) isn't processed twice. `rule_replies` limits auto-replies to one per sender now and then.
+const V5: &str = r#"
+ALTER TABLE messages ADD COLUMN list_id TEXT;
+ALTER TABLE messages ADD COLUMN auto TEXT;
+
+CREATE TABLE IF NOT EXISTS rules (
+  id INTEGER PRIMARY KEY,
+  position INTEGER NOT NULL DEFAULT 0,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  def TEXT NOT NULL,
+  origin TEXT NOT NULL DEFAULT 'user',
+  needs_approval INTEGER NOT NULL DEFAULT 0,
+  paused_reason TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS rule_queue (
+  message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+  account_id INTEGER NOT NULL,
+  queued_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS rule_seen (
+  account_id INTEGER NOT NULL,
+  msgid TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  PRIMARY KEY (account_id, msgid)
+);
+
+CREATE TABLE IF NOT EXISTS rule_log (
+  id INTEGER PRIMARY KEY,
+  rule_id INTEGER,
+  rule_name TEXT NOT NULL,
+  account_id INTEGER NOT NULL,
+  msgid TEXT,
+  subject TEXT NOT NULL DEFAULT '',
+  from_addr TEXT NOT NULL DEFAULT '',
+  action TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  undone INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_rule_log_rule ON rule_log(rule_id, at);
+
+CREATE TABLE IF NOT EXISTS rule_replies (
+  rule_id INTEGER NOT NULL,
+  addr TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  PRIMARY KEY (rule_id, addr)
+);
+"#;
 
 /// v4: conversations, the outbox (undo send, send later), snoozes, and server search hits.
 ///
@@ -711,18 +773,21 @@ impl Db {
     }
 
     /// Stores headers. `sparse` marks search hits that lie outside the sync window.
-    pub fn insert_messages(&self, account_id: i64, folder_id: i64, msgs: &[NewMessage]) -> Result<()> {
+    /// Returns the ids of the rows that are new.
+    pub fn insert_messages(&self, account_id: i64, folder_id: i64, msgs: &[NewMessage]) -> Result<Vec<i64>> {
         self.insert_messages_as(account_id, folder_id, msgs, false)
     }
 
-    pub fn insert_messages_as(&self, account_id: i64, folder_id: i64, msgs: &[NewMessage], sparse: bool) -> Result<()> {
+    pub fn insert_messages_as(&self, account_id: i64, folder_id: i64, msgs: &[NewMessage], sparse: bool) -> Result<Vec<i64>> {
+        let mut added = Vec::new();
         let mut c = self.c();
         let tx = c.transaction()?;
         {
             let mut ins = tx.prepare(
                 "INSERT OR IGNORE INTO messages (account_id, folder_id, uid, message_id, in_reply_to, refs, subject,
-                    from_name, from_addr, to_json, cc_json, reply_to_json, date, seen, flagged, has_attachments, size, sparse)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    from_name, from_addr, to_json, cc_json, reply_to_json, date, seen, flagged, has_attachments, size, sparse,
+                    list_id, auto)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )?;
             // Sync reaching a stored search hit takes it into the window.
             let mut unsparse = tx.prepare("UPDATE messages SET sparse = 0 WHERE folder_id = ? AND uid = ? AND sparse = 1")?;
@@ -747,9 +812,12 @@ impl Db {
                     m.has_attachments,
                     m.size,
                     sparse,
+                    m.list_id,
+                    m.auto,
                 ])?;
                 if n > 0 {
                     let id = tx.last_insert_rowid();
+                    added.push(id);
                     fts.execute(params![id, m.subject, format!("{} {}", m.from_name, m.from_addr)])?;
                     assign_thread(&tx, account_id, id, m.message_id.as_deref(), m.in_reply_to.as_deref(), m.refs.as_deref())?;
                 } else if !sparse {
@@ -758,7 +826,7 @@ impl Db {
             }
         }
         tx.commit()?;
-        Ok(())
+        Ok(added)
     }
 
     /// Applies server flags for every uid >= `from_uid` and deletes rows the server no longer has.
@@ -1355,6 +1423,306 @@ impl Db {
         )?)
     }
 
+    // ---------- rules ----------
+
+    fn rule_row(r: &rusqlite::Row) -> rusqlite::Result<Rule> {
+        let def: String = r.get(1)?;
+        let mut rule: Rule = serde_json::from_str(&def)
+            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e)))?;
+        rule.id = r.get(0)?;
+        rule.enabled = r.get(2)?;
+        rule.origin = r.get(3)?;
+        rule.needs_approval = r.get(4)?;
+        rule.paused_reason = r.get(5)?;
+        Ok(rule)
+    }
+
+    const RULE_COLS: &'static str = "id, def, enabled, origin, needs_approval, paused_reason";
+
+    /// Every rule, in the order they run.
+    pub fn rules(&self) -> Result<Vec<Rule>> {
+        let c = self.c();
+        let sql = format!("SELECT {} FROM rules ORDER BY position, id", Self::RULE_COLS);
+        let rows = c.prepare(&sql)?.query_map([], Self::rule_row)?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn rule(&self, id: i64) -> Result<Option<Rule>> {
+        let c = self.c();
+        let sql = format!("SELECT {} FROM rules WHERE id = ?", Self::RULE_COLS);
+        Ok(c.query_row(&sql, [id], Self::rule_row).optional()?)
+    }
+
+    /// Adds a rule at the end. Returns its id.
+    pub fn insert_rule(&self, rule: &Rule, now: i64) -> Result<i64> {
+        let c = self.c();
+        c.execute(
+            "INSERT INTO rules (position, enabled, def, origin, needs_approval, paused_reason, created_at, updated_at)
+             VALUES ((SELECT COALESCE(MAX(position), 0) + 1 FROM rules), ?, ?, ?, ?, ?, ?, ?)",
+            params![rule.enabled, serde_json::to_string(rule)?, rule.origin, rule.needs_approval, rule.paused_reason, now, now],
+        )?;
+        Ok(c.last_insert_rowid())
+    }
+
+    pub fn update_rule(&self, rule: &Rule, now: i64) -> Result<()> {
+        let c = self.c();
+        let n = c.execute(
+            "UPDATE rules SET enabled = ?, def = ?, origin = ?, needs_approval = ?, paused_reason = ?, updated_at = ? WHERE id = ?",
+            params![rule.enabled, serde_json::to_string(rule)?, rule.origin, rule.needs_approval, rule.paused_reason, now, rule.id],
+        )?;
+        if n == 0 {
+            return Err(anyhow!("There is no rule {}", rule.id));
+        }
+        Ok(())
+    }
+
+    pub fn delete_rule(&self, id: i64) -> Result<bool> {
+        let c = self.c();
+        Ok(c.execute("DELETE FROM rules WHERE id = ?", [id])? > 0)
+    }
+
+    pub fn reorder_rules(&self, ids: &[i64]) -> Result<()> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        for (i, id) in ids.iter().enumerate() {
+            tx.execute("UPDATE rules SET position = ? WHERE id = ?", params![i as i64 + 1, id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn set_rule_state(&self, id: i64, enabled: bool, needs_approval: bool, paused_reason: Option<&str>) -> Result<()> {
+        let c = self.c();
+        let n = c.execute(
+            "UPDATE rules SET enabled = ?, needs_approval = ?, paused_reason = ? WHERE id = ?",
+            params![enabled, needs_approval, paused_reason, id],
+        )?;
+        if n == 0 {
+            return Err(anyhow!("There is no rule {id}"));
+        }
+        Ok(())
+    }
+
+    pub fn rules_waiting_for_approval(&self) -> Result<usize> {
+        let c = self.c();
+        Ok(c.query_row("SELECT COUNT(*) FROM rules WHERE needs_approval = 1", [], |r| r.get::<_, i64>(0))? as usize)
+    }
+
+    /// Hands new Inbox mail to the rule runner.
+    pub fn queue_for_rules(&self, account_id: i64, ids: &[i64], now: i64) -> Result<()> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        for id in ids {
+            tx.execute("INSERT OR IGNORE INTO rule_queue (message_id, account_id, queued_at) VALUES (?, ?, ?)", params![id, account_id, now])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The oldest queued messages: (message id, account id, queued at).
+    pub fn rule_queue(&self, limit: usize) -> Result<Vec<(i64, i64, i64)>> {
+        let c = self.c();
+        let rows = c
+            .prepare("SELECT message_id, account_id, queued_at FROM rule_queue ORDER BY queued_at, message_id LIMIT ?")?
+            .query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn unqueue_for_rules(&self, ids: &[i64]) -> Result<()> {
+        let c = self.c();
+        for id in ids {
+            c.execute("DELETE FROM rule_queue WHERE message_id = ?", [id])?;
+        }
+        Ok(())
+    }
+
+    /// Records that rules looked at this message. False if they already had.
+    pub fn mark_rule_seen(&self, account_id: i64, msgid: &str, now: i64) -> Result<bool> {
+        let c = self.c();
+        Ok(c.execute("INSERT OR IGNORE INTO rule_seen (account_id, msgid, at) VALUES (?, ?, ?)", params![account_id, msgid, now])? > 0)
+    }
+
+    pub fn prune_rule_seen(&self, before: i64) -> Result<()> {
+        let c = self.c();
+        c.execute("DELETE FROM rule_seen WHERE at < ?", [before])?;
+        c.execute("DELETE FROM rule_replies WHERE at < ?", [before])?;
+        Ok(())
+    }
+
+    const FACT_COLS: &'static str = "m.id, m.account_id, m.folder_id, m.from_name, m.from_addr, m.to_json, m.cc_json, m.reply_to_json,
+        m.subject, m.list_id, m.auto, m.has_attachments, m.has_body, m.seen, m.date, m.message_id, m.refs, f.role";
+
+    fn facts_row(r: &rusqlite::Row) -> rusqlite::Result<crate::rules::Facts> {
+        let json = |i: usize| -> rusqlite::Result<Vec<Addr>> { Ok(serde_json::from_str(&r.get::<_, String>(i)?).unwrap_or_default()) };
+        Ok(crate::rules::Facts {
+            id: r.get(0)?,
+            account_id: r.get(1)?,
+            folder_id: r.get(2)?,
+            from_name: r.get(3)?,
+            from_addr: r.get(4)?,
+            to: json(5)?,
+            cc: json(6)?,
+            reply_to: json(7)?,
+            subject: r.get(8)?,
+            list_id: r.get(9)?,
+            auto: r.get(10)?,
+            has_attachments: r.get(11)?,
+            has_body: r.get(12)?,
+            seen: r.get(13)?,
+            date: r.get(14)?,
+            message_id: r.get(15)?,
+            refs: r.get(16)?,
+            role: r.get(17)?,
+        })
+    }
+
+    /// What rules look at in a stored message.
+    pub fn rule_facts(&self, id: i64) -> Result<Option<crate::rules::Facts>> {
+        let c = self.c();
+        let sql = format!("SELECT {} FROM messages m JOIN folders f ON f.id = m.folder_id WHERE m.id = ?", Self::FACT_COLS);
+        Ok(c.query_row(&sql, [id], Self::facts_row).optional()?)
+    }
+
+    /// The newest stored messages in a folder, or in the Inbox of one or every account.
+    pub fn rule_candidates(&self, account_id: Option<i64>, folder_id: Option<i64>, limit: usize) -> Result<Vec<crate::rules::Facts>> {
+        let c = self.c();
+        let (scope, arg): (&str, Option<i64>) = match (folder_id, account_id) {
+            (Some(f), _) => ("m.folder_id = ?1", Some(f)),
+            (None, Some(a)) => ("f.role = 'inbox' AND m.account_id = ?1", Some(a)),
+            (None, None) => ("f.role = 'inbox' AND ?1 IS NULL", None),
+        };
+        let sql = format!(
+            "SELECT {} FROM messages m JOIN folders f ON f.id = m.folder_id WHERE {scope} ORDER BY m.date DESC LIMIT ?2",
+            Self::FACT_COLS
+        );
+        let rows = c.prepare(&sql)?.query_map(params![arg, limit as i64], Self::facts_row)?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// The body as plain text (quoted replies left out), if it has been downloaded.
+    pub fn body_text(&self, id: i64) -> Result<Option<String>> {
+        let c = self.c();
+        let has: Option<bool> = c.query_row("SELECT has_body FROM messages WHERE id = ?", [id], |r| r.get(0)).optional()?;
+        if has != Some(true) {
+            return Ok(None);
+        }
+        Ok(Some(c.query_row("SELECT body FROM messages_fts WHERE rowid = ?", [id], |r| r.get(0)).optional()?.unwrap_or_default()))
+    }
+
+    pub fn list_id(&self, id: i64) -> Result<Option<String>> {
+        let c = self.c();
+        Ok(c.query_row("SELECT list_id FROM messages WHERE id = ?", [id], |r| r.get(0)).optional()?.flatten())
+    }
+
+    /// Stored copies of a message in a folder, by Message-ID.
+    pub fn ids_by_message_id(&self, folder_id: i64, msgid: &str) -> Result<Vec<i64>> {
+        let c = self.c();
+        let rows = c
+            .prepare("SELECT id FROM messages WHERE folder_id = ? AND message_id = ?")?
+            .query_map(params![folder_id, msgid], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Stored copies of a message anywhere in an account, by Message-ID.
+    pub fn ids_in_account(&self, account_id: i64, msgid: &str) -> Result<Vec<i64>> {
+        let c = self.c();
+        let rows = c
+            .prepare("SELECT id FROM messages WHERE account_id = ? AND message_id = ?")?
+            .query_map(params![account_id, msgid], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_rule(&self, rule: &Rule, account_id: i64, msgid: Option<&str>, subject: &str, from_addr: &str, action: &RuleAction, now: i64) -> Result<i64> {
+        let c = self.c();
+        c.execute(
+            "INSERT INTO rule_log (rule_id, rule_name, account_id, msgid, subject, from_addr, action, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![rule.id, rule.name, account_id, msgid, subject, from_addr, serde_json::to_string(action)?, now],
+        )?;
+        // Keep the log from growing forever.
+        c.execute("DELETE FROM rule_log WHERE id NOT IN (SELECT id FROM rule_log ORDER BY id DESC LIMIT 2000)", [])?;
+        Ok(c.last_insert_rowid())
+    }
+
+    /// The newest log entries: (entry, its Message-ID).
+    pub fn rule_activity(&self, limit: usize) -> Result<Vec<(RuleActivity, Option<String>)>> {
+        self.rule_log_where("1 = 1 ORDER BY id DESC LIMIT ?", limit as i64)
+    }
+
+    pub fn rule_log_entry(&self, id: i64) -> Result<Option<(RuleActivity, Option<String>)>> {
+        Ok(self.rule_log_where("id = ?", id)?.pop())
+    }
+
+    fn rule_log_where(&self, filter: &str, arg: i64) -> Result<Vec<(RuleActivity, Option<String>)>> {
+        let c = self.c();
+        let sql = format!("SELECT id, rule_id, rule_name, account_id, subject, from_addr, action, at, undone, msgid FROM rule_log WHERE {filter}");
+        let rows = c
+            .prepare(&sql)?
+            .query_map([arg], |r| {
+                let action: String = r.get(6)?;
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    action,
+                    r.get::<_, i64>(7)?,
+                    r.get::<_, bool>(8)?,
+                    r.get::<_, Option<String>>(9)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, rule_id, rule_name, account_id, subject, from_addr, action, at, undone, msgid)| {
+                let action: RuleAction = serde_json::from_str(&action).ok()?;
+                let can_undo = !undone && msgid.is_some() && !action.sends() && action != RuleAction::SkipNotification;
+                Some((RuleActivity { id, rule_id, rule_name, account_id, subject, from_addr, action, at, undone, can_undo }, msgid))
+            })
+            .collect())
+    }
+
+    pub fn mark_rule_undone(&self, id: i64) -> Result<()> {
+        let c = self.c();
+        c.execute("UPDATE rule_log SET undone = 1 WHERE id = ?", [id])?;
+        Ok(())
+    }
+
+    /// Forwards and replies a rule has sent since `since`.
+    pub fn rule_sends_since(&self, rule_id: i64, since: i64) -> Result<i64> {
+        let c = self.c();
+        Ok(c.query_row(
+            "SELECT COUNT(*) FROM rule_log WHERE rule_id = ? AND at >= ?
+               AND (action LIKE '{\"type\":\"forward\"%' OR action LIKE '{\"type\":\"reply\"%')",
+            params![rule_id, since],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Whether a rule auto-replied to this address since `since`.
+    pub fn replied_since(&self, rule_id: i64, addr: &str, since: i64) -> Result<bool> {
+        let c = self.c();
+        Ok(c.query_row(
+            "SELECT COUNT(*) > 0 FROM rule_replies WHERE rule_id = ? AND addr = ? AND at >= ?",
+            params![rule_id, addr.to_lowercase(), since],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn record_reply(&self, rule_id: i64, addr: &str, now: i64) -> Result<()> {
+        let c = self.c();
+        c.execute(
+            "INSERT INTO rule_replies (rule_id, addr, at) VALUES (?, ?, ?) ON CONFLICT(rule_id, addr) DO UPDATE SET at = excluded.at",
+            params![rule_id, addr.to_lowercase(), now],
+        )?;
+        Ok(())
+    }
+
     // ---------- settings ----------
 
     pub fn setting(&self, key: &str) -> Result<Option<String>> {
@@ -1445,6 +1813,8 @@ mod tests {
             flagged: false,
             has_attachments: false,
             size: 0,
+            list_id: None,
+            auto: None,
         }
     }
 
@@ -1731,17 +2101,17 @@ mod tests {
 
         let next = "ALTER TABLE accounts ADD COLUMN nickname TEXT NOT NULL DEFAULT 'none';";
         let mut conn = Connection::open(&path).unwrap();
-        migrate_with(&mut conn, &path, &[V1, V2, V3, V4, next]).unwrap();
+        migrate_with(&mut conn, &path, &[V1, V2, V3, V4, V5, next]).unwrap();
 
-        assert_eq!(version(&path), 5);
+        assert_eq!(version(&path), 6);
         let nick: String = conn.query_row("SELECT nickname FROM accounts", [], |r| r.get(0)).unwrap();
         assert_eq!(nick, "none");
         let email: String = conn.query_row("SELECT email FROM accounts", [], |r| r.get(0)).unwrap();
         assert_eq!(email, "me@example.com");
         // The pre-upgrade backup holds the old schema and the data.
-        let bak = Connection::open(path.with_extension("v4.bak")).unwrap();
+        let bak = Connection::open(path.with_extension("v5.bak")).unwrap();
         let v: i64 = bak.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 4);
+        assert_eq!(v, 5);
         let n: i64 = bak.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
     }
@@ -1794,13 +2164,36 @@ mod tests {
     }
 
     #[test]
+    fn v4_database_gains_rules_and_keeps_mail() {
+        let path = temp_db();
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            migrate_with(&mut conn, &path, &[V1, V2, V3, V4]).unwrap();
+            conn.execute("INSERT INTO accounts (name, email, imap_host, imap_port, smtp_host, smtp_port) VALUES ('Me', 'me@x.com', 'i', 993, 's', 465)", []).unwrap();
+            conn.execute("INSERT INTO folders (account_id, path, name, role) VALUES (1, 'INBOX', 'INBOX', 'inbox')", []).unwrap();
+            conn.execute("INSERT INTO messages (account_id, folder_id, uid, subject) VALUES (1, 1, 1, 'Old')", []).unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(version(&path), SCHEMA_VERSION);
+        let f = db.rule_facts(1).unwrap().unwrap();
+        assert_eq!((f.subject.as_str(), f.list_id, f.auto), ("Old", None, None));
+        assert!(db.rules().unwrap().is_empty());
+        // New mail stores the headers rules use.
+        let m = NewMessage { list_id: Some("<l.x.com>".into()), auto: Some("auto-replied".into()), ..msg(2, false) };
+        let ids = db.insert_messages(1, 1, &[m]).unwrap();
+        let f = db.rule_facts(ids[0]).unwrap().unwrap();
+        assert_eq!((f.list_id.as_deref(), f.auto.as_deref()), (Some("<l.x.com>"), Some("auto-replied")));
+        assert!(db.insert_messages(1, 1, &[msg(2, false)]).unwrap().is_empty());
+    }
+
+    #[test]
     fn failed_migration_rolls_back() {
         let path = temp_db();
         Db::open(&path).unwrap().save_account(&account()).unwrap();
         let bad = "ALTER TABLE accounts ADD COLUMN x TEXT; THIS IS NOT SQL;";
         let mut conn = Connection::open(&path).unwrap();
-        assert!(migrate_with(&mut conn, &path, &[V1, V2, V3, V4, bad]).is_err());
-        assert_eq!(version(&path), 4);
+        assert!(migrate_with(&mut conn, &path, &[V1, V2, V3, V4, V5, bad]).is_err());
+        assert_eq!(version(&path), 5);
         let cols: i64 = conn.query_row("SELECT COUNT(*) FROM pragma_table_info('accounts') WHERE name = 'x'", [], |r| r.get(0)).unwrap();
         assert_eq!(cols, 0);
     }

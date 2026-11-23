@@ -59,6 +59,8 @@ pub fn parse_header(uid: u32, raw: &[u8], seen: bool, flagged: bool, size: u32, 
             flagged,
             has_attachments: false,
             size,
+            list_id: None,
+            auto: None,
         };
     };
     let from = addrs(m.from()).into_iter().next();
@@ -79,7 +81,23 @@ pub fn parse_header(uid: u32, raw: &[u8], seen: bool, flagged: bool, size: u32, 
         flagged,
         has_attachments: is_multipart_mixed(&m),
         size,
+        list_id: m.header_raw("List-Id").map(unfold).filter(|s| !s.is_empty()),
+        auto: automated(m.header_raw("Auto-Submitted"), m.header_raw("Precedence")),
     }
+}
+
+/// A raw header value on one line.
+fn unfold(v: &str) -> String {
+    v.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether a machine sent the message (RFC 3834), as the header value that says so.
+fn automated(auto_submitted: Option<&str>, precedence: Option<&str>) -> Option<String> {
+    let value = |v: Option<&str>| v.map(|v| unfold(v).to_lowercase()).filter(|v| !v.is_empty());
+    if let Some(a) = value(auto_submitted).filter(|a| a != "no") {
+        return Some(a);
+    }
+    value(precedence).filter(|p| matches!(p.as_str(), "bulk" | "list" | "junk"))
 }
 
 fn clean_text(t: &str) -> String {
@@ -217,4 +235,22 @@ pub fn all_attachments(raw: &[u8]) -> Vec<(String, Vec<u8>)> {
         .iter()
         .filter_map(|a| attachment(raw, a.index))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn headers_for_rules() {
+        let raw = b"From: Hub <n@hub.example>\r\nList-Id: repo <repo.hub.example>\r\nPrecedence: bulk\r\nSubject: x\r\n\r\nbody";
+        let m = parse_header(1, raw, false, false, 0, 0);
+        assert_eq!(m.list_id.as_deref(), Some("repo <repo.hub.example>"));
+        assert_eq!(m.auto.as_deref(), Some("bulk"));
+        let raw = b"From: a@x.com\r\nAuto-Submitted: no\r\nPrecedence: first-class\r\nSubject: x\r\n\r\nbody";
+        let m = parse_header(1, raw, false, false, 0, 0);
+        assert_eq!((m.list_id, m.auto), (None, None));
+        let raw = b"From: a@x.com\r\nAuto-Submitted: Auto-Replied\r\nSubject: x\r\n\r\nbody";
+        assert_eq!(parse_header(1, raw, false, false, 0, 0).auto.as_deref(), Some("auto-replied"));
+    }
 }

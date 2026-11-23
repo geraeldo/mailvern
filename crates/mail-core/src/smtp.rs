@@ -96,6 +96,24 @@ pub struct Built {
     pub envelope: SimpleEnvelope,
 }
 
+/// The `Auto-Submitted` header (RFC 3834), on mail rules send.
+#[derive(Clone)]
+struct AutoSubmitted(String);
+
+impl lettre::message::header::Header for AutoSubmitted {
+    fn name() -> lettre::message::header::HeaderName {
+        lettre::message::header::HeaderName::new_from_ascii_str("Auto-Submitted")
+    }
+
+    fn parse(s: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(AutoSubmitted(s.to_string()))
+    }
+
+    fn display(&self) -> lettre::message::header::HeaderValue {
+        lettre::message::header::HeaderValue::new(Self::name(), self.0.clone())
+    }
+}
+
 /// Builds the MIME message. Attachments are read now, so a queued message doesn't
 /// depend on files that may be gone by the time it is sent.
 ///
@@ -123,6 +141,9 @@ pub fn build(acc: &Account, out: &Outgoing, message_id: &str, draft: bool) -> Re
     }
     if let Some(r) = out.references.as_ref().filter(|s| !s.is_empty()) {
         b = b.references(r.clone());
+    }
+    if let Some(v) = out.auto_submitted.as_ref().filter(|s| !s.is_empty()) {
+        b = b.header(AutoSubmitted(v.clone()));
     }
 
     let (html, images) = extract_inline_images(&out.html, domain);
@@ -240,7 +261,17 @@ mod tests {
             in_reply_to: None,
             references: None,
             message_id: None,
+            auto_submitted: None,
         }
+    }
+
+    #[test]
+    fn rule_mail_says_it_was_sent_automatically() {
+        let mut o = out(&["a@x.com"], &[]);
+        assert!(!String::from_utf8_lossy(&build(&acc(), &o, "<4@example.com>", false).unwrap().raw).contains("Auto-Submitted"));
+        o.auto_submitted = Some("auto-replied".into());
+        let raw = String::from_utf8_lossy(&build(&acc(), &o, "<5@example.com>", false).unwrap().raw).to_string();
+        assert!(raw.contains("Auto-Submitted: auto-replied\r\n"));
     }
 
     #[test]

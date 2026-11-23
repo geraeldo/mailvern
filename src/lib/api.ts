@@ -60,6 +60,8 @@ export type Detail = Summary & {
   html: string | null;
   text: string | null;
   attachments: Attachment[];
+  /** The List-Id header of mailing lists and notifications. */
+  listId: string | null;
 };
 
 /** "outbox" is the app's own list of queued mail; it never goes to the backend as a view. */
@@ -133,12 +135,76 @@ export type Cancelled = { message: Outgoing; attachments: FileInfo[] };
 /** Whether coding agents on this Mac may connect (the MCP server), and how. */
 export type AgentAccess = { enabled: boolean; running: boolean; url: string; token: string | null; error: string | null };
 
+export type RuleField =
+  | "from"
+  | "fromDomain"
+  | "to"
+  | "cc"
+  | "toOrCc"
+  | "onlyToMe"
+  | "ccMe"
+  | "subject"
+  | "body"
+  | "listId"
+  | "hasAttachment";
+export type RuleOp = "contains" | "is" | "startsWith" | "endsWith" | "regex";
+export type RuleCondition = { field: RuleField; op: RuleOp; value: string };
+export type SnoozeUntil = "laterToday" | "tomorrow" | "nextWeek";
+export type RuleAction =
+  | { type: "move"; folderId: number }
+  | { type: "archive" }
+  | { type: "trash" }
+  | { type: "junk" }
+  | { type: "markRead" }
+  | { type: "flag" }
+  | { type: "snooze"; until: SnoozeUntil }
+  | { type: "skipNotification" }
+  | { type: "forward"; to: string[] }
+  | { type: "reply"; subject: string | null; text: string };
+export type Rule = {
+  /** 0 for a rule not saved yet. */
+  id: number;
+  name: string;
+  enabled: boolean;
+  /** Only mail arriving in this account; null: every account. */
+  accountId: number | null;
+  /** All conditions must hold, or any one. */
+  matchAll: boolean;
+  /** None: every new message. */
+  conditions: RuleCondition[];
+  exceptions: RuleCondition[];
+  actions: RuleAction[];
+  /** Don't look at later rules once this one matches. */
+  stop: boolean;
+  origin: "user" | "agent";
+  /** An agent added or changed its sending actions: the user has to turn it on. */
+  needsApproval: boolean;
+  /** Why Mailvern switched it off. */
+  pausedReason: string | null;
+};
+export type RuleTest = { count: number; scanned: number; withoutBody: number; sample: Summary[] };
+export type RuleRun = { matched: number; sent: number; notSent: number };
+export type RuleActivity = {
+  id: number;
+  ruleId: number | null;
+  ruleName: string;
+  accountId: number;
+  subject: string;
+  fromAddr: string;
+  action: RuleAction;
+  at: number;
+  undone: boolean;
+  canUndo: boolean;
+};
+
 export type MailEvent =
   | { kind: "changed"; accountId: number }
   | { kind: "status"; accountId: number; state: "syncing" | "idle" | "error"; message: string | null }
   | { kind: "newMail"; accountId: number; from: string; subject: string; count: number }
   | { kind: "outbox" }
-  | { kind: "sendFailed"; subject: string; message: string };
+  | { kind: "sendFailed"; subject: string; message: string }
+  | { kind: "rulesChanged"; pendingApproval: number }
+  | { kind: "rulePaused"; ruleId: number; name: string; reason: string };
 
 export const api = {
   accounts: () => invoke<Account[]>("accounts"),
@@ -198,4 +264,16 @@ export const api = {
   agentAccess: () => invoke<AgentAccess>("agent_access"),
   setAgentAccess: (enabled: boolean) => invoke<AgentAccess>("set_agent_access", { enabled }),
   resetAgentToken: () => invoke<AgentAccess>("reset_agent_token"),
+  rules: () => invoke<Rule[]>("rules"),
+  saveRule: (rule: Rule) => invoke<Rule>("save_rule", { rule }),
+  deleteRule: (id: number) => invoke<void>("delete_rule", { id }),
+  reorderRules: (ids: number[]) => invoke<void>("reorder_rules", { ids }),
+  setRuleEnabled: (id: number, enabled: boolean) => invoke<void>("set_rule_enabled", { id, enabled }),
+  /** Rejects with what to fix. */
+  checkRule: (rule: Rule) => invoke<void>("check_rule", { rule }),
+  testRule: (rule: Rule, folderId: number | null = null) => invoke<RuleTest>("test_rule", { rule, folderId }),
+  runRule: (id: number, folderId: number | null, includeSending: boolean) =>
+    invoke<RuleRun>("run_rule", { id, folderId, includeSending }),
+  ruleActivity: (limit = 50) => invoke<RuleActivity[]>("rule_activity", { limit }),
+  undoRuleActivity: (id: number) => invoke<void>("undo_rule_activity", { id }),
 };

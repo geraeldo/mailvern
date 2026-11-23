@@ -53,6 +53,56 @@ async fn start() -> (Server, std::path::PathBuf) {
     (Server::start(engine, 0, TOKEN.into()).await.unwrap(), dir)
 }
 
+/// The rule id in "Rule 3 \"Name\" (…)".
+fn rule_id(out: &str) -> i64 {
+    out.split("Rule ").nth(1).and_then(|s| s.split(' ').next()).and_then(|s| s.parse().ok()).unwrap_or_else(|| panic!("no rule in:\n{out}"))
+}
+
+#[tokio::test]
+async fn agents_manage_rules_but_sending_ones_wait_for_the_user() {
+    let (server, dir) = start().await;
+    let addr = server.addr();
+
+    let (out, err) = tool(addr, "list_rules", json!({})).await;
+    assert!(!err && out.contains("No rules yet"), "{out}");
+
+    // Trying conditions changes nothing and shows the matches.
+    let (out, err) = tool(addr, "test_rule", json!({ "conditions": [{ "field": "from", "value": "maya" }] })).await;
+    assert!(!err && out.starts_with("1 of the latest 2 messages in the Inbox match"), "{out}");
+
+    // A rule that only files mail is live at once.
+    let (out, err) = tool(addr, "create_rule", json!({ "name": "Flag Maya", "conditions": [{ "field": "from", "value": "maya" }], "actions": [{ "type": "flag" }] })).await;
+    assert!(!err && out.contains("(on, every account"), "{out}");
+    let flag_id = rule_id(&out);
+
+    // One that forwards is saved switched off, and the agent can't switch it on.
+    let (out, err) = tool(
+        addr,
+        "create_rule",
+        json!({ "name": "Forward receipts", "conditions": [{ "field": "subject", "op": "regex", "value": "receipt|invoice" }], "actions": [{ "type": "forward", "to": ["pat@example.org"] }] }),
+    )
+    .await;
+    assert!(!err && out.contains("waiting for the user to approve") && out.contains("Tell them"), "{out}");
+    let (out, err) = tool(addr, "update_rule", json!({ "id": rule_id(&out), "enabled": true })).await;
+    assert!(err && out.contains("Only the user"), "{out}");
+
+    // Changing one part keeps the rest; a bad pattern is refused with the reason.
+    let (out, err) = tool(addr, "update_rule", json!({ "id": flag_id, "name": "Flag Maya Chen" })).await;
+    assert!(!err && out.contains("\"Flag Maya Chen\" (on") && out.contains("from contains \"maya\""), "{out}");
+    let (out, err) = tool(addr, "update_rule", json!({ "id": flag_id, "conditions": [{ "field": "subject", "op": "regex", "value": "(" }] })).await;
+    assert!(err && out.contains("isn't a valid pattern"), "{out}");
+
+    let (out, _) = tool(addr, "list_rules", json!({})).await;
+    assert!(out.starts_with("2 rules") && out.contains("added by agent"), "{out}");
+    let (out, err) = tool(addr, "delete_rule", json!({ "id": flag_id })).await;
+    assert!(!err && out.contains("Removed rule"), "{out}");
+    let (out, err) = tool(addr, "delete_rule", json!({ "id": flag_id })).await;
+    assert!(err && out.contains("There is no rule"), "{out}");
+
+    drop(server);
+    std::fs::remove_dir_all(dir).ok();
+}
+
 /// The id after "#" on the result row that mentions `needle`.
 fn id_of(listing: &str, needle: &str) -> i64 {
     let row = listing.split("\n\n").find(|r| r.contains(needle)).unwrap_or_else(|| panic!("no {needle} in:\n{listing}"));
@@ -107,7 +157,7 @@ async fn handshake_and_tool_list() {
     assert_eq!(http(addr, "POST", "/mcp", &[("Authorization", &auth)], note).await, (202, String::new()));
 
     let tools = rpc(addr, "tools/list", json!({})).await;
-    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 9);
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 14);
 
     assert_eq!(rpc(addr, "resources/list", json!({})).await["error"]["code"], -32601);
     assert_eq!(rpc(addr, "tools/call", json!({ "name": "send_mail", "arguments": {} })).await["error"]["code"], -32602);
