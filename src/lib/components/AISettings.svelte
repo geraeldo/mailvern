@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import ModelPicker from "./ModelPicker.svelte";
-  import { ai, checkKey, saveKey, setModel, setPrivateOnly, price, apiKey, type KeyCheck } from "../ai/config.svelte";
+  import { ai, checkKey, saveKey, setModel, setPrivateOnly, apiKey, type KeyCheck } from "../ai/config.svelte";
   import { api } from "../api";
 
   let keyInput = $state("");
@@ -40,7 +40,11 @@
   }
 
   const usage = (s: KeyCheck) =>
-    s.ok ? [s.label, s.usage != null ? `$${s.usage.toFixed(2)} used` : null, s.limit != null ? `$${s.limit.toFixed(2)} limit` : null].filter(Boolean).join(" · ") : "";
+    s.ok
+      ? [s.label, s.usage == null ? null : s.limit == null ? `$${s.usage.toFixed(2)} used` : `$${s.usage.toFixed(2)} of $${s.limit.toFixed(2)} used`]
+          .filter(Boolean)
+          .join(" · ")
+      : "";
 </script>
 
 <div class="group">
@@ -50,9 +54,9 @@
       <span class="label">API key</span>
       <span class="detail">
         {#if ai.hasKey && !editing}
-          {#if status && !status.ok}<span class="err">{status.error}</span>{:else}Saved in your Keychain{status ? ` · ${usage(status)}` : ""}{/if}
+          {#if status && !status.ok}<span class="err">{status.error}</span>{:else}{status ? usage(status) : "Saved in Keychain"}{/if}
         {:else}
-          Create one at <button class="link" onclick={() => api.openUrl("https://openrouter.ai/keys")}>openrouter.ai/keys</button>. It's kept in your Keychain.
+          Get one at <button class="link" onclick={() => api.openUrl("https://openrouter.ai/keys")}>openrouter.ai/keys</button>
         {/if}
       </span>
     </span>
@@ -83,14 +87,14 @@
   <div class="row">
     <span class="text">
       <span class="label">Search</span>
-      <span class="detail">Answers questions about your mail. It searches, reads messages and opens attachments, so a fast model with tool use works best.{#if ai.search}{" "}{price(ai.search)}.{/if}</span>
+      <span class="detail">Answers questions about your mail</span>
     </span>
     <ModelPicker value={ai.search} needsTools onpick={(m) => setModel("search", m)} />
   </div>
   <div class="row">
     <span class="text">
       <span class="label">Writing</span>
-      <span class="detail">Rephrases what you write in the composer.{#if ai.write}{" "}{price(ai.write)}.{/if}</span>
+      <span class="detail">Rephrases your drafts</span>
     </span>
     <ModelPicker value={ai.write} onpick={(m) => setModel("write", m)} />
   </div>
@@ -101,14 +105,12 @@
   <label class="row">
     <input type="checkbox" checked={ai.privateOnly} onchange={(e) => setPrivateOnly(e.currentTarget.checked)} />
     <span class="text">
-      <span class="label">Only use providers that don't store or train on requests</span>
-      <span class="detail">Some models may not be available with this on.</span>
+      <span class="label">Skip providers that store or train on data</span>
+      <span class="detail">Fewer models available</span>
     </span>
   </label>
   <p class="note">
-    Asking AI search a question sends it to OpenRouter and the model's provider, along with the mail the model chooses to read:
-    message lists, whole messages and attachments. Rephrasing sends your draft and the conversation you're replying to.
-    The AI can only read mail. It can't send, move or delete anything.
+    Your questions, drafts and the mail the AI reads go to OpenRouter and the model's provider. The AI can't send, move or delete mail.
   </p>
 </div>
 

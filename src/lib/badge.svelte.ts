@@ -5,9 +5,9 @@ import { api } from "./api";
 export type BadgeMode = "new" | "all" | "off";
 
 export const BADGE_MODES: { id: BadgeMode; label: string; detail: string }[] = [
-  { id: "new", label: "New messages", detail: "Unread mail that arrived since you last opened Mailvern. Mail you mark as unread to handle later doesn't count." },
-  { id: "all", label: "All unread messages", detail: "Every unread message in your inboxes." },
-  { id: "off", label: "Off", detail: "Never show a number on the Dock icon." },
+  { id: "new", label: "New messages", detail: "Unread mail since you last opened Mailvern" },
+  { id: "all", label: "All unread messages", detail: "Every unread message in your inboxes" },
+  { id: "off", label: "Off", detail: "" },
 ];
 
 export const badge = $state({ mode: "new" as BadgeMode });

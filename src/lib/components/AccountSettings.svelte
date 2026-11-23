@@ -120,7 +120,7 @@
 
   async function remove() {
     if (!draft.id) return;
-    const ok = await ask(`Remove ${draft.email} from Mailvern? Mail on the server is not affected.`, {
+    const ok = await ask(`Remove ${draft.email}? Mail on the server stays.`, {
       title: "Remove account",
       kind: "warning",
       okLabel: "Remove",

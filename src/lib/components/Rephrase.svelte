@@ -57,7 +57,7 @@
       return;
     }
     if (!ai.hasKey) {
-      toast("Add an OpenRouter key in Settings › AI to rephrase");
+      toast("Add an OpenRouter key in Settings › AI");
       return;
     }
     if (!writeReady()) {
@@ -74,7 +74,7 @@
       kind = "message";
     }
     if (!htmlToPlain(htmlOf(target)).trim()) {
-      toast("Write something first, then rephrase it");
+      toast("Nothing to rephrase yet");
       target = null;
       return;
     }
@@ -99,7 +99,7 @@
       if (my !== controller) return;
       result = html;
       phase = result.trim() ? "done" : "error";
-      if (!result.trim()) error = "The model returned nothing. Try again or pick another model.";
+      if (!result.trim()) error = "No response. Try again or pick another model.";
     } catch (e) {
       if (my !== controller) return;
       if (my.signal.aborted) {

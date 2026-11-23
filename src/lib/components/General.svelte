@@ -12,20 +12,20 @@
     <input type="checkbox" checked={ui.threaded} onchange={(e) => setThreaded(e.currentTarget.checked)} />
     <span class="text">
       <span class="label">Group into conversations</span>
-      <span class="detail">Show a message and its replies as one row, and read them together.</span>
+      <span class="detail">Show replies together in one row</span>
     </span>
   </label>
   <label class="row">
     <input type="checkbox" checked={ui.senderIcons} onchange={(e) => setSenderIcons(e.currentTarget.checked)} />
     <span class="text">
       <span class="label">Show sender logos</span>
-      <span class="detail">Get a company's logo or site icon from its own website. Personal addresses like Gmail keep their initials.</span>
+      <span class="detail">Fetched from the sender's website</span>
     </span>
   </label>
   <div class="row">
     <span class="text">
       <span class="label">Undo send</span>
-      <span class="detail">How long a sent message waits, so you can take it back.</span>
+      <span class="detail">Time to take back a sent message</span>
     </span>
     <Select
       label="Undo send"
@@ -42,7 +42,7 @@
       <input type="radio" name="badge" value={m.id} checked={badge.mode === m.id} onchange={() => setBadgeMode(m.id)} />
       <span class="text">
         <span class="label">{m.label}</span>
-        <span class="detail">{m.detail}</span>
+        {#if m.detail}<span class="detail">{m.detail}</span>{/if}
       </span>
     </label>
   {/each}

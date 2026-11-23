@@ -61,7 +61,7 @@
   }
 
   async function reset() {
-    const ok = await ask("Agents you've connected will stop working until you run their command again.", {
+    const ok = await ask("Connected agents stop working until you rerun their command.", {
       title: "Reset the access token?",
       kind: "warning",
       okLabel: "Reset",
@@ -81,7 +81,7 @@
   <label class="toggle">
     <span class="text">
       <span class="label">Let agents on this Mac use Mailvern</span>
-      <span class="detail">They can read mail and save drafts, never send, move or delete.</span>
+      <span class="detail">Read mail and save drafts. Never send, move or delete.</span>
     </span>
     <input
       type="checkbox"
@@ -105,7 +105,7 @@
       {#if wasReset}
         <div class="banner">
           <Icon name="refresh" size={14} />
-          <span>New token. Run the command again for each agent you use.</span>
+          <span>New token. Rerun the command for each agent.</span>
           <button class="btn ghost sm" onclick={() => (wasReset = false)}>Done</button>
         </div>
       {/if}
@@ -161,7 +161,7 @@
 {/if}
 
 <p class="note">
-  Mail can contain text meant to mislead an agent, so drafts always wait for you to send. What an agent reads goes to its model provider.
+  Drafts always wait for you to send. What an agent reads goes to its model provider.
 </p>
 
 <style>

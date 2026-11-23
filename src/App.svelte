@@ -61,7 +61,7 @@
       } else if (e.kind === "outbox") {
         loadOutbox();
       } else if (e.kind === "sendFailed") {
-        toast(`Couldn't send “${e.subject || "(no subject)"}”. It's in Scheduled and will be retried.`, { ms: 6000 });
+        toast(`Couldn't send “${e.subject || "(no subject)"}”. It will retry from Scheduled.`, { ms: 6000 });
         if (notify) sendNotification({ title: "Message not sent", body: `${e.subject || "(no subject)"}: ${e.message}` });
       }
     });
