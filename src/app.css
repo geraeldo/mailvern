@@ -5,8 +5,8 @@
   --line: #ebe9e4;
   --line-strong: #dedbd4;
   --text: #1d1c1a;
-  --text-2: #57544e;
-  --muted: #8f8b83;
+  --text-2: #43403b;
+  --muted: #6b6760;
   --hover: rgba(29, 28, 26, 0.045);
   --active: rgba(29, 28, 26, 0.075);
   --accent: #2459e0;
@@ -29,8 +29,8 @@
     --line: #2d2c2a;
     --line-strong: #3a3936;
     --text: #edece9;
-    --text-2: #bdbab3;
-    --muted: #8a8780;
+    --text-2: #d3d0c9;
+    --muted: #a6a39c;
     --hover: rgba(255, 255, 255, 0.05);
     --active: rgba(255, 255, 255, 0.08);
     --accent: #5d87ff;

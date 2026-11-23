@@ -233,7 +233,7 @@
         </div>
         <div class="preview-label">Preview</div>
         <div class="preview">
-          <MailFrame html={sigHtml || "<span style='color:#aaa'>Nothing yet</span>"} allowRemote={true} />
+          <MailFrame html={sigHtml || "<span style='color:#6b6760'>Nothing yet</span>"} allowRemote={true} />
         </div>
       {/if}
     </section>
