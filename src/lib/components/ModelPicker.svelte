@@ -16,6 +16,10 @@
   let active = $state(0);
   let input = $state<HTMLInputElement>();
   let listEl = $state<HTMLDivElement>();
+  let root = $state<HTMLDivElement>();
+  /** Opens upward when there's more room above, and the list fits the room it has. */
+  let up = $state(false);
+  let listMax = $state(320);
 
   const shown = $derived.by(() => {
     const words = query.toLowerCase().split(/\s+/).filter(Boolean);
@@ -27,6 +31,13 @@
   async function toggle() {
     open = !open;
     if (!open) return;
+    if (root) {
+      const r = root.getBoundingClientRect();
+      const below = window.innerHeight - r.bottom - 16;
+      const above = r.top - 16;
+      up = below < 300 && above > below;
+      listMax = Math.max(120, Math.min(320, (up ? above : below) - 60));
+    }
     query = "";
     active = 0;
     queueMicrotask(() => input?.focus());
@@ -65,13 +76,13 @@
 
 <svelte:window onmousedown={(e) => { if (open && !(e.target as Element).closest?.(".picker")) open = false; }} />
 
-<div class="picker">
+<div class="picker" bind:this={root}>
   <button class="current" onclick={toggle}>
     <span class="name">{value?.name ?? "Choose a model"}</span>
     <span class="caret"><Icon name="chevronDown" size={13} stroke={2} /></span>
   </button>
   {#if open}
-    <div class="pop">
+    <div class="pop" class:up>
       <input
         bind:this={input}
         bind:value={query}
@@ -80,7 +91,7 @@
         class="search"
         placeholder="Search models"
         spellcheck="false" />
-      <div class="list scroll" bind:this={listEl}>
+      <div class="list scroll" bind:this={listEl} style:max-height="{listMax}px">
         {#if loading}
           <div class="note"><span class="spinner"></span></div>
         {:else if error}
@@ -105,12 +116,13 @@
 </div>
 
 <style>
-  .picker { position: relative; }
+  /* Never shrinks under the label next to it; the model name truncates instead. */
+  .picker { position: relative; flex: none; max-width: min(260px, 45%); }
   .current {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    max-width: 260px;
+    max-width: 100%;
     height: 30px;
     padding: 0 8px 0 10px;
     border: 1px solid var(--line-strong);
@@ -134,6 +146,7 @@
     box-shadow: var(--shadow);
     animation: rise 0.12s ease-out;
   }
+  .pop.up { top: auto; bottom: calc(100% + 6px); }
   .search {
     width: 100%;
     height: 32px;
@@ -145,7 +158,7 @@
     font-size: 13px;
   }
   .search:focus { border-color: var(--accent); }
-  .list { max-height: 320px; margin-top: 6px; }
+  .list { margin-top: 6px; }
   .opt {
     display: flex;
     flex-direction: column;

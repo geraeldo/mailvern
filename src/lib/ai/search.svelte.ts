@@ -369,7 +369,7 @@ export async function runAiSearch(question: string) {
       if (turn === MAX_TURNS - 1) {
         ctx.messages.push({ role: "user", content: "You are out of steps. Call show_results now with what you have found.", timestamp: Date.now() });
       }
-      const res = await stream(piModel(model), ctx, { apiKey: key, signal: my.signal, maxTokens: 4096 });
+      const res = await stream(piModel(model), ctx, { apiKey: key, signal: my.signal, maxTokens: 16000 });
       let said = "";
       for await (const ev of res) {
         if (!live()) {

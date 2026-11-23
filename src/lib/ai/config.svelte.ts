@@ -154,10 +154,13 @@ export function piModel(m: ModelInfo): Model<"openai-completions"> {
     provider: "openrouter",
     baseUrl: OPENROUTER,
     reasoning: m.reasoning,
+    // Send no reasoning setting, so each model thinks as much as it normally does. Without
+    // this, pi-ai asks for effort "none", which models with mandatory reasoning refuse.
+    thinkingLevelMap: { off: null },
     input: m.vision ? ["text", "image"] : ["text"],
     cost: { input: m.input, output: m.output, cacheRead: 0, cacheWrite: 0 },
     contextWindow: m.contextLength,
-    maxTokens: Math.min(m.maxOutput ?? 16384, 32000),
+    maxTokens: Math.min(m.maxOutput ?? 32000, 32000),
     headers: { "X-Title": "Mailvern" },
     compat: { openRouterRouting: ai.privateOnly ? { data_collection: "deny" } : {} },
   };

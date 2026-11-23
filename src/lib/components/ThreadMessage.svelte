@@ -177,7 +177,7 @@
     letter-spacing: 0.02em;
   }
   .avatar.small { width: 26px; height: 26px; font-size: 10.5px; }
-  .who { flex: 1; min-width: 0; -webkit-user-select: text; user-select: text; }
+  .who { flex: 1; min-width: 80px; -webkit-user-select: text; user-select: text; }
   .line { display: flex; align-items: baseline; gap: 8px; min-width: 0; overflow: hidden; }
   .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: none; max-width: 100%; }
   .addr { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -187,6 +187,10 @@
   .dot { width: 6px; height: 6px; border-radius: 50%; }
   .own { flex: none; display: flex; gap: 0; margin: -4px -6px 0 0; }
   .icon-btn.small { width: 28px; height: 28px; }
+  @container (max-width: 520px) {
+    .meta { gap: 10px; }
+    .own .icon-btn.small { width: 24px; }
+  }
   .btn.small { height: 28px; padding: 0 10px; display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; }
   .files { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
   .file {
@@ -224,8 +228,9 @@
     color: var(--muted);
     font-size: 13px;
   }
-  .images span { flex: 1; }
-  .link { border: 0; background: none; padding: 0; color: var(--accent); font-size: 13px; font-weight: 500; }
+  .images { flex-wrap: wrap; row-gap: 4px; }
+  .images span { flex: 1; white-space: nowrap; }
+  .link { border: 0; background: none; padding: 0; color: var(--accent); font-size: 13px; font-weight: 500; white-space: nowrap; }
   .paper { border-radius: 10px; overflow: hidden; }
   @media (prefers-color-scheme: dark) {
     .paper { padding: 16px 18px; background: #fff; }

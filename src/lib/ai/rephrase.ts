@@ -134,7 +134,7 @@ export async function rephrase(
   const res = await stream(
     piModel(model),
     { systemPrompt: SYSTEM, messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
-    { apiKey: key, signal, maxTokens: 8000 },
+    { apiKey: key, signal, maxTokens: 16000 },
   );
   let out = "";
   for await (const ev of res) {

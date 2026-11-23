@@ -122,6 +122,7 @@
     height: 100%;
     min-width: 0;
     background: var(--panel);
+    container-type: inline-size;
   }
   header {
     height: 52px;
@@ -131,7 +132,7 @@
     justify-content: flex-end;
     padding: 0 14px;
   }
-  .tools { display: flex; align-items: center; gap: 2px; }
+  .tools { display: flex; align-items: center; gap: 2px; min-width: 0; }
   .tools .btn { margin-left: 6px; }
   .sep { width: 1px; height: 18px; background: var(--line); margin: 0 6px; }
   .icon-btn.flagged { color: #e0882a; }
@@ -164,6 +165,14 @@
   .paper { border-radius: 10px; overflow: hidden; }
   @media (prefers-color-scheme: dark) {
     .paper { padding: 16px 18px; background: #fff; }
+  }
+  /* A narrow window: tighter toolbar and margins so nothing spills into the list. */
+  @container (max-width: 520px) {
+    header { padding: 0 8px; }
+    .tools { gap: 0; }
+    .tools .icon-btn { width: 27px; }
+    .sep { margin: 0 3px; }
+    article { padding: 12px 20px 40px; }
   }
   .center { flex: 1; display: grid; place-items: center; color: var(--muted); }
   .bulk { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; font-size: 14px; }
