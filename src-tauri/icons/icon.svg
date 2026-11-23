@@ -1,11 +1,20 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#2F6BFF"/>
-      <stop offset="1" stop-color="#1D4FD8"/>
+      <stop offset="0" stop-color="#F5F8FF"/>
+      <stop offset="1" stop-color="#DDE7FF"/>
     </linearGradient>
   </defs>
   <rect x="100" y="100" width="824" height="824" rx="190" fill="url(#bg)"/>
-  <!-- "Mv": the M's last stroke runs on into the V -->
-  <path d="M252 677 V347 L397 537 L542 347 L642 647 L772 347" fill="none" stroke="#fff" stroke-width="76" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- A paper crane, facing left, folded from flat facets -->
+  <g transform="translate(0 50)" stroke-linejoin="round">
+    <path d="M512 470 L740 260 L640 545 Z" fill="#9DB9FF"/>
+    <path d="M830 380 L704 600 L650 560 Z" fill="#1D4FD8"/>
+    <path d="M320 600 L512 470 L704 600 Z" fill="#2459E0"/>
+    <path d="M320 600 L512 700 L704 600 Z" fill="#183FB0"/>
+    <path d="M470 500 L620 210 L612 575 Z" fill="#5D87FF"/>
+    <path d="M470 500 L620 210 L560 545 Z" fill="#7D9EFF"/>
+    <path d="M320 600 L250 350 L385 565 Z" fill="#1D4FD8"/>
+    <path d="M250 350 L190 405 L272 392 Z" fill="#1D4FD8"/>
+  </g>
 </svg>
