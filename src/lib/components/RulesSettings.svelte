@@ -86,7 +86,7 @@
     if (!text || thinking) return;
     if (!searchReady()) {
       openSettings("ai");
-      toast("Add an OpenRouter key and a search model in Settings › AI to describe rules");
+      toast("Add an OpenRouter key and search model first");
       return;
     }
     thinking = true;
@@ -110,7 +110,7 @@
     <Icon name="sparkle" />
     <input
       class="plain"
-      placeholder="Describe a rule, e.g. “Move GitHub mail about PRs to Dev and mark it read”"
+      placeholder="Describe a rule, e.g. “Archive GitHub mail and mark it read”"
       bind:value={describe}
       disabled={thinking} />
     {#if thinking}
@@ -128,7 +128,7 @@
       <button class="btn sm" onclick={() => openRuleEditor()}><Icon name="plus" size={14} /> New rule</button>
     </div>
     {#if rulesUi.loaded && !rulesUi.rules.length}
-      <p class="empty">No rules yet. A rule acts on new mail as it arrives in your Inbox: it can file it, flag it, forward it or answer it.</p>
+      <p class="empty">No rules yet. Rules file, flag, forward or answer new mail as it arrives.</p>
     {/if}
     <div class="list" use:sortable={{ item: ".rule", onsort: reorder }}>
       {#each rulesUi.rules as r (r.id)}
@@ -147,9 +147,9 @@
             </span>
             <span class="sum">{ruleSummary(r)}</span>
             {#if r.needsApproval}
-              <span class="why">An agent added or changed what this rule sends. Check it, then turn it on.</span>
+              <span class="why">An agent changed what this rule sends. Check it, then turn it on.</span>
             {:else if r.pausedReason}
-              <span class="why">Switched off because {r.pausedReason}. Turn it on to resume.</span>
+              <span class="why">Switched off because {r.pausedReason}.</span>
             {/if}
           </button>
           <Icon name="chevron" size={14} />
@@ -157,7 +157,7 @@
       {/each}
     </div>
     {#if rulesUi.rules.length}
-      <p class="hint">Rules run top to bottom on new Inbox mail while Mailvern is open. Drag to reorder.</p>
+      <p class="hint">Rules run top to bottom while Mailvern is open. Drag to reorder.</p>
     {/if}
   </section>
 

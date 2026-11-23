@@ -29,7 +29,14 @@
       .map((f) => ({ value: f.id, label: f.name })),
   );
   const fieldOptions = FIELDS.map((f) => ({ value: f.value, label: f.label }));
-  const actionOptions = ACTIONS.map((a) => ({ value: a.value, label: a.label }));
+
+  /** Actions that can still go next to the others: each once, and one place to put the message. */
+  function actionChoices(others: RuleAction[]) {
+    const used = new Set(others.map((a) => a.type));
+    const placed = others.some(relocates);
+    return ACTIONS.filter((a) => !used.has(a.value) && !(placed && relocates({ type: a.value } as RuleAction)));
+  }
+  const addable = $derived(actionChoices(r.actions));
 
   const placeholder: Record<string, string> = {
     from: "name or address",
@@ -42,38 +49,53 @@
     listId: "list name or id",
   };
 
+  const blank = (c: RuleCondition) => !isFlag(c.field) && !c.value.trim();
+  /** A condition still waiting for its words: nothing to preview or save yet. */
+  const unfinished = $derived(r.conditions.some(blank) || r.exceptions.some(blank));
+
   // Live preview: how many recent Inbox messages this would catch. Debounced, and only the
-  // newest answer counts.
+  // newest answer counts. Quiet until every condition says what to look for.
   let seq = 0;
   $effect(() => {
     const snapshot = JSON.stringify(r.conditions) + JSON.stringify(r.exceptions) + r.matchAll + r.accountId;
     void snapshot;
     const mine = ++seq;
+    test = null;
+    testError = null;
+    if (!r.conditions.length || unfinished) return;
     const rule = $state.snapshot(r) as Rule;
     const t = setTimeout(async () => {
       try {
         const res = await api.testRule({ ...rule, name: rule.name || "Preview", actions: [{ type: "markRead" }] });
-        if (mine === seq) {
-          test = res;
-          testError = null;
-        }
+        if (mine === seq) test = res;
       } catch (e) {
-        if (mine === seq) {
-          test = null;
-          testError = String(e);
-        }
+        if (mine === seq) testError = String(e);
       }
     }, 350);
     return () => clearTimeout(t);
   });
 
-  function addCondition(list: RuleCondition[]) {
-    list.push({ field: "subject", op: "contains", value: "" });
+  /** Set when a row is added, so its first field takes the cursor. */
+  let focusNew = false;
+  function autofocus(node: HTMLElement) {
+    if (!focusNew) return;
+    focusNew = false;
+    queueMicrotask(() => node.focus());
+  }
+
+  function addCondition(list: RuleCondition[], field: RuleCondition["field"]) {
+    focusNew = !isFlag(field);
+    list.push({ field, op: "contains", value: "" });
   }
 
   function setField(c: RuleCondition, field: RuleCondition["field"]) {
     c.field = field;
     if (isFlag(field)) c.value = "";
+  }
+
+  function addAction(type: RuleAction["type"]) {
+    focusNew = type === "reply";
+    r.actions.push(blankAction(type, r.accountId));
   }
 
   function setAction(i: number, type: RuleAction["type"]) {
@@ -129,8 +151,9 @@
   function autoName(rule: Rule): string {
     const c = rule.conditions[0];
     if (!c) return "All new mail";
-    if (isFlag(c.field)) return FIELDS.find((f) => f.value === c.field)!.label;
-    return `${FIELDS.find((f) => f.value === c.field)!.label}: ${c.value}`.slice(0, 60);
+    const label = FIELDS.find((f) => f.value === c.field)!.label;
+    if (isFlag(c.field) || !c.value.trim()) return label;
+    return `${label}: ${c.value.trim()}`.slice(0, 60);
   }
 
   async function remove() {
@@ -155,14 +178,14 @@
     const t = await api.testRule(rule).catch(() => null);
     const n = t?.count ?? 0;
     if (!n) {
-      toast("Nothing in the Inbox matches this rule");
+      toast("Nothing in the Inbox matches");
       return;
     }
     const where = rule.accountId == null ? "your Inboxes" : "the Inbox";
     if (!(await ask(`Apply “${rule.name}” to ${n} message${n === 1 ? "" : "s"} already in ${where}?`, { title: "Run rule now?", okLabel: "Run" }))) return;
     let includeSending = false;
     if (rule.actions.some(sends)) {
-      includeSending = await ask(`Also send for each of them?\n\n${sendingLines(rule)}\n\nAt most 50 an hour; mailing lists and automatic mail are skipped.`, {
+      includeSending = await ask(`Also send for each of them?\n\n${sendingLines(rule)}\n\nAt most 50 an hour. Mailing lists and automatic mail are skipped.`, {
         title: `Send for ${n} existing message${n === 1 ? "" : "s"}?`,
         kind: "warning",
         okLabel: "Send Too",
@@ -180,16 +203,20 @@
     }
     busy = false;
   }
+
+  const where = $derived(r.accountId == null ? "your Inboxes" : "the Inbox");
+  /** "Stop here" only means something when other rules come after. */
+  const showStop = $derived(r.stop || rulesUi.rules.some((x) => x.id !== r.id));
 </script>
 
 <div class="editor">
   <div class="top">
     <button class="icon-btn" title="Back to rules" onclick={() => (rulesUi.draft = null)}><Icon name="chevron" /></button>
-    <input class="field name" placeholder="Rule name" bind:value={r.name} aria-label="Rule name" />
+    <input class="field name" placeholder={r.conditions.length ? autoName(r) : "Rule name"} bind:value={r.name} aria-label="Rule name" />
   </div>
 
   {#if r.needsApproval}
-    <p class="banner">An agent set up what this rule sends. Check the actions below; saving here makes it yours.</p>
+    <p class="banner">An agent set up what this rule sends. Check the actions, then save.</p>
   {:else if r.pausedReason}
     <p class="banner">Switched off because {r.pausedReason}.</p>
   {/if}
@@ -210,26 +237,39 @@
     {#each r.conditions as c, i (i)}
       {@render condition(c, () => r.conditions.splice(i, 1))}
     {/each}
-    {#if !r.conditions.length}<p class="hint">No conditions: the rule acts on every new message.</p>{/if}
-    <button class="btn ghost sm add" onclick={() => addCondition(r.conditions)}><Icon name="plus" size={14} /> Condition</button>
+    {#if !r.conditions.length && r.actions.length}<p class="hint">No conditions, so it acts on every new message.</p>{/if}
+    <div class="adds">
+      <Select prompt="Condition" label="Add a condition" value={null} options={fieldOptions} onchange={(f) => addCondition(r.conditions, f!)} />
+      {#if r.conditions.length && !r.exceptions.length}
+        <Select prompt="Exception" label="Add an exception" value={null} options={fieldOptions} onchange={(f) => addCondition(r.exceptions, f!)} />
+      {/if}
+    </div>
   </section>
 
-  <section>
-    <div class="lead head">Except when any of these holds</div>
-    {#each r.exceptions as c, i (i)}
-      {@render condition(c, () => r.exceptions.splice(i, 1))}
-    {/each}
-    <button class="btn ghost sm add" onclick={() => addCondition(r.exceptions)}><Icon name="plus" size={14} /> Exception</button>
-  </section>
+  {#if r.exceptions.length}
+    <section>
+      <div class="lead head">Except when any of these holds</div>
+      {#each r.exceptions as c, i (i)}
+        {@render condition(c, () => r.exceptions.splice(i, 1))}
+      {/each}
+      <div class="adds">
+        <Select prompt="Exception" label="Add an exception" value={null} options={fieldOptions} onchange={(f) => addCondition(r.exceptions, f!)} />
+      </div>
+    </section>
+  {/if}
 
   <section>
     <div class="lead head">Then</div>
     {#each r.actions as a, i (i)}
       <div class="row">
-        <Select label="Action" value={a.type} options={actionOptions} onchange={(v) => setAction(i, v)} />
+        <Select
+          label="Action"
+          value={a.type}
+          options={[ACTIONS.find((x) => x.value === a.type)!, ...actionChoices(r.actions.filter((_, j) => j !== i))]}
+          onchange={(v) => setAction(i, v)} />
         {#if a.type === "move"}
           {#if r.accountId == null}
-            <span class="note">Choose an account above to pick a folder.</span>
+            <span class="note">Pick an account above to choose a folder</span>
           {:else}
             <Select label="Folder" value={a.folderId} options={folderOptions} onchange={(v) => (a.folderId = v)} />
             <span class="grow"></span>
@@ -247,8 +287,8 @@
       {#if a.type === "reply"}
         <div class="reply">
           <input class="field" placeholder="Subject (default: Re: their subject)" value={a.subject ?? ""} oninput={(e) => (a.subject = e.currentTarget.value || null)} />
-          <textarea class="field" rows="4" placeholder="Your reply" bind:value={a.text}></textarea>
-          <p class="hint">Sent once per sender every 4 days, never to mailing lists, automatic mail or yourself.</p>
+          <textarea class="field" rows="4" placeholder="Your reply" bind:value={a.text} use:autofocus></textarea>
+          <p class="hint">Once per sender every 4 days. Never to mailing lists, automatic mail or you.</p>
         </div>
       {/if}
       {#if a.type === "forward"}
@@ -256,35 +296,41 @@
       {/if}
     {/each}
     {#if r.actions.filter(relocates).length > 1}
-      <p class="err">A message can go to one place only: keep one of Move, Archive, Delete, Junk and Snooze.</p>
+      <p class="err">Keep only one of Move, Archive, Delete, Junk and Snooze.</p>
     {/if}
-    <button class="btn ghost sm add" onclick={() => r.actions.push(blankAction("flag", r.accountId))}><Icon name="plus" size={14} /> Action</button>
-    <label class="check">
-      <input type="checkbox" bind:checked={r.stop} />
-      <span>Stop here: don't apply later rules to mail this one matches</span>
-    </label>
+    {#if addable.length}
+      <div class="adds">
+        <Select prompt="Action" label="Add an action" value={null} options={addable} onchange={(t) => addAction(t!)} />
+      </div>
+    {/if}
+    {#if showStop}
+      <label class="check">
+        <input type="checkbox" bind:checked={r.stop} />
+        <span>Don't run later rules on mail this one matches</span>
+      </label>
+    {/if}
   </section>
 
-  <div class="preview">
-    {#if testError}
-      <span class="err">{testError}</span>
-    {:else if test}
-      <span>
-        {#if test.count}Matches <b>{test.count}</b> of the latest {test.scanned} messages in {r.accountId == null ? "your Inboxes" : "the Inbox"}.
-        {:else}Nothing among the latest {test.scanned} messages in {r.accountId == null ? "your Inboxes" : "the Inbox"} matches.{/if}
-        {#if test.withoutBody}{test.withoutBody} couldn't be checked: their body isn't downloaded yet.{/if}
-      </span>
-      {#if test.sample.length}
-        <ul>
-          {#each test.sample.slice(0, 4) as m (m.id)}
-            <li><span class="from">{m.fromName || m.fromAddr}</span> {m.subject || "(no subject)"}</li>
-          {/each}
-        </ul>
+  {#if test || testError}
+    <div class="preview">
+      {#if testError}
+        <span class="err">{testError}</span>
+      {:else if test}
+        <span>
+          {#if test.count}Matches <b>{test.count}</b> of the last {test.scanned} messages in {where}.
+          {:else}No match in the last {test.scanned} messages in {where}.{/if}
+          {#if test.withoutBody}{test.withoutBody} not downloaded yet.{/if}
+        </span>
+        {#if test.sample.length}
+          <ul>
+            {#each test.sample.slice(0, 4) as m (m.id)}
+              <li><span class="from">{m.fromName || m.fromAddr}</span> {m.subject || "(no subject)"}</li>
+            {/each}
+          </ul>
+        {/if}
       {/if}
-    {:else}
-      <span class="hint">Checking your Inbox…</span>
-    {/if}
-  </div>
+    </div>
+  {/if}
 
   {#if error}<p class="err">{error}</p>{/if}
 
@@ -295,7 +341,7 @@
     {/if}
     <span class="grow"></span>
     <button class="btn" disabled={busy} onclick={() => (rulesUi.draft = null)}>Cancel</button>
-    <button class="btn primary" disabled={busy} onclick={() => save()}>Save</button>
+    <button class="btn primary" disabled={busy || !r.actions.length} title={r.actions.length ? "" : "Add an action first"} onclick={() => save()}>Save</button>
   </div>
 </div>
 
@@ -308,7 +354,8 @@
         class="field grow"
         class:mono={c.op === "regex"}
         placeholder={c.op === "regex" ? "pattern, e.g. invoice|receipt" : placeholder[c.field]}
-        bind:value={c.value} />
+        bind:value={c.value}
+        use:autofocus />
     {:else}
       <span class="grow"></span>
     {/if}
@@ -329,7 +376,7 @@
   .row .field { height: 32px; }
   .grow { flex: 1; min-width: 0; }
   .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px; }
-  .add { align-self: flex-start; height: 26px; padding: 0 8px; font-size: 12.5px; color: var(--text-2); }
+  .adds { display: flex; gap: 4px; margin-left: -8px; }
   .reply { display: flex; flex-direction: column; gap: 6px; margin-left: 2px; }
   .reply .field { height: 32px; }
   .reply textarea.field { height: auto; padding: 8px 11px; resize: vertical; }

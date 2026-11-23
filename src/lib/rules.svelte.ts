@@ -46,7 +46,7 @@ export const SNOOZES: { value: SnoozeUntil; label: string }[] = [
   { value: "nextWeek", label: "until Monday 8:00" },
 ];
 
-export const ACTIONS: { value: RuleAction["type"]; label: string }[] = [
+export const ACTIONS: { value: RuleAction["type"]; label: string; detail?: string }[] = [
   { value: "move", label: "Move to folder" },
   { value: "archive", label: "Archive" },
   { value: "trash", label: "Delete" },
@@ -55,8 +55,8 @@ export const ACTIONS: { value: RuleAction["type"]; label: string }[] = [
   { value: "markRead", label: "Mark as read" },
   { value: "flag", label: "Flag" },
   { value: "skipNotification", label: "Don't notify" },
-  { value: "forward", label: "Forward to" },
-  { value: "reply", label: "Auto-reply" },
+  { value: "forward", label: "Forward to", detail: "Sends mail as you" },
+  { value: "reply", label: "Auto-reply", detail: "Sends mail as you" },
 ];
 
 export const isFlag = (f: RuleField) => FIELDS.find((x) => x.value === f)?.flag ?? false;
@@ -70,9 +70,9 @@ export function blankRule(): Rule {
     enabled: true,
     accountId: null,
     matchAll: true,
-    conditions: [{ field: "from", op: "contains", value: "" }],
+    conditions: [],
     exceptions: [],
-    actions: [{ type: "archive" }],
+    actions: [],
     stop: false,
     origin: "user",
     needsApproval: false,
