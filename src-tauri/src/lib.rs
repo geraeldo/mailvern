@@ -533,6 +533,12 @@ pub fn run() {
             };
             app.manage(engine.clone());
             app.manage(agents::Agents::default());
+            // Apply the saved appearance before the page loads, so the window doesn't flash the system theme.
+            match engine.setting("theme").ok().flatten().as_deref() {
+                Some("light") => app.set_theme(Some(tauri::Theme::Light)),
+                Some("dark") => app.set_theme(Some(tauri::Theme::Dark)),
+                _ => {}
+            }
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {

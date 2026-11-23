@@ -14,6 +14,7 @@
   import { api, type MailEvent } from "./lib/api";
   import { allowNativeMenu } from "./lib/menus";
   import { refreshBadge, loadBadgeMode } from "./lib/badge.svelte";
+  import { loadTheme } from "./lib/theme.svelte";
   import { loadAi } from "./lib/ai/config.svelte";
   import {
     ui, loadAccounts, loadFolders, loadList, loadTrusted, loadPrefs, loadOutbox, refreshThread, move, compose,
@@ -42,6 +43,7 @@
   }
 
   onMount(() => {
+    loadTheme();
     (async () => {
       await loadAccounts();
       await loadPrefs();

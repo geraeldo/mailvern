@@ -1,10 +1,22 @@
 <script lang="ts">
   import { BADGE_MODES, badge, setBadgeMode } from "../badge.svelte";
   import { ui, setUndoSend, setThreaded, setSenderIcons } from "../state.svelte";
+  import { THEME_MODES, theme, setThemeMode } from "../theme.svelte";
   import Select from "./Select.svelte";
 
   const UNDO = [0, 5, 10, 20, 30];
 </script>
+
+<div class="group">
+  <div class="gname">Appearance</div>
+  <div class="row">
+    <span class="text">
+      <span class="label">Theme</span>
+      <span class="detail">System follows your Mac's light or dark setting</span>
+    </span>
+    <Select label="Theme" value={theme.mode} options={THEME_MODES} onchange={setThemeMode} />
+  </div>
+</div>
 
 <div class="group">
   <div class="gname">Messages</div>
