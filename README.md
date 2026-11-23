@@ -42,6 +42,7 @@ Append a new entry to `MIGRATIONS` in `crates/mail-core/src/db.rs`, for example 
 - The newest 500 headers per folder sync first. Recent bodies download in the background.
 - Scrolling past the end of the local cache fetches the next 500 older headers from the server.
 - Read, flag, archive and delete update locally first, then go to the server.
+- A folder list or message list that the server cut off (a dropped connection, a refusal) is an error, never "the rest was deleted". The sync deletes local mail only on a complete answer.
 - Search shows local results at once, then asks each server (IMAP SEARCH) and merges in mail that was never downloaded. Those hits are stored as "sparse" rows outside the synced window.
 
 ## Writing and sending

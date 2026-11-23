@@ -242,7 +242,7 @@ impl Worker {
             return Ok(());
         }
         let s = self.ensure().await?;
-        s.select(path).await?;
+        imap::select(s, path).await?;
         self.selected = Some(path.to_string());
         Ok(())
     }
@@ -550,7 +550,7 @@ impl Worker {
 
     async fn sync_folder(&mut self, folder_id: i64, path: &str, role: Option<&str>) -> Result<()> {
         let s = self.ensure().await?;
-        let mb = s.select(path).await?;
+        let mb = imap::select(s, path).await?;
         self.selected = Some(path.to_string());
         let uv = mb.uid_validity.unwrap_or(0);
         let mut changed = false;
@@ -596,28 +596,15 @@ impl Worker {
         let (min_uid, _) = self.db.uid_range(folder_id)?;
         if min_uid > 0 {
             let s = self.session.as_mut().unwrap();
-            let flags: Vec<Fetch> = s.uid_fetch(format!("{min_uid}:*"), "(UID FLAGS)").await?.try_collect().await?;
-            let flags: Vec<(u32, bool, bool)> = flags
-                .iter()
-                .filter_map(|f| {
-                    let (seen, flagged) = imap::flags_of(f);
-                    Some((f.uid?, seen, flagged))
-                })
-                .collect();
+            // The folder has mail, so this answer always holds at least its newest message.
+            let flags = imap::fetch_flags(s, format!("{min_uid}:*"), true).await?;
             changed |= self.db.reconcile_flags(folder_id, min_uid, &flags)?;
         }
         // Search hits below the window: check just those.
         let sparse = self.db.sparse_uids_below(folder_id, if min_uid > 0 { min_uid } else { u32::MAX })?;
         if !sparse.is_empty() {
             let s = self.session.as_mut().unwrap();
-            let flags: Vec<Fetch> = s.uid_fetch(imap::uid_set(&sparse), "(UID FLAGS)").await?.try_collect().await?;
-            let flags: Vec<(u32, bool, bool)> = flags
-                .iter()
-                .filter_map(|f| {
-                    let (seen, flagged) = imap::flags_of(f);
-                    Some((f.uid?, seen, flagged))
-                })
-                .collect();
+            let flags = imap::fetch_flags(s, imap::uid_set(&sparse), false).await?;
             changed |= self.db.reconcile_uids(folder_id, &sparse, &flags)?;
         }
         if changed {
