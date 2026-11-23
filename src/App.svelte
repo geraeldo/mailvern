@@ -19,9 +19,10 @@
     ui, loadAccounts, loadFolders, loadList, loadTrusted, loadPrefs, loadOutbox, refreshThread, move, compose,
     archiveSelected, trashSelected, toggleJunk, toggleSeen, toggleFlag, accountById, openSettings, openAccountSettings,
     moveSelected, snoozeSelected, unsnoozeSelected, selectAll, extendSelection, clearSelection, snoozeRows, moveRows,
-    selectedRows, roleOf, toast, undoToast, copyThread,
+    selectedRows, roleOf, toast, undoToast, copyThread, openMessage,
   } from "./lib/state.svelte";
   import { snoozePresets } from "./lib/when";
+  import { exitAi } from "./lib/ai/search.svelte";
   import { keymap, comboOf, match, canFireWhileTyping, usesModifier, loadShortcuts, type Action } from "./lib/shortcuts.svelte";
 
   let list: MessageList;
@@ -111,6 +112,13 @@
     if (ui.compose || ui.settings || ui.accountSettings || ui.picker) return;
     if (combo === "escape" && !typing(e) && clearSelection()) {
       e.preventDefault();
+      return;
+    }
+    // AI answer: Escape goes back from a source to the answer, then out of the answer.
+    if (combo === "escape" && !typing(e) && ui.ai) {
+      e.preventDefault();
+      if (ui.selectedId != null) openMessage(null);
+      else exitAi();
       return;
     }
     const action = match(combo);

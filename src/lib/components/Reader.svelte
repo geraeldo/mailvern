@@ -2,9 +2,11 @@
   import Icon from "./Icon.svelte";
   import MailFrame from "./MailFrame.svelte";
   import ThreadMessage from "./ThreadMessage.svelte";
+  import AiAnswer from "./AiAnswer.svelte";
+  import { exitAi } from "../ai/search.svelte";
   import {
     ui, compose, archiveSelected, trashSelected, toggleJunk, toggleSeen, toggleFlag, selectedRows, roleOf, clearSelection,
-    snoozeSelected, unsnoozeSelected, moveSelected, accountById, editQueued, deleteQueued, sendQueuedNow, copyThread,
+    snoozeSelected, unsnoozeSelected, moveSelected, accountById, editQueued, deleteQueued, sendQueuedNow, copyThread, openMessage,
   } from "../state.svelte";
   import { hint } from "../shortcuts.svelte";
   import { whenLabel } from "../when";
@@ -21,12 +23,21 @@
   const oneAccount = $derived(new Set(rows.map((r) => r.accountId)).size === 1);
   const showTools = $derived(ui.view.kind !== "outbox" && (multi || !!d));
   /** Scroll to the first unread message of a longer conversation, else stay at the top. */
+  /** AI search: its answer fills the reader until a source is opened. */
+  const answer = $derived(ui.ai && ui.view.kind !== "outbox" && ui.selectedId == null && !multi);
   const focusId = $derived(ui.thread.length > 3 ? (ui.thread.find((m) => ui.expandIds.includes(m.id) && !m.seen)?.id ?? null) : null);
 </script>
 
 <section class="reader">
   <header data-tauri-drag-region>
-    {#if outboxItem}
+    {#if ui.ai && !answer}
+      <button class="back" title="Back to the answer  Esc" onclick={() => (multi ? clearSelection() : openMessage(null))}>
+        <span class="chev"><Icon name="chevron" size={13} stroke={2.2} /></span> Answer
+      </button>
+    {/if}
+    {#if answer}
+      <button class="icon-btn close-ai" title="Close answer  Esc" onclick={exitAi}><Icon name="x" size={16} /></button>
+    {:else if outboxItem}
       <div class="tools">
         <button class="btn" onclick={() => sendQueuedNow(outboxItem.id)}>Send now</button>
         <button class="btn" onclick={() => editQueued(outboxItem.id)}>Edit</button>
@@ -91,6 +102,8 @@
         </div>
       </article>
     </div>
+  {:else if answer && ui.ai}
+    <AiAnswer s={ui.ai} />
   {:else if multi}
     <div class="center bulk">
       <div class="big">{ui.selectedIds.length}</div>
@@ -137,6 +150,22 @@
     padding: 0 14px;
   }
   .tools { display: flex; align-items: center; gap: 2px; min-width: 0; }
+  .back {
+    margin-right: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    height: 28px;
+    padding: 0 10px 0 4px;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--accent);
+    font-size: 13px;
+    font-weight: 500;
+  }
+  .back:hover { background: var(--accent-soft); }
+  .chev { display: grid; transform: rotate(180deg); }
   .tools .btn { margin-left: 6px; }
   .sep { width: 1px; height: 18px; background: var(--line); margin: 0 6px; }
   .icon-btn.flagged { color: #e0882a; }

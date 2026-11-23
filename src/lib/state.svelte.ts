@@ -14,17 +14,33 @@ export type SettingsSection = "general" | "ai" | "agents" | "shortcuts";
 export type SyncStatus = { state: "syncing" | "idle" | "error"; message: string | null };
 /** One thing AI search did, shown while it works. */
 export type AiStep = { kind: "search" | "read" | "attachment" | "count" | "thread" | "folders" | "note"; text: string; done: boolean; error?: boolean };
-/** An AI search: the question, what it did, its answer and the messages it picked. */
-export type AiSearch = {
+/** A labelled fact in an AI answer ("Amount": "Rp 1.500.000 [1]"). */
+export type AiFact = { label: string; value: string };
+/** One question and its answer. Citations [n] in the text refer to `sources[n - 1]`. */
+export type AiTurn = {
   question: string;
   running: boolean;
   steps: AiStep[];
+  /** The one-line direct answer. */
   answer: string;
-  ids: number[];
+  /** More explanation, with citations; may hold "- " list lines. */
+  details: string;
+  facts: AiFact[];
+  /** Message ids. While running: what it has read so far; when done: the cited sources. */
+  sources: number[];
   error: string | null;
   cost: number;
-  model: string;
 };
+/** An AI search: a question and its follow-ups. */
+export type AiSearch = { turns: AiTurn[]; model: string };
+
+/** The turn whose sources the list shows: the newest one that has any. */
+export function aiSourceTurn(a: AiSearch | null): AiTurn | null {
+  if (!a) return null;
+  for (let i = a.turns.length - 1; i >= 0; i--) if (a.turns[i].sources.length) return a.turns[i];
+  return null;
+}
+export const aiRunning = (a: AiSearch | null) => !!a?.turns.some((t) => t.running);
 export type Picker = { kind: "snooze"; rows: Summary[] } | { kind: "move"; rows: Summary[]; accountId: number };
 
 const PAGE = 200;
@@ -263,9 +279,15 @@ export async function loadList(reset = true) {
   let rows: Summary[];
   if (ui.ai) {
     if (!reset) return;
-    // The messages AI search picked, in its order.
-    const ids = ui.ai.ids;
+    // The answer's sources, in citation order, each with the size of its conversation.
+    const ids = aiSourceTurn(ui.ai)?.sources ?? [];
     rows = ids.length ? await api.summaries(ids) : [];
+    rows = await Promise.all(
+      rows.map(async (r) => {
+        const thread = await api.thread(r.id).catch(() => []);
+        return { ...r, count: Math.max(1, thread.length) };
+      }),
+    );
     if (my !== listSeq) return;
     ui.list = rows;
     ui.hasMore = false;
@@ -360,6 +382,11 @@ export function showAi(a: AiSearch | null) {
   clearTimeout(serverTimer);
   clearOpen();
   loadList(true);
+}
+
+/** Reloads the AI sources in the list, leaving any open message open. */
+export function refreshAi() {
+  if (ui.ai) loadList(true);
 }
 
 let serverTimer: ReturnType<typeof setTimeout> | undefined;

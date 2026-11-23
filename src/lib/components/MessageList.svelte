@@ -8,9 +8,9 @@
   import { shortDate, displayName } from "../format";
   import { whenLabel } from "../when";
   import { api } from "../api";
-  import AiPanel from "./AiPanel.svelte";
   import { ai, searchReady } from "../ai/config.svelte";
   import { runAiSearch, stopAiSearch } from "../ai/search.svelte";
+  import { aiSourceTurn, aiRunning } from "../state.svelte";
 
   const ROW = 76;
   const OVERSCAN = 8;
@@ -19,8 +19,9 @@
   let scrollTop = $state(0);
   let height = $state(600);
   let searchEl = $state<HTMLInputElement>();
-  let searchOpen = $state(false);
-  let draft = $state("");
+  // Picks up a search already in progress (an AI answer, or words typed before a reload).
+  let searchOpen = $state(!!ui.query || !!ui.ai);
+  let draft = $state(ui.query);
   let loadingMore = false;
 
   const start = $derived(Math.max(0, Math.floor(scrollTop / ROW) - OVERSCAN));
@@ -99,10 +100,10 @@
     runAiSearch(q);
   }
 
-  function closeAi() {
-    stopAiSearch();
-    setQuery(draft);
-  }
+  /** Sources are numbered to match the answer's citations, once the answer is in. */
+  const sourceTurn = $derived(aiSourceTurn(ui.ai));
+  const numbered = $derived(!!sourceTurn && !sourceTurn.running);
+  const running = $derived(aiRunning(ui.ai));
 
   function closeSearch() {
     stopAiSearch();
@@ -123,7 +124,8 @@
           oninput={onInput}
           onkeydown={(e) => {
             if (e.key === "Escape") closeSearch();
-            if (e.key === "Enter" && e.metaKey) {
+            // ⌘↩, or a question (ending in "?"), asks AI.
+            if (e.key === "Enter" && (e.metaKey || (ai.hasKey && draft.trim().endsWith("?")))) {
               e.preventDefault();
               askAi();
               return;
@@ -143,7 +145,7 @@
       <button class="icon-btn" title={hint("Search", "search")} onclick={focusSearch}><Icon name="search" /></button>
     {/if}
   </header>
-  {#if searchOpen}
+  {#if searchOpen && !ui.ai}
     <div class="scopes" role="radiogroup" aria-label="Search in">
       {#each searchScopes() as s (scopeKey(s))}
         {@const on = scopeKey(s) === scopeKey(ui.searchScope)}
@@ -155,7 +157,7 @@
     </div>
   {/if}
 
-  {#if searchOpen && draft.trim() && !(ui.ai && ui.ai.question === draft.trim())}
+  {#if searchOpen && draft.trim() && !ui.ai}
     <button class="ask" onclick={askAi}>
       <Icon name="sparkle" size={14} />
       <span class="ask-text">{ai.hasKey ? "Ask AI" : "Set up AI search"}<span class="ask-q">{ai.hasKey ? ` “${draft.trim()}”` : ""}</span></span>
@@ -163,7 +165,14 @@
     </button>
   {/if}
   {#if ui.ai}
-    <AiPanel s={ui.ai} onclose={closeAi} />
+    <div class="sources-head">
+      {#if running && !ui.list.length}
+        <span class="spinner small"></span> Finding sources…
+      {:else}
+        <Icon name="sparkle" size={13} />
+        {ui.list.length} source{ui.list.length === 1 ? "" : "s"}{running ? " so far" : ""}
+      {/if}
+    </div>
   {/if}
 
   {#if ui.view.kind === "outbox"}
@@ -186,10 +195,10 @@
     </div>
   {:else}
   <div class="scroll body" bind:this={scroller} bind:clientHeight={height} onscroll={onScroll}>
-    {#if ui.listReady && !ui.list.length && !ui.searchingServer && !ui.ai?.running}
+    {#if ui.listReady && !ui.list.length && !ui.searchingServer && !running}
       <div class="empty">
         {#if ui.ai}
-          No messages
+          No sources
         {:else if ui.query}
           No results
         {:else if !ui.accounts.length}
@@ -215,8 +224,8 @@
           onclick={(e) => clickRow(m, e)}
           ondblclick={() => onDouble(m.id)}
           oncontextmenu={(e) => { e.preventDefault(); messageMenu(m); }}>
-          <span class="mark">
-            {#if !m.seen}<span class="unread-dot"></span>{/if}
+          <span class="mark" class:num={ui.ai && numbered}>
+            {#if ui.ai && numbered}<span class="n">{start + i + 1}</span>{:else if !m.seen}<span class="unread-dot"></span>{/if}
           </span>
           <span class="main">
             <span class="line1">
@@ -382,6 +391,32 @@
   .row.selected::after { opacity: 0; }
   .mark { width: 14px; flex: none; display: flex; justify-content: center; padding-top: 6px; }
   .unread-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+  .mark.num { width: 26px; padding-top: 2px; }
+  .n {
+    min-width: 17px;
+    height: 17px;
+    padding: 0 4px;
+    border-radius: 5px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-size: 11px;
+    font-weight: 650;
+    line-height: 17px;
+    text-align: center;
+  }
+  .sources-head {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    height: 30px;
+    padding: 0 20px 8px;
+    border-bottom: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .sources-head :global(svg) { color: var(--accent); }
+  .spinner.small { width: 11px; height: 11px; border-width: 1.5px; }
   .main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
   .line1 { display: flex; align-items: center; gap: 6px; }
   .from {

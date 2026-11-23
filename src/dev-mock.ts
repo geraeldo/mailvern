@@ -134,17 +134,35 @@ function mockOpenRouter(url: string, init?: RequestInit): Response | null {
     const short = user.includes("shorter");
     return sse([...textChunks(short ? "<div>Hi Maya,</div><div><br></div><div>The agenda looks good. Could we add 15 minutes for the offsite budget?</div>" : "<div>Hi Maya,</div><div><br></div><div>Thanks for sharing the agenda. It looks great to me. Could we add 15 minutes to discuss the offsite budget?</div><div><br></div><div>See you Thursday.</div>"), end("stop")]);
   }
-  const results = msgs.filter((m) => m.role === "tool");
+  // Script: search, read the conversation it found, then answer. Follow-ups answer at once.
+  const lastUser = msgs.map((m) => m.role).lastIndexOf("user");
+  const results = msgs.slice(lastUser + 1).filter((m) => m.role === "tool");
+  const followUp = msgs.filter((m) => m.role === "user").length > 1;
+  if (followUp && results.length === 0) {
+    return sse([...toolChunks([{ name: "show_results", args: { answer: "They offered to connect you with their support team for pricing and a technical roadmap instead [1].", sources: [66] } }]), end("tool_calls")]);
+  }
   if (results.length === 0) {
-    return sse([...textChunks("Looking for Stripe invoices."), ...toolChunks([{ name: "search_mail", args: { text: "invoice", from: "stripe" } }]), end("tool_calls")]);
+    return sse([...toolChunks([{ name: "search_mail", args: { text: "agenda" } }, { name: "search_mail", args: { from: "maya" } }]), end("tool_calls")]);
   }
-  if (results.length === 1) {
-    const id = Number(/#(\d+)/.exec(textOf(results[0].content))?.[1] ?? 2);
-    (window as any).__aiPick = id;
-    return sse([...toolChunks([{ name: "read_message", args: { id } }, { name: "read_attachment", args: { messageId: id, index: 0 } }]), end("tool_calls")]);
+  if (results.length === 2) {
+    return sse([...toolChunks([{ name: "read_conversation", args: { id: 66 } }]), end("tool_calls")]);
   }
-  const id = (window as any).__aiPick ?? 2;
-  return sse([...toolChunks([{ name: "show_results", args: { messageIds: [id], answer: `Your latest Stripe invoice is #2041 for November, **due within 14 days** [#${id}].\n- Amount: $1,240.00\n- Paid from: Acme card` } }]), end("tool_calls")]);
+  return sse([
+    ...toolChunks([{
+      name: "show_results",
+      args: {
+        answer: "Maya added the offsite budget to Thursday's agenda, right after hiring [1].",
+        facts: [
+          { label: "Meeting", value: "Thursday, Q4 planning [2]" },
+          { label: "Topics", value: "Hiring plan, roadmap, offsite logistics [2]" },
+          { label: "Added", value: "15 minutes for the offsite budget [1][3]" },
+        ],
+        details: "- You asked for the budget slot on the 23rd [3].\n- Maya confirmed it the same day [1].",
+        sources: [66, 1, 65],
+      },
+    }]),
+    end("tool_calls"),
+  ]);
 }
 
 function matches(m: M, q: any): boolean {
