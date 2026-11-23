@@ -1133,6 +1133,20 @@ impl Db {
         Ok(c.execute("DELETE FROM messages WHERE folder_id = ? AND message_id = ?", params![folder_id, message_id])?)
     }
 
+    /// The newest local copy of a draft, by Message-ID, in any account's Drafts folder:
+    /// (message id, account id).
+    pub fn find_draft(&self, message_id: &str) -> Result<Option<(i64, i64)>> {
+        let c = self.c();
+        Ok(c
+            .query_row(
+                "SELECT m.id, m.account_id FROM messages m JOIN folders f ON f.id = m.folder_id
+                 WHERE f.role = 'drafts' AND m.message_id = ? ORDER BY m.id DESC LIMIT 1",
+                [message_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
     pub fn has_message_id(&self, folder_id: i64, message_id: &str) -> Result<bool> {
         let c = self.c();
         let n: i64 = c.query_row(

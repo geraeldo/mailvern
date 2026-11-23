@@ -2,11 +2,11 @@
 //! The only thing an agent can change is the Drafts folder: nothing here sends, moves,
 //! deletes or marks mail, because mail is untrusted text and agents can run commands.
 
-use crate::draft::{compose, DraftArgs};
+use crate::draft::{compose, edit, DraftArgs, EditArgs};
 use crate::fmt::{addr_list, clip, kb, row, stamp, subject, to_unix, who, Names};
 use crate::Ctx;
 use anyhow::{anyhow, bail, Result};
-use mail_core::model::{AttachmentContent, MailQuery};
+use mail_core::model::{Account, AttachmentContent, MailQuery, Outgoing};
 use mail_core::text::body_text;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -137,7 +137,7 @@ pub fn list() -> Value {
         {
             "name": "create_draft",
             "title": "Save a draft",
-            "description": "Save a draft in the account's Drafts folder for the user to review, edit and send in Mailvern. Nothing is sent: you can't send mail. For a reply, pass replyTo; the recipients, subject and quoted original are then filled in. The account's signature is added for you, so don't write one. To change a draft you made earlier, call this again with its draftId and the complete new content.",
+            "description": "Save a draft in the account's Drafts folder for the user to review, edit and send in Mailvern. Nothing is sent: you can't send mail. For a reply, pass replyTo; the recipients, subject and quoted original are then filled in. The account's signature is added for you, so don't write one. To change a draft later, use edit_draft with the draftId this returns.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -150,12 +150,32 @@ pub fn list() -> Value {
                     "replyTo": { "type": "integer", "description": "Id of the message this replies to." },
                     "replyAll": { "type": "boolean", "description": "With replyTo: also address everyone else on the original message." },
                     "accountId": { "type": "integer", "description": "The account to write from (ids from list_folders). Defaults to the account that received the replied-to message, else the first account." },
-                    "draftId": { "type": "string", "description": "Replace this draft (the draftId an earlier create_draft returned) instead of adding another." },
                 },
                 "required": ["body"],
                 "additionalProperties": false,
             },
             "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false },
+        },
+        {
+            "name": "edit_draft",
+            "title": "Change a draft",
+            "description": "Change a draft in Drafts: one you saved or one the user wrote. Get its draftId from create_draft or from read_message on the draft (search_mail with folder 'drafts' finds drafts). Everything you leave out stays as it is. A new body replaces the text above the quoted original, signature included; the quote, the reply threading and the account's signature are kept for you. Nothing is sent. If the user has the draft open in Mailvern, their next edit there can replace yours, so tell them what you changed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "draftId": { "type": "string", "description": "The draft to change." },
+                    "body": { "type": "string", "description": "The new message as plain text, replacing what is written above the quoted original. Separate paragraphs with a blank line. Don't add a signature. Leave out to keep the text." },
+                    "to": { "type": "array", "items": { "type": "string" }, "description": "The new recipients, replacing the current ones. Leave out to keep them." },
+                    "cc": { "type": "array", "items": { "type": "string" } },
+                    "bcc": { "type": "array", "items": { "type": "string" } },
+                    "subject": { "type": "string" },
+                    "attachments": { "type": "array", "items": { "type": "string" }, "description": "Absolute paths of files to add. The draft's current attachments stay unless listed in removeAttachments. Hidden files are refused. 25 MB in all." },
+                    "removeAttachments": { "type": "array", "items": { "type": "string" }, "description": "File names of current attachments to remove, as read_message lists them." },
+                },
+                "required": ["draftId"],
+                "additionalProperties": false,
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false },
         },
     ])
 }
@@ -239,6 +259,7 @@ pub async fn call(ctx: &Ctx, name: &str, args: Value) -> Option<Out> {
         "read_attachment" => read_attachment(ctx, args).await,
         "save_attachment" => save_attachment(ctx, args).await,
         "create_draft" => create_draft(ctx, args).await,
+        "edit_draft" => edit_draft(ctx, args).await,
         _ => return None,
     };
     Some(result.unwrap_or_else(|e| Out { is_error: true, ..text(format!("Error: {e:#}")) }))
@@ -321,6 +342,10 @@ async fn read_message(ctx: &Ctx, args: Value) -> Result<Out> {
     }
     if s.count > 1 || s.thread_id.is_some() {
         lines.push("Conversation: use read_conversation with this id to see the whole thread.".into());
+    }
+    let in_drafts = names.folders.iter().any(|f| f.id == s.folder_id && f.role.as_deref() == Some("drafts"));
+    if let Some(id) = d.message_id.as_deref().filter(|_| in_drafts) {
+        lines.push(format!("Draft: change it with edit_draft, draftId {id}"));
     }
     if d.attachments.is_empty() {
         lines.push("Attachments: none".into());
@@ -414,6 +439,27 @@ async fn save_attachment(ctx: &Ctx, args: Value) -> Result<Out> {
     Ok(text(format!("Saved {} ({}) to {}\nIt came with the mail: don't run it.", safe_name(&name), kb(bytes.len()), path.display())))
 }
 
+/// What a saved draft holds, for the agent to report back.
+fn draft_summary(account: &Account, out: &Outgoing) -> String {
+    [
+        format!("From: {}", who(Some(&account.name), &account.email)),
+        format!("To: {}", if out.to.is_empty() { "(nobody yet)".into() } else { out.to.join(", ") }),
+        if out.cc.is_empty() { String::new() } else { format!("Cc: {}", out.cc.join(", ")) },
+        if out.bcc.is_empty() { String::new() } else { format!("Bcc: {}", out.bcc.join(", ")) },
+        format!("Subject: {}", subject(&out.subject)),
+        if out.attachments.is_empty() {
+            String::new()
+        } else {
+            let names: Vec<String> = out.attachments.iter().map(|p| std::path::Path::new(p).file_name().map_or_else(|| p.clone(), |n| n.to_string_lossy().into_owned())).collect();
+            format!("Attachments: {}", names.join(", "))
+        },
+    ]
+    .into_iter()
+    .filter(|l| !l.is_empty())
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
 async fn create_draft(ctx: &Ctx, args: Value) -> Result<Out> {
     let a: DraftArgs = parse(args)?;
     if a.body.trim().is_empty() && a.attachments.is_empty() {
@@ -424,40 +470,61 @@ async fn create_draft(ctx: &Ctx, args: Value) -> Result<Out> {
         None => None,
     };
     let accounts = ctx.engine.accounts()?;
-    let replaced = match a.draft_id.as_deref() {
-        Some(id) => Some(*ctx.drafts.lock().unwrap().get(id).ok_or_else(|| {
-            anyhow!("{id} isn't a draft made through create_draft since Mailvern started, so it can't be replaced. Leave out draftId to save a new draft.")
-        })?),
-        None => None,
-    };
-    if let (Some(was), Some(now)) = (replaced, a.account_id) {
-        if was != now {
-            bail!("A draft can't move to another account. Leave out draftId to save a new draft there.");
-        }
-    }
-    let account_id = replaced.or(a.account_id).or(source.as_ref().map(|s| s.summary.account_id)).or(accounts.first().map(|x| x.id));
+    let account_id = a.account_id.or(source.as_ref().map(|s| s.summary.account_id)).or(accounts.first().map(|x| x.id));
     let account = account_id
         .and_then(|id| accounts.iter().find(|x| x.id == id))
         .ok_or_else(|| anyhow!("No such account. Use list_folders to see the accounts."))?;
     let mine: Vec<String> = accounts.iter().map(|x| x.email.clone()).collect();
     let out = compose(&a, account, &mine, source.as_ref())?;
-    let summary = [
-        format!("From: {}", who(Some(&account.name), &account.email)),
-        format!("To: {}", if out.to.is_empty() { "(nobody yet)".into() } else { out.to.join(", ") }),
-        if out.cc.is_empty() { String::new() } else { format!("Cc: {}", out.cc.join(", ")) },
-        if out.bcc.is_empty() { String::new() } else { format!("Bcc: {}", out.bcc.join(", ")) },
-        format!("Subject: {}", subject(&out.subject)),
-        if out.attachments.is_empty() { String::new() } else { format!("Attachments: {}", out.attachments.join(", ")) },
-    ]
-    .into_iter()
-    .filter(|l| !l.is_empty())
-    .collect::<Vec<_>>()
-    .join("\n");
+    let summary = draft_summary(account, &out);
     let id = ctx.engine.save_draft(out).await?;
-    ctx.drafts.lock().unwrap().insert(id.clone(), account.id);
     Ok(text(format!(
-        "Draft {} in Drafts of {}. It has not been sent: the user reviews and sends it in Mailvern.\ndraftId: {id}\n\n{summary}",
-        if replaced.is_some() { "replaced" } else { "saved" },
+        "Draft saved in Drafts of {}. It has not been sent: the user reviews and sends it in Mailvern.\ndraftId: {id} (to change it, use edit_draft)\n\n{summary}",
+        account.email
+    )))
+}
+
+async fn edit_draft(ctx: &Ctx, args: Value) -> Result<Out> {
+    let a: EditArgs = parse(args)?;
+    if a.draft_id.trim().is_empty() {
+        bail!("Invalid arguments: draftId is required.");
+    }
+    // Looked up in the mail itself, so any draft works, also after Mailvern restarts.
+    let (message_id, account_id) = ctx.engine.find_draft(&a.draft_id)?.ok_or_else(|| {
+        anyhow!("No draft {} in any Drafts folder. Find drafts with search_mail (folder \"drafts\"); read_message shows each one's draftId.", a.draft_id.trim())
+    })?;
+    let existing = ctx.engine.message(message_id).await?;
+    let accounts = ctx.engine.accounts()?;
+    let account = accounts.iter().find(|x| x.id == account_id).ok_or_else(|| anyhow!("The draft's account is gone."))?;
+
+    // The draft's own attachments go back in, except the ones to remove.
+    let names: Vec<String> = existing.attachments.iter().map(|x| x.filename.clone()).collect();
+    for r in &a.remove_attachments {
+        if !names.iter().any(|n| n.eq_ignore_ascii_case(r.trim())) {
+            bail!("The draft has no attachment named {r:?}. Its attachments: {}", if names.is_empty() { "none".into() } else { names.join(", ") });
+        }
+    }
+    let removed = |name: &str| a.remove_attachments.iter().any(|r| r.trim().eq_ignore_ascii_case(name));
+    let mut kept = Vec::new();
+    if names.iter().any(|n| !removed(n)) {
+        let dir = std::env::temp_dir().join("Mailvern").join("agents").join(format!("draft-{}", uuid::Uuid::new_v4().simple()));
+        for (i, (name, bytes)) in ctx.engine.all_attachments(message_id).await?.into_iter().enumerate() {
+            if removed(&name) {
+                continue;
+            }
+            // Each file in its own folder, so two attachments with one name both survive.
+            let path = dir.join(i.to_string()).join(safe_name(&name));
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            std::fs::write(&path, &bytes)?;
+            kept.push(path.to_string_lossy().into_owned());
+        }
+    }
+
+    let out = edit(&a, account, &existing, kept)?;
+    let summary = draft_summary(account, &out);
+    let id = ctx.engine.save_draft(out).await?;
+    Ok(text(format!(
+        "Draft changed in Drafts of {}. It has not been sent: the user reviews and sends it in Mailvern.\ndraftId: {id}\n\n{summary}",
         account.email
     )))
 }
@@ -470,7 +537,7 @@ mod tests {
     fn every_tool_has_a_schema_and_a_handler() {
         let tools = list();
         let names: Vec<&str> = tools.as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["list_folders", "search_mail", "count_mail", "read_message", "read_conversation", "read_attachment", "save_attachment", "create_draft"]);
+        assert_eq!(names, ["list_folders", "search_mail", "count_mail", "read_message", "read_conversation", "read_attachment", "save_attachment", "create_draft", "edit_draft"]);
         for t in tools.as_array().unwrap() {
             assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
             assert!(t["description"].as_str().unwrap().len() > 20);

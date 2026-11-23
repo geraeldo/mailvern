@@ -710,6 +710,14 @@ impl Engine {
         Ok(message_id)
     }
 
+    /// Finds a draft in any account's Drafts folder by its Message-ID ("<…>"; the brackets
+    /// may be left out): (message id, account id).
+    pub fn find_draft(&self, message_id: &str) -> Result<Option<(i64, i64)>> {
+        let id = message_id.trim();
+        let id = if id.starts_with('<') { id.to_string() } else { format!("<{id}>") };
+        self.db.find_draft(&id)
+    }
+
     pub fn delete_draft(&self, account_id: i64, message_id: &str) -> Result<()> {
         if let Some((folder_id, _)) = self.db.folder_by_role(account_id, "drafts")? {
             if self.db.delete_by_message_id(folder_id, message_id)? > 0 {

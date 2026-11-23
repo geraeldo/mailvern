@@ -107,7 +107,7 @@ async fn handshake_and_tool_list() {
     assert_eq!(http(addr, "POST", "/mcp", &[("Authorization", &auth)], note).await, (202, String::new()));
 
     let tools = rpc(addr, "tools/list", json!({})).await;
-    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 8);
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 9);
 
     assert_eq!(rpc(addr, "resources/list", json!({})).await["error"]["code"], -32601);
     assert_eq!(rpc(addr, "tools/call", json!({ "name": "send_mail", "arguments": {} })).await["error"]["code"], -32602);
@@ -174,7 +174,7 @@ async fn reading_mail() {
 }
 
 #[tokio::test]
-async fn drafts_go_through_the_account_and_only_own_drafts_are_replaced() {
+async fn new_drafts_go_through_the_account_and_are_checked() {
     let (server, dir) = start().await;
     let addr = server.addr();
     let (found, _) = tool(addr, "search_mail", json!({ "from": "maya" })).await;
@@ -186,8 +186,9 @@ async fn drafts_go_through_the_account_and_only_own_drafts_are_replaced() {
 
     let (out, err) = tool(addr, "create_draft", json!({ "body": "x", "to": ["Tom <tom@>"] })).await;
     assert!(err && out.contains("Invalid address"), "{out}");
-    let (out, err) = tool(addr, "create_draft", json!({ "body": "x", "draftId": "<someone-elses@acme.co>" })).await;
-    assert!(err && out.contains("can't be replaced"), "{out}");
+    // Changing a draft is edit_draft's job; create_draft says so instead of adding a copy.
+    let (out, err) = tool(addr, "create_draft", json!({ "body": "x", "draftId": "<d1@acme.co>" })).await;
+    assert!(err && out.contains("unknown field `draftId`"), "{out}");
     let (out, err) = tool(addr, "create_draft", json!({ "body": "x", "accountId": 99 })).await;
     assert!(err && out.contains("No such account"), "{out}");
     let (out, err) = tool(addr, "create_draft", json!({ "body": "x", "attachments": ["/etc/hosts", "~/.ssh/id_rsa"] })).await;
@@ -195,6 +196,45 @@ async fn drafts_go_through_the_account_and_only_own_drafts_are_replaced() {
     let (out, err) = tool(addr, "create_draft", json!({ "to": ["a@b.co"] })).await;
     assert!(err && out.contains("no body"), "{out}");
     let (out, err) = tool(addr, "create_draft", json!({ "body": 5 })).await;
+    assert!(err && out.contains("Invalid arguments"), "{out}");
+
+    drop(server);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn any_draft_can_be_edited() {
+    let (server, dir) = start().await;
+    let addr = server.addr();
+
+    // The user's own draft, found the way an agent would.
+    let (found, _) = tool(addr, "search_mail", json!({ "folder": "drafts" })).await;
+    let draft = id_of(&found, "Offsite budget");
+    let (msg, _) = tool(addr, "read_message", json!({ "id": draft })).await;
+    assert!(msg.contains("Draft: change it with edit_draft, draftId <d1@acme.co>"), "{msg}");
+    assert!(msg.contains("Bcc: boss@acme.co") && msg.contains("[0] budget.csv"), "{msg}");
+    // Other messages aren't offered for editing.
+    let (inbox, _) = tool(addr, "search_mail", json!({ "from": "stripe" })).await;
+    let (receipt, _) = tool(addr, "read_message", json!({ "id": id_of(&inbox, "Stripe") })).await;
+    assert!(!receipt.contains("edit_draft"), "{receipt}");
+
+    // It is found by its id from the mail itself (with or without brackets), so it works for
+    // drafts the user wrote and after a restart. Saving needs the account's mail server,
+    // which tests don't have: getting that far means the draft was found and rebuilt.
+    for id in ["<d1@acme.co>", "d1@acme.co"] {
+        let (out, err) = tool(addr, "edit_draft", json!({ "draftId": id, "body": "Final numbers below." })).await;
+        assert!(err && out.contains("Account is not running"), "{id}: {out}");
+    }
+    let (out, err) = tool(addr, "edit_draft", json!({ "draftId": "<nope@acme.co>", "body": "x" })).await;
+    assert!(err && out.contains("No draft <nope@acme.co>"), "{out}");
+    // Only drafts: a message in the inbox has an id too, but isn't one.
+    let (out, err) = tool(addr, "edit_draft", json!({ "draftId": "<r1@stripe.com>", "body": "x" })).await;
+    assert!(err && out.contains("No draft"), "{out}");
+    let (out, err) = tool(addr, "edit_draft", json!({ "draftId": "<d1@acme.co>", "removeAttachments": ["nope.pdf"] })).await;
+    assert!(err && out.contains("no attachment named \"nope.pdf\"") && out.contains("budget.csv"), "{out}");
+    let (out, err) = tool(addr, "edit_draft", json!({ "draftId": "<d1@acme.co>", "removeAttachments": ["BUDGET.csv"], "subject": "Offsite budget v2" })).await;
+    assert!(err && out.contains("Account is not running"), "{out}");
+    let (out, err) = tool(addr, "edit_draft", json!({ "body": "x" })).await;
     assert!(err && out.contains("Invalid arguments"), "{out}");
 
     drop(server);
