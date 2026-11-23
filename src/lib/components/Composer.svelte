@@ -3,6 +3,7 @@
   import { open as openDialog, ask } from "@tauri-apps/plugin-dialog";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import Icon from "./Icon.svelte";
+  import Select from "./Select.svelte";
   import Editor from "./Editor.svelte";
   import RecipientField from "./RecipientField.svelte";
   import WhenPicker from "./WhenPicker.svelte";
@@ -333,11 +334,12 @@
       {#if ui.accounts.length > 1}
         <div class="from">
           <span class="label">From</span>
-          <select bind:value={accountId}>
-            {#each ui.accounts as a (a.id)}
-              <option value={a.id}>{a.name ? `${a.name} <${a.email}>` : a.email}</option>
-            {/each}
-          </select>
+          <Select
+            plain
+            label="From"
+            value={accountId}
+            options={ui.accounts.map((a) => (a.name ? { value: a.id, label: a.name, detail: a.email } : { value: a.id, label: a.email }))}
+            onchange={(id) => (accountId = id)} />
         </div>
       {/if}
       <div class="to-wrap">
@@ -426,14 +428,6 @@
     border-bottom: 1px solid var(--line);
   }
   .label { width: 52px; flex: none; color: var(--muted); font-size: 13px; }
-  select {
-    flex: 1;
-    border: 0;
-    background: transparent;
-    outline: none;
-    font-size: 14px;
-    margin-left: -4px;
-  }
   .to-wrap { position: relative; }
   .cc-toggle {
     position: absolute;

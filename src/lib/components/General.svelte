@@ -1,6 +1,7 @@
 <script lang="ts">
   import { BADGE_MODES, badge, setBadgeMode } from "../badge.svelte";
   import { ui, setUndoSend, setThreaded } from "../state.svelte";
+  import Select from "./Select.svelte";
 
   const UNDO = [0, 5, 10, 20, 30];
 </script>
@@ -19,11 +20,11 @@
       <span class="label">Undo send</span>
       <span class="detail">How long a sent message waits, so you can take it back.</span>
     </span>
-    <select value={ui.undoSend} onchange={(e) => setUndoSend(Number(e.currentTarget.value))}>
-      {#each UNDO as s (s)}
-        <option value={s}>{s === 0 ? "Off" : `${s} seconds`}</option>
-      {/each}
-    </select>
+    <Select
+      label="Undo send"
+      value={ui.undoSend}
+      options={UNDO.map((s) => ({ value: s, label: s === 0 ? "Off" : `${s} seconds` }))}
+      onchange={setUndoSend} />
   </div>
 </div>
 
@@ -53,7 +54,6 @@
   input { margin: 2px 0 0; accent-color: var(--accent); }
   .text { flex: 1; display: flex; flex-direction: column; gap: 2px; }
   .group + .group { margin-top: 22px; }
-  select { font: inherit; font-size: 13px; }
   .label { font-size: 13.5px; }
   .detail { font-size: 12.5px; color: var(--muted); }
 </style>
