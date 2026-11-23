@@ -225,12 +225,42 @@ fn open_url(app: tauri::AppHandle, url: String) -> R<()> {
     app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string())
 }
 
+/// The app's own pages, which the webview may navigate between.
+fn is_app_url(app: &tauri::AppHandle, url: &tauri::Url) -> bool {
+    match url.scheme() {
+        "tauri" | "about" | "data" | "blob" | "asset" | "ipc" => true,
+        "http" | "https" => {
+            url.host_str() == Some("tauri.localhost")
+                || (tauri::is_dev() && app.config().build.dev_url.as_ref().is_some_and(|d| d.origin() == url.origin()))
+        }
+        _ => false,
+    }
+}
+
+/// Links in a message would otherwise load inside its sandboxed frame (blank, since most sites
+/// refuse to be framed). Any navigation away from the app is cancelled and opened in the browser.
+fn external_links() -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    tauri::plugin::Builder::new("external-links")
+        .on_navigation(|webview, url| {
+            let app = webview.app_handle();
+            if is_app_url(app, url) {
+                return true;
+            }
+            if matches!(url.scheme(), "http" | "https" | "mailto") {
+                let _ = app.opener().open_url(url.as_str(), None::<&str>);
+            }
+            false
+        })
+        .build()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(external_links())
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;

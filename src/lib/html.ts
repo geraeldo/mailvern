@@ -19,6 +19,14 @@ export function hasRemoteContent(html: string): boolean {
   return REMOTE.test(html);
 }
 
+/**
+ * The sandbox silently drops clicks on links that open a new window (target="_blank"),
+ * so make every link navigate the frame itself; the app turns that into opening the browser.
+ */
+function dropTargets(html: string): string {
+  return html.replace(/(<(?:a|area|base)\b[^>]*?)\s+target\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "$1");
+}
+
 /** A self-contained document for the sandboxed reading frame. Scripts never run. */
 export function frameDoc(body: string, allowRemote: boolean): string {
   const remote = allowRemote ? " https: http:" : "";
@@ -34,7 +42,7 @@ export function frameDoc(body: string, allowRemote: boolean): string {
   pre{white-space:pre-wrap}
   a{color:#2459e0}
   blockquote{margin:0 0 0 2px;padding-left:12px;border-left:2px solid #e3e1dc;color:#55524c}
-</style></head><body>${body}</body></html>`;
+</style></head><body>${dropTargets(body)}</body></html>`;
 }
 
 /** Strips anything that could restyle or script the app before quoting into the composer. */
