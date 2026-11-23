@@ -149,14 +149,12 @@
       <Icon name="at" />
     </button>
     <span class="sync" title={errors.length ? `${errors.length} account(s) can't connect` : ""}>
-      {#if syncing}
-        <span class="spin"><Icon name="refresh" size={13} /></span>
-      {:else if errors.length}
+      {#if errors.length && !syncing}
         <span class="err"><Icon name="alert" size={13} /></span>
       {/if}
     </span>
-    <button class="icon-btn" title={hint("Check for mail", "sync")} onclick={() => api.syncNow()}>
-      <Icon name="refresh" size={15} />
+    <button class="icon-btn" title={syncing ? "Checking for mail…" : hint("Check for mail", "sync")} onclick={() => api.syncNow()}>
+      <span class:spin={syncing}><Icon name="refresh" size={15} /></span>
     </button>
   </footer>
 </aside>
@@ -226,6 +224,7 @@
     padding: 10px 12px;
   }
   .sync { flex: 1; display: flex; justify-content: center; color: var(--muted); }
-  .spin { display: grid; animation: spin 1s linear infinite; }
+  footer .icon-btn > span { display: grid; }
+  .spin { animation: spin 1s linear infinite; }
   .err { display: grid; color: var(--danger); }
 </style>
