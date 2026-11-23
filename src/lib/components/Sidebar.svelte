@@ -24,8 +24,12 @@
     all.forEach((f, i) => isMain(f) && (cut = i + 1));
     const extra = all.length - cut;
     const visible = showMore[accountId] ? all : all.slice(0, cut);
-    return { visible, extra };
+    const hiddenUnread = !showMore[accountId] && all.slice(cut).some(showCount);
+    return { visible, extra, hiddenUnread };
   }
+
+  /** Inbox or a custom folder of this account has unread mail (drafts, sent, junk, etc. don't count). */
+  const hasUnread = (accountId: number) => ui.folders.some((f) => f.accountId === accountId && showCount(f));
 
   /** All Accounts: each standard folder that at least one account has, with unread summed across accounts. */
   const unified = $derived(
@@ -100,6 +104,7 @@
               {#if st?.state === "error"}
                 <span class="warn" title={st.message ?? ""}><Icon name="alert" size={13} /></span>
               {/if}
+              {#if hasUnread(acc.id)}<span class="unread" title="Unread mail"></span>{/if}
               <span class="chev" class:open={!collapsed[acc.id]}><Icon name="chevron" size={12} stroke={2} /></span>
             </button>
           </div>
@@ -121,6 +126,7 @@
             {#if fs.extra}
               <button class="more" onclick={() => (showMore[acc.id] = !showMore[acc.id])}>
                 {showMore[acc.id] ? "Less" : "More"}
+                {#if fs.hiddenUnread}<span class="unread" title="Unread mail in hidden folders"></span>{/if}
               </button>
             {/if}
           {/if}
@@ -208,6 +214,8 @@
   .head-row:hover .chev { opacity: 1; }
   .chev.open { transform: rotate(90deg); }
   .warn { color: var(--danger); display: grid; }
+  .unread { width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--accent); }
+  .more .unread { margin-left: -3px; }
   .more { font-size: 12px; color: var(--muted); padding-left: 34px; height: 26px; }
   .add { color: var(--accent); font-weight: 500; }
   footer {
