@@ -16,11 +16,15 @@ mod context_menu;
 type E<'a> = State<'a, Arc<Engine>>;
 type R<T> = Result<T, String>;
 
+// Plain commands run on the main thread, which also delivers keystrokes to the window. Reads
+// marked `(async)` run elsewhere: waiting on the database (held by sync while it stores bodies)
+// must never stall typing.
+
 fn err(e: anyhow::Error) -> String {
     format!("{e:#}")
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn accounts(engine: E) -> R<Vec<Account>> {
     engine.accounts().map_err(err)
 }
@@ -45,17 +49,17 @@ fn reorder_folders(engine: E, account_id: i64, ids: Vec<i64>) -> R<()> {
     engine.reorder_folders(account_id, &ids).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn folders(engine: E) -> R<Vec<Folder>> {
     engine.folders().map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn messages(engine: E, view: View, query: Option<String>, offset: i64, limit: i64, threaded: Option<bool>) -> R<Vec<MessageSummary>> {
     engine.messages(&view, query.as_deref(), offset, limit, threaded.unwrap_or(true)).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn thread(engine: E, id: i64) -> R<Vec<MessageSummary>> {
     engine.thread(id).map_err(err)
 }
@@ -85,7 +89,7 @@ async fn load_older(engine: E<'_>, view: View) -> R<usize> {
     engine.load_older(&view).await.map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn search(engine: E, query: String, scope: Option<SearchScope>) -> R<Vec<MessageSummary>> {
     engine.search(&query, &scope.unwrap_or_default()).map_err(err)
 }
@@ -116,13 +120,13 @@ struct GroupResult {
     groups: Vec<MailGroup>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn group_mail(engine: E, query: MailQuery, by: String) -> R<GroupResult> {
     let (total, groups) = engine.group_mail(&query, &by).map_err(err)?;
     Ok(GroupResult { total, groups })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn summaries(engine: E, ids: Vec<i64>) -> R<Vec<MessageSummary>> {
     engine.summaries(&ids).map_err(err)
 }
@@ -153,7 +157,7 @@ fn set_ai_key(key: String) -> R<()> {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn badge_count(engine: E) -> R<i64> {
     engine.badge_count().map_err(err)
 }
@@ -236,7 +240,7 @@ fn send_now(engine: E, id: i64) -> R<()> {
     engine.send_now(id).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn outbox(engine: E) -> R<Vec<OutboxItem>> {
     engine.outbox().map_err(err)
 }
@@ -266,7 +270,7 @@ fn sync_view(engine: E, view: View) -> R<()> {
     engine.sync_view(&view).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_setting(engine: E, key: String) -> R<Option<String>> {
     engine.setting(&key).map_err(err)
 }
@@ -278,7 +282,7 @@ fn set_setting(engine: E, key: String, value: String) -> R<()> {
 
 // ---------- rules ----------
 
-#[tauri::command]
+#[tauri::command(async)]
 fn rules(engine: E) -> R<Vec<Rule>> {
     engine.rules().map_err(err)
 }
@@ -309,7 +313,7 @@ fn check_rule(engine: E, rule: Rule) -> R<()> {
     engine.check_rule(&rule).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn test_rule(engine: E, rule: Rule, folder_id: Option<i64>) -> R<RuleTest> {
     engine.test_rule(&rule, folder_id).map_err(err)
 }
@@ -319,12 +323,12 @@ async fn run_rule(engine: E<'_>, id: i64, folder_id: Option<i64>, include_sendin
     engine.run_rule(id, folder_id, include_sending).await.map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn rule_facts(engine: E, ids: Vec<i64>) -> R<Vec<mail_core::rules::Facts>> {
     engine.rule_facts(&ids).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn rule_activity(engine: E, limit: usize) -> R<Vec<RuleActivity>> {
     engine.rule_activity(limit).map_err(err)
 }
@@ -459,7 +463,7 @@ async fn sender_icon(engine: E<'_>, email: String) -> R<Option<SenderIcon>> {
     }))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn contacts(engine: E, query: String) -> R<Vec<mail_core::model::Addr>> {
     engine.contacts(&query).map_err(err)
 }

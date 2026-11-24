@@ -405,7 +405,7 @@ let serverTimer: ReturnType<typeof setTimeout> | undefined;
 export function setQuery(q: string) {
   ui.ai = null;
   ui.query = q;
-  ui.list = [];
+  // The last results stay until the new ones replace them, so the list doesn't blank between keys.
   remote = null;
   ui.searchingServer = false;
   clearOpen();

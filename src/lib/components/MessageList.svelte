@@ -67,9 +67,10 @@
 
   const outboxTo = (to: string[]) => to.map((t) => t.replace(/\s*<.*>$/, "").replace(/^"|"$/g, "")).join(", ") || "(no recipients)";
 
-  // Reset scroll when the view changes.
+  // Reset scroll when the view or the search changes.
   $effect(() => {
     ui.view;
+    ui.query;
     if (scroller) scroller.scrollTop = 0;
   });
 
@@ -77,7 +78,8 @@
   function onInput() {
     stopAiSearch();
     clearTimeout(timer);
-    timer = setTimeout(() => setQuery(draft), 140);
+    // Search once typing pauses, not on every key.
+    timer = setTimeout(() => setQuery(draft), 250);
   }
 
   export function focusSearch() {
