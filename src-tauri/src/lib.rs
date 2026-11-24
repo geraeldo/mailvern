@@ -523,11 +523,15 @@ fn open_url(app: tauri::AppHandle, url: String) -> R<()> {
     app.opener().open_url(parsed.as_str(), None::<&str>).map_err(|e| e.to_string())
 }
 
+fn is_allowed_about_url(url: &tauri::Url) -> bool {
+    url.scheme() == "about" && matches!(url.path(), "blank" | "srcdoc") && url.query().is_none()
+}
+
 /// The app's own pages, which the webview may navigate between.
 fn is_app_url(app: &tauri::AppHandle, url: &tauri::Url) -> bool {
     match url.scheme() {
         "tauri" | "asset" | "ipc" => true,
-        "about" => matches!(url.as_str(), "about:blank" | "about:srcdoc"),
+        "about" => is_allowed_about_url(url),
         "http" | "https" => {
             (url.host_str() == Some("tauri.localhost") && url.port().is_none())
                 || (tauri::is_dev() && app.config().build.dev_url.as_ref().is_some_and(|d| d.origin() == url.origin()))
@@ -538,6 +542,9 @@ fn is_app_url(app: &tauri::AppHandle, url: &tauri::Url) -> bool {
 
 /// Links in a message would otherwise load inside its sandboxed frame (blank, since most sites
 /// refuse to be framed). Any navigation away from the app is cancelled and opened in the browser.
+/// Note: WebKit checks the parent document's `frame-src` CSP before firing `on_navigation` for
+/// iframe clicks, so `tauri.conf.json` must allow `https: http: mailto:` in `frame-src`; this
+/// handler cancels the navigation before anything loads in the frame.
 /// On macOS it also trims WebKit's right-click menu in each webview (see `context_menu`).
 fn external_links() -> tauri::plugin::TauriPlugin<tauri::Wry> {
     tauri::plugin::Builder::new("external-links")
@@ -740,5 +747,34 @@ fn show_main(app: &tauri::AppHandle) {
         let _ = w.unminimize();
         let _ = w.show();
         let _ = w.set_focus();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allowed_about_urls_include_srcdoc_fragments() {
+        assert!(is_allowed_about_url(&tauri::Url::parse("about:blank").unwrap()));
+        assert!(is_allowed_about_url(&tauri::Url::parse("about:srcdoc").unwrap()));
+        assert!(is_allowed_about_url(&tauri::Url::parse("about:srcdoc#section-1").unwrap()));
+        assert!(!is_allowed_about_url(&tauri::Url::parse("about:srcdoc?foo=bar").unwrap()));
+        assert!(!is_allowed_about_url(&tauri::Url::parse("about:settings").unwrap()));
+    }
+
+    #[test]
+    fn csp_frame_src_allows_external_email_links_to_reach_navigation_hook() {
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let csp = conf["app"]["security"]["csp"].as_str().expect("security.csp must be set");
+        let frame_src = csp
+            .split(';')
+            .map(str::trim)
+            .find(|d| d.starts_with("frame-src "))
+            .expect("CSP must define frame-src");
+        let tokens: Vec<&str> = frame_src.split_whitespace().collect();
+        for required in ["'self'", "about:", "https:", "http:", "mailto:"] {
+            assert!(tokens.contains(&required), "frame-src must include {required}, got: {frame_src}");
+        }
     }
 }
