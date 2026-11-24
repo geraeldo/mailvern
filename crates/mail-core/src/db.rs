@@ -1739,6 +1739,12 @@ impl Db {
         Ok(())
     }
 
+    pub fn delete_setting(&self, key: &str) -> Result<()> {
+        let c = self.c();
+        c.execute("DELETE FROM settings WHERE key = ?", [key])?;
+        Ok(())
+    }
+
     // ---------- sender pictures ----------
 
     /// The cached picture for a domain (None inside when it has none) and when to look again.

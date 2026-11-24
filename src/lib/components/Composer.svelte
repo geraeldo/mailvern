@@ -13,7 +13,7 @@
   import { api, type FileInfo, type Outgoing } from "../api";
   import { sendPresets, toUnix, whenLabel } from "../when";
   import { formatAddr, fileSize } from "../format";
-  import { htmlToText, prefixed, quoteForward, quoteReply, emailWrap } from "../html";
+  import { htmlToText, prefixed, quoteForward, quoteReply, emailWrap, sanitize } from "../html";
   import { comboOf, match, hint } from "../shortcuts.svelte";
 
   let props: { init: ComposeInit } = $props();
@@ -104,7 +104,8 @@
   const account = $derived(ui.accounts.find((a) => a.id === accountId)!);
 
   function sigBlock(sig: string) {
-    return `<div data-signature="1">${sig ? `<br>${sig}` : ""}</div>`;
+    const clean = sig ? sanitize(sig) : "";
+    return `<div data-signature="1">${clean ? `<br>${clean}` : ""}</div>`;
   }
 
   const signature = ui.accounts.find((a) => a.id === initAccount)?.signature ?? "";
@@ -147,7 +148,7 @@
     if (accountId === lastAccount || !editorEl) return;
     lastAccount = accountId;
     const block = editorEl.querySelector<HTMLElement>("[data-signature]");
-    const sig = account?.signature ?? "";
+    const sig = account?.signature ? sanitize(account.signature) : "";
     if (block) block.innerHTML = sig ? `<br>${sig}` : "";
   });
 

@@ -11,6 +11,8 @@ use std::io::{Cursor, Read};
 const MAX_IMAGE: usize = 20 * 1024 * 1024;
 /// Uncompressed size read from one file inside an Office document or archive.
 const MAX_ENTRY: u64 = 50 * 1024 * 1024;
+/// Total uncompressed bytes allowed across all entries of a ZIP-based document or spreadsheet.
+const MAX_ZIP_TOTAL: u64 = 50 * 1024 * 1024;
 
 /// The content of attachment `index` of a raw message. Text comes back from `offset` (in
 /// characters), at most `max_chars` of it, so long documents can be read in parts.
@@ -135,11 +137,34 @@ fn pdf_pages(bytes: &[u8]) -> Result<Vec<String>> {
     }
 }
 
-fn zip_entry(zip: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> Result<Option<String>> {
+fn zip_entry(zip: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str, budget: &mut u64) -> Result<Option<String>> {
+    if *budget == 0 {
+        return Ok(None);
+    }
     let Ok(f) = zip.by_name(name) else { return Ok(None) };
-    let mut s = String::new();
-    f.take(MAX_ENTRY).read_to_string(&mut s)?;
-    Ok(Some(s))
+    let cap = (*budget).min(MAX_ENTRY);
+    let mut buf = Vec::new();
+    f.take(cap).read_to_end(&mut buf)?;
+    *budget = budget.saturating_sub(buf.len() as u64);
+    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+}
+
+/// Checks declared uncompressed size of a ZIP archive to reject zip bombs before handing
+/// it to libraries (like `calamine`) that decompress entries without a size cap.
+fn check_zip_total(bytes: &[u8]) -> Result<()> {
+    if !bytes.starts_with(b"PK\x03\x04") {
+        return Ok(());
+    }
+    let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| anyhow!("Couldn't open this archive: {e}"))?;
+    let mut total: u64 = 0;
+    for i in 0..zip.len() {
+        let f = zip.by_index_raw(i).map_err(|e| anyhow!("Couldn't inspect archive entry: {e}"))?;
+        total = total.saturating_add(f.size());
+        if total > MAX_ZIP_TOTAL {
+            return Err(anyhow!("This file is too large to read safely (exceeds 50 MB uncompressed)."));
+        }
+    }
+    Ok(())
 }
 
 fn unescape_xml(s: &str) -> String {
@@ -212,7 +237,8 @@ fn office_xml_text(xml: &str, text_tag: &str, breaks: &[(&str, &str, &str)]) -> 
 
 fn docx_text(bytes: &[u8]) -> Result<String> {
     let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| anyhow!("Couldn't open this Word file: {e}"))?;
-    let xml = zip_entry(&mut zip, "word/document.xml")?.ok_or_else(|| anyhow!("This Word file has no document body."))?;
+    let mut budget = MAX_ZIP_TOTAL;
+    let xml = zip_entry(&mut zip, "word/document.xml", &mut budget)?.ok_or_else(|| anyhow!("This Word file has no document body."))?;
     let breaks = [("w:p", "", "\n"), ("w:tab", "\t", ""), ("w:br", "\n", ""), ("w:cr", "\n", ""), ("w:tc", "", " | "), ("w:tr", "", "\n")];
     // A paragraph ending inside a table cell shouldn't split the row.
     Ok(tidy(&office_xml_text(&xml, "w:t", &breaks).replace("\n | ", " | ")))
@@ -231,11 +257,15 @@ fn pptx_text(bytes: &[u8]) -> Result<(String, usize)> {
     slides.sort();
     let breaks = [("a:p", "", "\n"), ("a:br", "\n", ""), ("a:tab", "\t", "")];
     let mut out = String::new();
+    let mut budget = MAX_ZIP_TOTAL;
     for (num, name) in &slides {
-        let xml = zip_entry(&mut zip, name)?.unwrap_or_default();
+        if budget == 0 {
+            break;
+        }
+        let xml = zip_entry(&mut zip, name, &mut budget)?.unwrap_or_default();
         out.push_str(&format!("--- Slide {num} ---\n{}\n\n", tidy(&office_xml_text(&xml, "a:t", &breaks))));
         let notes = format!("ppt/notesSlides/notesSlide{num}.xml");
-        if let Some(xml) = zip_entry(&mut zip, &notes)? {
+        if let Some(xml) = zip_entry(&mut zip, &notes, &mut budget)? {
             let t = tidy(&office_xml_text(&xml, "a:t", &breaks));
             if !t.is_empty() {
                 out.push_str(&format!("Notes: {t}\n\n"));
@@ -247,31 +277,45 @@ fn pptx_text(bytes: &[u8]) -> Result<(String, usize)> {
 
 fn spreadsheet_text(bytes: &[u8]) -> Result<(String, usize)> {
     use calamine::{Data, Reader};
-    let mut book = calamine::open_workbook_auto_from_rs(Cursor::new(bytes.to_vec())).map_err(|e| anyhow!("Couldn't open this spreadsheet: {e}"))?;
-    let names = book.sheet_names();
-    let mut out = String::new();
-    for name in &names {
-        let Ok(range) = book.worksheet_range(name) else { continue };
-        out.push_str(&format!("--- Sheet: {name} ({} rows × {} columns) ---\n", range.height(), range.width()));
-        for row in range.rows() {
-            let cells: Vec<String> = row
-                .iter()
-                .map(|c| match c {
-                    Data::Empty => String::new(),
-                    Data::DateTime(d) => d.as_datetime().map(|t| t.format("%Y-%m-%d %H:%M").to_string().trim_end_matches(" 00:00").to_string()).unwrap_or_else(|| c.to_string()),
-                    Data::String(s) => s.replace(['\t', '\n', '\r'], " "),
-                    other => other.to_string(),
-                })
-                .collect();
-            if cells.iter().all(|c| c.is_empty()) {
-                continue;
+    check_zip_total(bytes)?;
+    let bytes = bytes.to_vec();
+    let parsed = std::panic::catch_unwind(move || -> Result<(String, usize)> {
+        let mut book = calamine::open_workbook_auto_from_rs(Cursor::new(bytes)).map_err(|e| anyhow!("Couldn't open this spreadsheet: {e}"))?;
+        let names = book.sheet_names();
+        let mut out = String::new();
+        for name in &names {
+            let Ok(range) = book.worksheet_range(name) else { continue };
+            out.push_str(&format!("--- Sheet: {name} ({} rows × {} columns) ---\n", range.height(), range.width()));
+            for row in range.rows() {
+                let cells: Vec<String> = row
+                    .iter()
+                    .map(|c| match c {
+                        Data::Empty => String::new(),
+                        Data::DateTime(d) => d.as_datetime().map(|t| t.format("%Y-%m-%d %H:%M").to_string().trim_end_matches(" 00:00").to_string()).unwrap_or_else(|| c.to_string()),
+                        Data::String(s) => s.replace(['\t', '\n', '\r'], " "),
+                        other => other.to_string(),
+                    })
+                    .collect();
+                if cells.iter().all(|c| c.is_empty()) {
+                    continue;
+                }
+                out.push_str(cells.join("\t").trim_end());
+                out.push('\n');
+                if out.len() > MAX_ZIP_TOTAL as usize {
+                    break;
+                }
             }
-            out.push_str(cells.join("\t").trim_end());
             out.push('\n');
+            if out.len() > MAX_ZIP_TOTAL as usize {
+                break;
+            }
         }
-        out.push('\n');
+        Ok((out, names.len()))
+    });
+    match parsed {
+        Ok(res) => res,
+        Err(_) => Err(anyhow!("Couldn't read this spreadsheet.")),
     }
-    Ok((out, names.len()))
 }
 
 /// Readable text from HTML: no scripts or styles, line breaks at block ends.

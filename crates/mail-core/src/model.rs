@@ -217,6 +217,11 @@ impl RuleAction {
             RuleAction::Move { .. } | RuleAction::Archive | RuleAction::Trash | RuleAction::Junk | RuleAction::Snooze { .. }
         )
     }
+
+    /// Actions that require explicit user approval when an agent creates or modifies a rule.
+    pub fn requires_approval(&self) -> bool {
+        self.sends() || self.relocates()
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

@@ -8,7 +8,7 @@ use crate::fmt::{addr_list, clip, kb, row, stamp, subject, to_unix, who, Names};
 use crate::Ctx;
 use anyhow::{anyhow, bail, Result};
 use mail_core::model::{Account, AttachmentContent, MailQuery, Outgoing};
-use mail_core::text::body_text;
+use mail_core::text::{body_text, quarantine_file, safe_filename};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -184,7 +184,7 @@ pub fn list() -> Value {
 }
 
 #[derive(Deserialize, Default)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 struct Filters {
     text: Option<String>,
     subject: Option<String>,
@@ -230,7 +230,7 @@ impl Filters {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReadArgs {
     id: i64,
     #[serde(default)]
@@ -238,7 +238,7 @@ struct ReadArgs {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AttachmentArgs {
     message_id: i64,
     index: usize,
@@ -277,6 +277,7 @@ async fn search_mail(ctx: &Ctx, args: Value) -> Result<Out> {
     let mut q = f.query()?;
     q.limit = Some(f.limit.unwrap_or(20).clamp(1, 50));
     let offset = f.offset.unwrap_or(0).max(0);
+    q.offset = Some(offset);
     let (r, server_error) = if f.server { ctx.engine.query_mail_server(&q).await? } else { (ctx.engine.query_mail(&q)?, None) };
     let names = Names::load(ctx)?;
     let mut out = if r.total == 1 { "1 message matches".to_string() } else { format!("{} messages match", r.total) };
@@ -291,7 +292,7 @@ async fn search_mail(ctx: &Ctx, args: Value) -> Result<Out> {
     }
     out.push_str("\n\n");
     out.push_str(&r.rows.iter().map(|m| row(m, &names)).collect::<Vec<_>>().join("\n\n"));
-    let shown = offset + r.rows.len() as i64;
+    let shown = offset.saturating_add(r.rows.len() as i64);
     if r.total > shown {
         out.push_str(&format!("\n\nMore: use offset {shown}."));
     }
@@ -424,12 +425,6 @@ async fn read_attachment(ctx: &Ctx, args: Value) -> Result<Out> {
     }
 }
 
-fn safe_name(name: &str) -> String {
-    let n: String = name.chars().map(|c| if matches!(c, '/' | '\\' | ':' | '\0') { '_' } else { c }).collect();
-    let n = n.trim_start_matches('.').trim().to_string();
-    if n.is_empty() { "attachment".into() } else { n }
-}
-
 async fn save_attachment(ctx: &Ctx, args: Value) -> Result<Out> {
     let a: AttachmentArgs = parse(args)?;
     let (name, bytes) = ctx.engine.attachment(a.message_id, a.index).await?;
@@ -437,9 +432,11 @@ async fn save_attachment(ctx: &Ctx, args: Value) -> Result<Out> {
     // so a mail attachment can't be dropped somewhere it would be run or loaded.
     let dir = std::env::temp_dir().join("Mailvern").join("agents").join(format!("{}-{}", a.message_id, a.index));
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(safe_name(&name));
+    let safe = safe_filename(&name);
+    let path = dir.join(&safe);
     std::fs::write(&path, &bytes)?;
-    Ok(text(format!("Saved {} ({}) to {}\nIt came with the mail: don't run it.", safe_name(&name), kb(bytes.len()), path.display())))
+    quarantine_file(&path);
+    Ok(text(format!("Saved {} ({}) to {}\nIt came with the mail: don't run it.", safe, kb(bytes.len()), path.display())))
 }
 
 /// What a saved draft holds, for the agent to report back.
@@ -507,16 +504,27 @@ async fn edit_draft(ctx: &Ctx, args: Value) -> Result<Out> {
             bail!("The draft has no attachment named {r:?}. Its attachments: {}", if names.is_empty() { "none".into() } else { names.join(", ") });
         }
     }
+    struct TempCleanup(Option<std::path::PathBuf>);
+    impl Drop for TempCleanup {
+        fn drop(&mut self) {
+            if let Some(dir) = &self.0 {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
     let removed = |name: &str| a.remove_attachments.iter().any(|r| r.trim().eq_ignore_ascii_case(name));
     let mut kept = Vec::new();
+    let mut _cleanup = TempCleanup(None);
     if names.iter().any(|n| !removed(n)) {
         let dir = std::env::temp_dir().join("Mailvern").join("agents").join(format!("draft-{}", uuid::Uuid::new_v4().simple()));
+        _cleanup.0 = Some(dir.clone());
         for (i, (name, bytes)) in ctx.engine.all_attachments(message_id).await?.into_iter().enumerate() {
             if removed(&name) {
                 continue;
             }
             // Each file in its own folder, so two attachments with one name both survive.
-            let path = dir.join(i.to_string()).join(safe_name(&name));
+            let path = dir.join(i.to_string()).join(safe_filename(&name));
             std::fs::create_dir_all(path.parent().unwrap())?;
             std::fs::write(&path, &bytes)?;
             kept.push(path.to_string_lossy().into_owned());
@@ -567,6 +575,7 @@ mod tests {
         assert_eq!((q.role.as_deref(), q.has_attachments, q.limit), (Some("sent"), Some(true), Some(5)));
         assert!(parse::<Filters>(json!({ "after": 5 })).is_err());
         assert!(parse::<ReadArgs>(json!({})).err().unwrap().to_string().starts_with("Invalid arguments"));
-        assert_eq!(safe_name("../../.zshrc"), "_.._.zshrc");
+        assert_eq!(safe_filename("../../.zshrc"), "_.._.zshrc");
+        assert_eq!(safe_filename(" .."), "attachment");
     }
 }

@@ -36,6 +36,93 @@ pub fn escape_html(s: &str) -> String {
     out
 }
 
+/// Turns an untrusted attachment filename into a safe single-segment filename:
+/// strips path separators, control characters, Unicode bidirectional overrides, leading
+/// whitespace/dots, rejects `.` and `..`, and caps length while preserving the extension.
+pub fn safe_filename(name: &str) -> String {
+    let mut cleaned = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_control()
+            || matches!(
+                c,
+                '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+            )
+        {
+            continue;
+        }
+        if matches!(c, '/' | '\\' | ':') {
+            cleaned.push('_');
+        } else {
+            cleaned.push(c);
+        }
+    }
+    // Strip leading/trailing whitespace and any leading dots (including after whitespace).
+    let trimmed = cleaned.trim().trim_start_matches(|c: char| c == '.' || c.is_whitespace()).trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return "attachment".into();
+    }
+    // Cap UTF-8 byte length well below macOS/POSIX NAME_MAX (255), preserving extension.
+    const MAX_BYTES: usize = 200;
+    if trimmed.len() <= MAX_BYTES {
+        return trimmed.to_string();
+    }
+    let (stem, ext) = match trimmed.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() && e.len() <= 20 => (s, format!(".{e}")),
+        _ => (trimmed, String::new()),
+    };
+    let budget = MAX_BYTES.saturating_sub(ext.len());
+    let mut cut = 0;
+    for (i, c) in stem.char_indices() {
+        if i + c.len_utf8() > budget {
+            break;
+        }
+        cut = i + c.len_utf8();
+    }
+    let out = format!("{}{}", stem[..cut].trim_end(), ext);
+    if out.is_empty() || out == "." || out == ".." {
+        "attachment".into()
+    } else {
+        out
+    }
+}
+
+/// Marks a downloaded/extracted file as quarantined on macOS so Gatekeeper warnings apply.
+#[cfg(target_os = "macos")]
+pub fn quarantine_file(path: &std::path::Path) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    extern "C" {
+        fn setxattr(
+            path: *const std::ffi::c_char,
+            name: *const std::ffi::c_char,
+            value: *const std::ffi::c_void,
+            size: usize,
+            position: u32,
+            options: std::ffi::c_int,
+        ) -> std::ffi::c_int;
+    }
+    let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) else { return };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // 0081 = kLSQuarantineTypeOtherDownload + user-visible quarantine flags.
+    let val = format!("0081;{now:08x};Mailvern;");
+    unsafe {
+        let _ = setxattr(
+            cpath.as_ptr(),
+            c"com.apple.quarantine".as_ptr(),
+            val.as_ptr() as *const std::ffi::c_void,
+            val.len(),
+            0,
+            0,
+        );
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn quarantine_file(_path: &std::path::Path) {}
+
 /// Where the element that was opened just before `pos` ends (after its closing tag).
 /// `lower` is the lowercased document; nested elements of the same name are skipped over.
 fn element_end(lower: &str, mut pos: usize, name: &str) -> usize {
@@ -174,5 +261,19 @@ mod tests {
         assert_eq!(quotable_html(html), "<p>Hi <b>there</b></p>");
         assert_eq!(quotable_html("plain &amp; simple"), "plain &amp; simple");
         assert_eq!(escape_html("<a href=\"x\">&'"), "&lt;a href=&quot;x&quot;&gt;&amp;&#39;");
+    }
+
+    #[test]
+    fn safe_filename_blocks_traversal_dotfiles_and_bidi() {
+        assert_eq!(safe_filename(" .."), "attachment");
+        assert_eq!(safe_filename(" ."), "attachment");
+        assert_eq!(safe_filename(".."), "attachment");
+        assert_eq!(safe_filename(" .zshrc"), "zshrc");
+        assert_eq!(safe_filename("../../.zshrc"), "_.._.zshrc");
+        assert_eq!(safe_filename("a\nb\0c.pdf"), "abc.pdf");
+        assert_eq!(safe_filename("inv\u{202e}fdp.command"), "invfdp.command");
+        let long = format!("{}.pdf", "a".repeat(300));
+        let capped = safe_filename(&long);
+        assert!(capped.len() <= 200 && capped.ends_with(".pdf"), "{capped}");
     }
 }

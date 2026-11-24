@@ -90,11 +90,13 @@ fn text_to_blocks(text: &str) -> String {
 }
 
 /// A file the agent asked to attach, checked. Mailvern reads it with the user's own
-/// permissions, so hidden files (keys, tokens, .env) are refused: a draft must not become
-/// a way to read what the agent itself may not.
+/// permissions, so hidden files (keys, tokens, .env) and sensitive macOS/system locations
+/// (`~/Library`, `/etc`, `/private/etc`, `/var/db`, `/System`) are refused: a draft must
+/// not become a way to read what the agent itself may not.
 fn attachment(path: &str) -> Result<(String, u64)> {
+    let home = std::env::var_os("HOME").map(PathBuf::from).filter(|p| p.is_absolute());
     let p = match path.strip_prefix("~/") {
-        Some(rest) => PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(rest),
+        Some(rest) => home.clone().ok_or_else(|| anyhow!("Can't expand ~: HOME is not set"))?.join(rest),
         None => PathBuf::from(path),
     };
     if !p.is_absolute() {
@@ -108,6 +110,16 @@ fn attachment(path: &str) -> Result<(String, u64)> {
     let hidden = real.components().any(|c| matches!(c, Component::Normal(n) if n.to_string_lossy().starts_with('.')));
     if hidden {
         bail!("Mailvern doesn't attach hidden files or files in hidden folders ({path}). The user can attach it themselves in Mailvern.");
+    }
+    let restricted_home = home
+        .as_ref()
+        .and_then(|h| h.canonicalize().ok().or_else(|| Some(h.clone())))
+        .is_some_and(|h| real.starts_with(h.join("Library")));
+    let restricted_sys = ["/etc", "/private/etc", "/var/db", "/private/var/db", "/System"]
+        .iter()
+        .any(|prefix| real.starts_with(prefix));
+    if restricted_home || restricted_sys {
+        bail!("Mailvern doesn't attach files from system or Library folders ({path}). The user can attach it themselves in Mailvern.");
     }
     Ok((real.to_string_lossy().into_owned(), meta.len()))
 }
@@ -168,7 +180,7 @@ pub fn compose(args: &DraftArgs, account: &Account, mine: &[String], source: Opt
         text.push_str(&format!("\n\n{head}\n{}", quoted.join("\n")));
     }
 
-    let attachments = checked_attachments(&args.attachments)?;
+    let attachments = checked_attachments(&args.attachments, 0)?;
 
     Ok(Outgoing {
         account_id: account.id,
@@ -186,13 +198,14 @@ pub fn compose(args: &DraftArgs, account: &Account, mine: &[String], source: Opt
     })
 }
 
-/// Checks files the agent asked to attach; returns their real paths.
-fn checked_attachments(paths: &[String]) -> Result<Vec<String>> {
+/// Checks files the agent asked to attach; returns their real paths. `existing_bytes` is the
+/// total size of attachments already on the draft so repeated edits can't exceed the 25 MB cap.
+fn checked_attachments(paths: &[String], existing_bytes: u64) -> Result<Vec<String>> {
     let mut out = Vec::new();
-    let mut size = 0;
+    let mut size = existing_bytes;
     for path in paths {
         let (real, bytes) = attachment(path)?;
-        size += bytes;
+        size = size.saturating_add(bytes);
         out.push(real);
     }
     if size > MAX_ATTACHMENTS {
@@ -284,8 +297,9 @@ pub fn edit(args: &EditArgs, account: &Account, existing: &MessageDetail, kept: 
             (format!("<div style=\"{WRAP_STYLE}\">{inner}</div>"), text)
         }
     };
+    let kept_bytes: u64 = kept.iter().filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len())).sum();
     let mut attachments = kept;
-    attachments.extend(checked_attachments(&args.attachments)?);
+    attachments.extend(checked_attachments(&args.attachments, kept_bytes)?);
     Ok(Outgoing {
         account_id: account.id,
         to: args.to.clone().unwrap_or_else(|| list(&existing.to)),

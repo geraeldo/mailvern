@@ -62,24 +62,45 @@ async function conversation(source: Detail): Promise<string> {
   return parts.filter(Boolean).join("\n\n---\n\n");
 }
 
-/** Prepares the text: only simple markup, images swapped for placeholders. */
-function prepare(html: string): { html: string; images: string[] } {
-  const doc = new DOMParser().parseFromString(`<div>${html}</div>`, "text/html");
-  const images: string[] = [];
+type SafeImage = { src: string; alt: string; width: string | null; height: string | null };
+const SAFE_IMG_SRC = /^data:image\/(?:png|jpeg|jpg|gif|webp);base64,[a-z0-9+/=\s]+$/i;
+const DROP_TAGS = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE", "SVG", "MATH", "IFRAME", "OBJECT", "EMBED", "FORM", "META", "BASE", "LINK", "TITLE", "HEAD"]);
+
+/** Prepares the text: only simple markup, safe inline images swapped for placeholders. */
+function prepare(html: string): { html: string; images: SafeImage[] } {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const images: SafeImage[] = [];
   doc.querySelectorAll("img").forEach((img) => {
-    images.push(img.outerHTML);
+    const src = (img.getAttribute("src") ?? "").trim();
+    if (!SAFE_IMG_SRC.test(src)) {
+      img.remove();
+      return;
+    }
+    const w = img.getAttribute("width")?.trim() ?? null;
+    const h = img.getAttribute("height")?.trim() ?? null;
+    images.push({
+      src,
+      alt: img.getAttribute("alt") ?? "",
+      width: w && /^\d{1,4}$/.test(w) ? w : null,
+      height: h && /^\d{1,4}$/.test(h) ? h : null,
+    });
     img.replaceWith(doc.createTextNode(`[[image ${images.length}]]`));
   });
   doc.querySelectorAll("*").forEach((el) => {
     for (const a of Array.from(el.attributes)) if (!(el.tagName === "A" && a.name === "href")) el.removeAttribute(a.name);
   });
-  return { html: doc.body.firstElementChild!.innerHTML, images };
+  return { html: doc.body.innerHTML, images };
 }
 
 const ALLOWED = new Set(["DIV", "P", "BR", "B", "STRONG", "I", "EM", "U", "S", "A", "UL", "OL", "LI", "BLOCKQUOTE", "H2", "H3"]);
 
-/** Keeps only the allowed tags (others are unwrapped) and puts the images back. */
-export function clean(html: string, images: string[]): string {
+function safeHref(raw: string): boolean {
+  const cleaned = raw.replace(/[\u0000-\u0020\u007f]+/g, "");
+  return /^(?:https?:|mailto:|tel:)/i.test(cleaned);
+}
+
+/** Keeps only the allowed tags (others are unwrapped) and puts the images back in DOM text nodes. */
+export function clean(html: string, images: SafeImage[]): string {
   const src = html.replace(/^\s*```(?:html)?\s*/i, "").replace(/\s*```\s*$/, "");
   // Plain text back instead of HTML: make paragraphs of it.
   const marked = /<\/?[a-z][^>]*>/i.test(src)
@@ -88,25 +109,58 @@ export function clean(html: string, images: string[]): string {
         .split(/\n{2,}/)
         .map((p) => `<div>${p.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/\n/g, "<br>")}</div>`)
         .join("<div><br></div>");
-  const doc = new DOMParser().parseFromString(`<div>${marked}</div>`, "text/html");
-  const root = doc.body.firstElementChild!;
-  const walk = (el: Element) => {
-    for (const child of Array.from(el.children)) {
-      walk(child);
-      if (!ALLOWED.has(child.tagName)) {
-        child.replaceWith(...Array.from(child.childNodes));
-        continue;
-      }
-      for (const a of Array.from(child.attributes)) {
-        const keep = child.tagName === "A" && a.name === "href" && /^(https?:|mailto:|tel:)/i.test(a.value);
-        if (!keep) child.removeAttribute(a.name);
-      }
+  const doc = new DOMParser().parseFromString(marked, "text/html");
+  const outDoc = document.implementation.createHTMLDocument("");
+
+  const appendTextWithImages = (text: string, parent: Node) => {
+    if (!images.length || !text.includes("[[image ")) {
+      parent.appendChild(outDoc.createTextNode(text));
+      return;
     }
+    const re = /\[\[image (\d+)\]\]/g;
+    let last = 0;
+    for (const m of text.matchAll(re)) {
+      const idx = m.index!;
+      const img = images[Number(m[1]) - 1];
+      if (!img) continue;
+      if (idx > last) parent.appendChild(outDoc.createTextNode(text.slice(last, idx)));
+      const el = outDoc.createElement("img");
+      el.setAttribute("src", img.src);
+      if (img.width) el.setAttribute("width", img.width);
+      if (img.height) el.setAttribute("height", img.height);
+      el.setAttribute("style", "max-width:100%;height:auto");
+      el.setAttribute("alt", img.alt);
+      parent.appendChild(el);
+      last = idx + m[0].length;
+    }
+    if (last < text.length) parent.appendChild(outDoc.createTextNode(text.slice(last)));
   };
-  walk(root);
-  let out = root.innerHTML;
-  images.forEach((img, i) => (out = out.split(`[[image ${i + 1}]]`).join(img)));
-  return out;
+
+  const walk = (node: Node, parent: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      appendTextWithImages(node.textContent ?? "", parent);
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const el = node as Element;
+    if (el.namespaceURI !== "http://www.w3.org/1999/xhtml") return;
+    const tag = el.tagName.toUpperCase();
+    if (DROP_TAGS.has(tag)) return;
+    if (!ALLOWED.has(tag)) {
+      for (const child of Array.from(el.childNodes)) walk(child, parent);
+      return;
+    }
+    const copy = outDoc.createElement(tag.toLowerCase());
+    if (tag === "A") {
+      const href = el.getAttribute("href");
+      if (href && safeHref(href)) copy.setAttribute("href", href.trim());
+    }
+    parent.appendChild(copy);
+    for (const child of Array.from(el.childNodes)) walk(child, copy);
+  };
+
+  for (const child of Array.from(doc.body.childNodes)) walk(child, outDoc.body);
+  return outDoc.body.innerHTML;
 }
 
 /** Streams the rewrite; `onText` gets the cleaned HTML so far. Resolves with the final HTML. */

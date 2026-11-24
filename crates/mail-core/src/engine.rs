@@ -754,6 +754,10 @@ impl Engine {
         self.db.set_setting(key, value)
     }
 
+    pub fn delete_setting(&self, key: &str) -> Result<()> {
+        self.db.delete_setting(key)
+    }
+
     // ---------- sender pictures ----------
 
     /// The picture for a sender: their domain's BIMI logo or website icon. None for

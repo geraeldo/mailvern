@@ -53,6 +53,7 @@ pub fn icon_domain(addr: &str) -> Option<String> {
     let domain = addr.rsplit('@').next()?.trim().trim_end_matches('.').to_ascii_lowercase();
     if domain.len() > 253
         || !domain.contains('.')
+        || domain.parse::<IpAddr>().is_ok()
         || !domain.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
         || domain.split('.').any(|l| l.is_empty() || l.len() > 63)
     {
@@ -64,6 +65,15 @@ pub fn icon_domain(addr: &str) -> Option<String> {
         return None;
     }
     Some(domain)
+}
+
+/// Only HTTPS URLs targeting a domain name (never an IP literal, which bypasses DNS resolvers).
+fn is_allowed_url(url: &Url) -> bool {
+    if url.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = url.host_str() else { return false };
+    !host.is_empty() && !host.starts_with('[') && host.parse::<IpAddr>().is_err()
 }
 
 /// The registrable domain: `news.stripe.com` → `stripe.com`, `mail.example.co.id` → `example.co.id`.
@@ -84,7 +94,15 @@ impl Fetcher {
         let http = reqwest::Client::builder()
             .dns_resolver(PublicOnly(dns.clone()))
             .https_only(true)
-            .redirect(reqwest::redirect::Policy::limited(5))
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 5 {
+                    attempt.error("too many redirects")
+                } else if !is_allowed_url(attempt.url()) {
+                    attempt.error("disallowed redirect target")
+                } else {
+                    attempt.follow()
+                }
+            }))
             .connect_timeout(Duration::from_secs(4))
             .timeout(Duration::from_secs(8))
             .user_agent(USER_AGENT)
@@ -204,6 +222,9 @@ impl Fetcher {
 
     /// Downloads an image, checking by its bytes that it is one.
     async fn image(&self, url: Url, failed: &mut bool) -> Option<Icon> {
+        if !is_allowed_url(&url) {
+            return None;
+        }
         let resp = match self.get(url).await {
             Ok(r) if r.status().is_success() => r,
             Ok(_) => return None,
@@ -220,7 +241,7 @@ impl Fetcher {
     }
 }
 
-/// The `l=` URL of a BIMI record, when it names an https one.
+/// The `l=` URL of a BIMI record, when it names an allowed https domain URL.
 fn bimi_location(record: &str) -> Option<Url> {
     record
         .split(';')
@@ -229,7 +250,7 @@ fn bimi_location(record: &str) -> Option<Url> {
         .map(|(_, v)| v.trim())
         .filter(|v| !v.is_empty())
         .and_then(|v| Url::parse(v).ok())
-        .filter(|u| u.scheme() == "https")
+        .filter(is_allowed_url)
 }
 
 /// Reads a body up to `max` bytes. Past that it is cut (`truncate`) or dropped (None).
@@ -265,8 +286,23 @@ fn sniff(data: &[u8]) -> Option<&'static str> {
         Some("image/x-icon")
     } else {
         let head = String::from_utf8_lossy(&data[..data.len().min(2048)]).to_ascii_lowercase();
-        let head = head.trim_start_matches('\u{feff}').trim_start();
-        (head.starts_with('<') && head.contains("<svg")).then_some("image/svg+xml")
+        let mut s = head.trim_start_matches('\u{feff}').trim_start();
+        loop {
+            if let Some(rest) = s.strip_prefix("<?xml") {
+                let end = rest.find("?>")?;
+                s = rest[end + 2..].trim_start();
+            } else if let Some(rest) = s.strip_prefix("<!--") {
+                let end = rest.find("-->")?;
+                s = rest[end + 3..].trim_start();
+            } else if let Some(rest) = s.strip_prefix("<!doctype svg") {
+                let end = rest.find('>')?;
+                s = rest[end + 1..].trim_start();
+            } else {
+                break;
+            }
+        }
+        let is_svg = s.strip_prefix("<svg").is_some_and(|r| r.is_empty() || r.starts_with(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/'));
+        is_svg.then_some("image/svg+xml")
     }
 }
 
@@ -291,7 +327,7 @@ fn icon_links(html: &str, base: &Url) -> Vec<Url> {
         }
         let Some(href) = attr("href") else { continue };
         let Ok(url) = base.join(&href.replace("&amp;", "&")) else { continue };
-        if url.scheme() != "https" {
+        if !is_allowed_url(&url) {
             continue;
         }
         let svg = attr("type").is_some_and(|t| t.contains("svg")) || url.path().ends_with(".svg");
@@ -368,6 +404,7 @@ fn is_public(ip: &IpAddr) -> bool {
                 || o[0] == 0
                 || (o[0] == 100 && (o[1] & 0xC0) == 64)
                 || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
                 || o[0] >= 240)
         }
         IpAddr::V6(v6) => {
@@ -375,11 +412,19 @@ fn is_public(ip: &IpAddr) -> bool {
                 return is_public(&IpAddr::V4(v4));
             }
             let s = v6.segments();
+            // Reject loopback, unspecified, multicast, ULA, link-local, site-local,
+            // IPv4-compatible (::/96), NAT64 (64:ff9b::/96, 64:ff9b:1::/48), Teredo (2001::/32),
+            // documentation (2001:db8::/32), and 6to4 (2002::/16).
             !(v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 || (s[0] & 0xFE00) == 0xFC00
-                || (s[0] & 0xFFC0) == 0xFE80)
+                || (s[0] & 0xFFC0) == 0xFE80
+                || (s[0] & 0xFFC0) == 0xFEC0
+                || (s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0)
+                || (s[0] == 0x0064 && s[1] == 0xFF9B && ((s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0) || s[2] == 1))
+                || (s[0] == 0x2001 && (s[1] == 0 || s[1] == 0x0DB8))
+                || s[0] == 0x2002)
         }
     }
 }
@@ -394,6 +439,8 @@ mod tests {
         assert_eq!(icon_domain("a@yahoo.co.id"), None);
         assert_eq!(icon_domain("a@gmx.de"), None);
         assert_eq!(icon_domain("a@localhost"), None);
+        assert_eq!(icon_domain("a@127.0.0.1"), None);
+        assert_eq!(icon_domain("a@192.168.1.1"), None);
         assert_eq!(icon_domain("a@exa mple.com"), None);
         assert_eq!(icon_domain("Bills@News.Stripe.com").as_deref(), Some("news.stripe.com"));
         assert_eq!(org_domain("mail.example.co.id"), "example.co.id");
@@ -405,6 +452,8 @@ mod tests {
         assert_eq!(u.as_str(), "https://x.com/logo.svg");
         assert!(bimi_location("v=BIMI1; l=;").is_none());
         assert!(bimi_location("v=BIMI1; l=http://x.com/logo.svg").is_none());
+        assert!(bimi_location("v=BIMI1; l=https://127.0.0.1/logo.svg").is_none());
+        assert!(bimi_location("v=BIMI1; l=https://[::1]/logo.svg").is_none());
     }
 
     #[test]
@@ -427,11 +476,15 @@ mod tests {
         assert_eq!(sniff(b"<?xml version=\"1.0\"?><svg xmlns=\"\"/>"), Some("image/svg+xml"));
         assert_eq!(sniff(&[0, 0, 1, 0, 1, 0, 16]), Some("image/x-icon"));
         assert_eq!(sniff(b"<!doctype html><html>"), None);
+        assert_eq!(sniff(b"<html><body><svg></svg></body></html>"), None);
     }
 
     #[test]
     fn local_addresses_are_refused() {
-        for ip in ["127.0.0.1", "10.1.2.3", "192.168.1.1", "169.254.1.1", "100.64.0.1", "::1", "fd00::1", "::ffff:192.168.0.1"] {
+        for ip in [
+            "127.0.0.1", "10.1.2.3", "192.168.1.1", "169.254.1.1", "100.64.0.1", "198.18.0.1",
+            "::1", "fd00::1", "::ffff:192.168.0.1", "64:ff9b::127.0.0.1", "2002:7f00:1::1", "2001:db8::1",
+        ] {
             assert!(!is_public(&ip.parse().unwrap()), "{ip}");
         }
         assert!(is_public(&"93.184.216.34".parse().unwrap()));

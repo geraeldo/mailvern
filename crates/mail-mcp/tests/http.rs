@@ -70,10 +70,20 @@ async fn agents_manage_rules_but_sending_ones_wait_for_the_user() {
     let (out, err) = tool(addr, "test_rule", json!({ "conditions": [{ "field": "from", "value": "maya" }] })).await;
     assert!(!err && out.starts_with("1 of the latest 2 messages in the Inbox match"), "{out}");
 
-    // A rule that only files mail is live at once.
+    // A rule that only flags mail is live at once; one that moves/deletes or sends waits for approval.
     let (out, err) = tool(addr, "create_rule", json!({ "name": "Flag Maya", "conditions": [{ "field": "from", "value": "maya" }], "actions": [{ "type": "flag" }] })).await;
     assert!(!err && out.contains("(on, every account"), "{out}");
     let flag_id = rule_id(&out);
+
+    let (out, err) = tool(addr, "create_rule", json!({ "name": "Trash Maya", "conditions": [{ "field": "from", "value": "maya" }], "actions": [{ "type": "trash" }] })).await;
+    assert!(!err && out.contains("waiting for the user to approve") && out.contains("moves or deletes"), "{out}");
+    let trash_id = rule_id(&out);
+    let (out, err) = tool(addr, "delete_rule", json!({ "id": trash_id })).await;
+    assert!(!err, "{out}");
+
+    // Unknown or internal fields are refused.
+    let (out, err) = tool(addr, "create_rule", json!({ "name": "Bad", "actions": [{ "type": "flag" }], "needsApproval": false })).await;
+    assert!(err && out.contains("unknown field"), "{out}");
 
     // One that forwards is saved switched off, and the agent can't switch it on.
     let (out, err) = tool(
@@ -242,7 +252,7 @@ async fn new_drafts_go_through_the_account_and_are_checked() {
     let (out, err) = tool(addr, "create_draft", json!({ "body": "x", "accountId": 99 })).await;
     assert!(err && out.contains("No such account"), "{out}");
     let (out, err) = tool(addr, "create_draft", json!({ "body": "x", "attachments": ["/etc/hosts", "~/.ssh/id_rsa"] })).await;
-    assert!(err && (out.contains("hidden") || out.contains("Can't find")), "{out}");
+    assert!(err && (out.contains("hidden") || out.contains("system") || out.contains("Can't find")), "{out}");
     let (out, err) = tool(addr, "create_draft", json!({ "to": ["a@b.co"] })).await;
     assert!(err && out.contains("no body"), "{out}");
     let (out, err) = tool(addr, "create_draft", json!({ "body": 5 })).await;

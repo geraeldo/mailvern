@@ -2,7 +2,7 @@
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import type { Snippet } from "svelte";
   import Icon from "./Icon.svelte";
-  import { sanitize } from "../html";
+  import { escapeHtml, sanitize } from "../html";
   import { api } from "../api";
   import { toast } from "../state.svelte";
 
@@ -96,9 +96,9 @@
     if (!/^(https?:|mailto:|tel:)/i.test(url)) url = url.includes("@") && !url.includes("/") ? `mailto:${url}` : `https://${url}`;
     restoreSelection();
     const sel = window.getSelection();
-    const safe = url.replace(/"/g, "&quot;");
+    const safe = escapeHtml(url);
     if (sel && sel.isCollapsed) {
-      document.execCommand("insertHTML", false, `<a href="${safe}">${url.replace(/</g, "&lt;")}</a>`);
+      document.execCommand("insertHTML", false, `<a href="${safe}">${safe}</a>`);
     } else {
       document.execCommand("createLink", false, url);
     }

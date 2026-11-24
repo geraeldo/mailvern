@@ -64,22 +64,31 @@ impl Engine {
 
     /// Adds a rule (id 0) or replaces one. Returns it as stored.
     ///
-    /// When an agent saves a rule that forwards or auto-replies, and those actions are new
-    /// or changed, or it switches such a rule on, it's stored switched off and waiting for
-    /// the user's approval: mail a rule sends goes out in the user's name.
+    /// When an agent saves a rule that sends mail (forward/reply) or relocates/deletes mail
+    /// (move/archive/trash/junk/snooze), any new rule, re-enable, or change to its scope,
+    /// conditions, exceptions, or actions is stored switched off and waiting for the user's
+    /// approval in Mailvern.
     pub fn save_rule(&self, mut rule: Rule, by_agent: bool) -> Result<Rule> {
         rule.name = rule.name.trim().to_string();
         self.check_rule(&rule)?;
         let old = if rule.id > 0 { Some(self.rule(rule.id)?) } else { None };
         rule.paused_reason = None;
         if by_agent {
-            let sending = |r: &Rule| r.actions.iter().filter(|a| a.sends()).cloned().collect::<Vec<_>>();
+            let needs = rule.actions.iter().any(RuleAction::requires_approval);
             let unapproved = match &old {
                 None => true,
-                Some(o) => o.needs_approval || sending(o) != sending(&rule) || (!o.enabled && rule.enabled),
+                Some(o) => {
+                    o.needs_approval
+                        || (!o.enabled && rule.enabled)
+                        || o.account_id != rule.account_id
+                        || o.match_all != rule.match_all
+                        || o.conditions != rule.conditions
+                        || o.exceptions != rule.exceptions
+                        || o.actions != rule.actions
+                }
             };
             rule.origin = "agent".into();
-            rule.needs_approval = !sending(&rule).is_empty() && unapproved;
+            rule.needs_approval = needs && unapproved;
             if rule.needs_approval {
                 rule.enabled = false;
             }
@@ -165,6 +174,15 @@ impl Engine {
     /// replies go out only with `include_sending`, within the usual limits.
     pub async fn run_rule(&self, id: i64, folder_id: Option<i64>, include_sending: bool) -> Result<RuleRun> {
         let rule = self.rule(id)?;
+        if rule.needs_approval {
+            return Err(anyhow!("Approve and turn on this rule before running it"));
+        }
+        if let (Some(acc), Some(fid)) = (rule.account_id, folder_id) {
+            let (folder_acc, ..) = self.db.folder(fid)?;
+            if folder_acc != acc {
+                return Err(anyhow!("That folder belongs to another account than the rule"));
+            }
+        }
         let mine = self.my_addresses()?;
         let compiled = Compiled::new(&rule, &mine).map_err(|e| anyhow!(e))?;
         let mut run = RuleRun::default();
@@ -406,10 +424,10 @@ impl Engine {
                 if !files.is_empty() {
                     std::fs::create_dir_all(&dir)?;
                     for (i, (name, bytes)) in files.iter().enumerate() {
-                        let safe: String = name.chars().map(|c| if matches!(c, '/' | '\\' | ':') { '_' } else { c }).collect();
+                        let safe = crate::text::safe_filename(name);
                         let sub = dir.join(i.to_string());
                         std::fs::create_dir_all(&sub)?;
-                        let path = sub.join(if safe.trim().is_empty() { "attachment".into() } else { safe });
+                        let path = sub.join(safe);
                         std::fs::write(&path, bytes)?;
                         paths.push(path.to_string_lossy().to_string());
                     }
@@ -578,17 +596,28 @@ mod tests {
         s.engine.set_rule_enabled(r.id, true).unwrap();
         let r = s.engine.rule(r.id).unwrap();
         assert!(!r.needs_approval && r.enabled);
-        // An agent editing other parts keeps it approved; changing the address doesn't.
+        // An agent editing only the name keeps it approved; widening conditions or changing the address doesn't.
         let r = s.engine.save_rule(Rule { name: "Forward boss".into(), ..r }, true).unwrap();
         assert!(!r.needs_approval && r.enabled);
+        let widened = s.engine.save_rule(Rule { conditions: vec![], ..r.clone() }, true).unwrap();
+        assert!(widened.needs_approval && !widened.enabled);
+        s.engine.set_rule_enabled(r.id, true).unwrap();
+        let r = s.engine.rule(r.id).unwrap();
         let r = s.engine.save_rule(Rule { actions: vec![RuleAction::Forward { to: vec!["eve@example.net".into()] }], ..r }, true).unwrap();
         assert!(r.needs_approval && !r.enabled);
+        // Unapproved rules cannot be executed via run_rule.
+        assert!(s.engine.run_rule(r.id, None, true).await.is_err());
         // An agent can't switch back on a sending rule the user switched off.
         s.engine.set_rule_enabled(r.id, true).unwrap();
         s.engine.set_rule_enabled(r.id, false).unwrap();
         let r = s.engine.save_rule(Rule { enabled: true, ..s.engine.rule(r.id).unwrap() }, true).unwrap();
         assert!(r.needs_approval && !r.enabled);
-        // Rules that don't send are live at once.
+        // Relocating/deleting rules (archive, trash, move, junk, snooze) from agents also wait for approval.
+        let trash = s.engine.save_rule(rule("Trash", vec![from("boss")], vec![RuleAction::Trash]), true).unwrap();
+        assert!(trash.needs_approval && !trash.enabled);
+        let archive = s.engine.save_rule(rule("Archive", vec![from("boss")], vec![RuleAction::Archive]), true).unwrap();
+        assert!(archive.needs_approval && !archive.enabled);
+        // Non-sending, non-relocating rules (e.g. Flag) are live at once.
         let r = s.engine.save_rule(rule("Flag", vec![from("boss")], vec![RuleAction::Flag]), true).unwrap();
         assert!(!r.needs_approval && r.enabled);
     }

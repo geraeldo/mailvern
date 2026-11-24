@@ -9,6 +9,7 @@
   import { api, type Account } from "../api";
   import { accountColors } from "../format";
   import { guessServers } from "../providers";
+  import { sanitize } from "../html";
 
   function blank(): Account {
     return {
@@ -64,7 +65,7 @@
   }
 
   function currentSignature(): string {
-    const html = sigMode === "html" ? sigHtml : (sigEl?.innerHTML ?? draft.signature);
+    const html = sigMode === "html" ? sanitize(sigHtml) : (sigEl?.innerHTML ?? draft.signature);
     return html.trim().replace(/^(<br\s*\/?>|\s|<div><br\s*\/?><\/div>)+$/i, "");
   }
 
@@ -73,7 +74,7 @@
     if (mode === "html") {
       sigHtml = currentSignature();
     } else {
-      draft.signature = sigHtml;
+      draft.signature = sanitize(sigHtml);
       sigKey++;
     }
     sigMode = mode;
@@ -224,7 +225,7 @@
       {#if sigMode === "visual"}
         <div class="sig">
           {#key `${selected}-${sigKey}`}
-            <Editor bind:el={sigEl} html={draft.signature} minHeight={110} placeholder="Write or paste your signature" />
+            <Editor bind:el={sigEl} html={sanitize(draft.signature)} minHeight={110} placeholder="Write or paste your signature" />
           {/key}
         </div>
       {:else}
@@ -233,7 +234,7 @@
         </div>
         <div class="preview-label">Preview</div>
         <div class="preview">
-          <MailFrame html={sigHtml || "<span style='color:#6b6760'>Nothing yet</span>"} allowRemote={true} />
+          <MailFrame html={sigHtml || "<span style='color:#6b6760'>Nothing yet</span>"} allowRemote={false} />
         </div>
       {/if}
     </section>

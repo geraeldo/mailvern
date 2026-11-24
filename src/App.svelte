@@ -70,7 +70,7 @@
         loadRules();
       } else if (e.kind === "rulesChanged") {
         if (rulesUi.loaded) loadRules();
-        if (e.pendingApproval > pendingRules) toast("An agent set up a rule that sends mail. Review it in Settings › Rules.", { ms: 8000 });
+        if (e.pendingApproval > pendingRules) toast("An agent added or changed a rule. Review it in Settings › Rules.", { ms: 8000 });
         pendingRules = e.pendingApproval;
       } else if (e.kind === "sendFailed") {
         toast(`Couldn't send “${e.subject || "(no subject)"}”. It will retry from Scheduled.`, { ms: 6000 });

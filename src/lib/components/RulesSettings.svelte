@@ -47,9 +47,12 @@
   }
 
   async function toggle(r: Rule, on: boolean, input: HTMLInputElement) {
-    if (on && r.actions.some(sends)) {
-      const who = r.needsApproval ? "An agent set up this rule. " : "";
-      const ok = await ask(`${who}It sends mail in your name while Mailvern is open:\n\n${sendingLines(r)}`, {
+    if (on && (r.actions.some(sends) || r.needsApproval)) {
+      const who = r.needsApproval ? "An agent created or changed this rule. " : "";
+      const details = r.actions.some(sends)
+        ? `It sends mail in your name while Mailvern is open:\n\n${sendingLines(r)}`
+        : `It will act on incoming mail while Mailvern is open:\n\n${r.actions.map((a) => `• ${actionText(a)}`).join("\n")}`;
+      const ok = await ask(`${who}${details}`, {
         title: `Turn on “${r.name}”?`,
         kind: "warning",
         okLabel: "Turn On",
@@ -169,7 +172,7 @@
             </span>
             <span class="sum">{ruleSummary(r)}</span>
             {#if r.needsApproval}
-              <span class="why">An agent changed what this rule sends. Check it, then turn it on.</span>
+              <span class="why">An agent created or changed this rule. Check it, then turn it on.</span>
             {:else if r.pausedReason}
               <span class="why">Switched off because {r.pausedReason}.</span>
             {/if}

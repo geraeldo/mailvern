@@ -2,8 +2,10 @@ use mail_core::model::{
     Account, AttachmentContent, Folder, MailGroup, MailQuery, MessageDetail, MessageSummary, Outgoing, OutboxItem, Rule, RuleActivity,
     RuleRun, RuleTest, SearchScope, View,
 };
+use mail_core::text::{quarantine_file, safe_filename};
 use mail_core::Engine;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
@@ -228,9 +230,9 @@ fn cancel_send(engine: E, id: i64) -> R<Cancelled> {
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let mut attachments = Vec::new();
     for (name, bytes) in files {
-        let path = unique_path(&dir, &safe_name(&name));
-        std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
-        attachments.push(FileInfo { path: path.to_string_lossy().into(), name: safe_name(&name), size: bytes.len() as u64 });
+        let safe = safe_filename(&name);
+        let path = write_unique_file(&dir, &safe, &bytes)?;
+        attachments.push(FileInfo { path: path.to_string_lossy().into(), name: safe, size: bytes.len() as u64 });
     }
     Ok(Cancelled { message, attachments })
 }
@@ -270,13 +272,23 @@ fn sync_view(engine: E, view: View) -> R<()> {
     engine.sync_view(&view).map_err(err)
 }
 
+fn is_restricted_setting(key: &str) -> bool {
+    matches!(key, agents::ENABLED | agents::LEGACY_TOKEN)
+}
+
 #[tauri::command(async)]
 fn get_setting(engine: E, key: String) -> R<Option<String>> {
+    if is_restricted_setting(&key) {
+        return Err("That setting can only be managed from Agent Settings".into());
+    }
     engine.setting(&key).map_err(err)
 }
 
 #[tauri::command]
 fn set_setting(engine: E, key: String, value: String) -> R<()> {
+    if is_restricted_setting(&key) {
+        return Err("That setting can only be managed from Agent Settings".into());
+    }
     engine.set_setting(&key, &value).map_err(err)
 }
 
@@ -338,35 +350,60 @@ fn undo_rule_activity(engine: E, id: i64) -> R<()> {
     engine.undo_rule_activity(id).map_err(err)
 }
 
-fn safe_name(name: &str) -> String {
-    let n: String = name.chars().map(|c| if matches!(c, '/' | '\\' | ':' | '\0') { '_' } else { c }).collect();
-    let n = n.trim_start_matches('.').trim().to_string();
-    if n.is_empty() { "attachment".into() } else { n }
-}
-
-fn unique_path(dir: &PathBuf, name: &str) -> PathBuf {
-    let p = dir.join(name);
-    if !p.exists() {
-        return p;
-    }
+/// Atomically creates a new file in `dir` without overwriting existing files or following
+/// dangling symlinks (`O_CREAT | O_EXCL`), picking a numbered suffix on collisions.
+fn write_unique_file(dir: &Path, name: &str, bytes: &[u8]) -> R<PathBuf> {
     let (stem, ext) = match name.rsplit_once('.') {
         Some((s, e)) => (s.to_string(), format!(".{e}")),
         None => (name.to_string(), String::new()),
     };
-    (1..)
-        .map(|i| dir.join(format!("{stem} ({i}){ext}")))
-        .find(|p| !p.exists())
-        .unwrap()
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    for i in 0u32..10_000 {
+        let candidate = if i == 0 { dir.join(name) } else { dir.join(format!("{stem} ({i}){ext}")) };
+        match opts.open(&candidate) {
+            Ok(mut f) => {
+                f.write_all(bytes).map_err(|e| e.to_string())?;
+                return Ok(candidate);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err("Too many files with that name".into())
+}
+
+/// Extensions that can execute code or launch commands directly when opened via LaunchServices.
+fn is_dangerous_extension(name: &str) -> bool {
+    let ext = Path::new(name).extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+    matches!(
+        ext.as_deref(),
+        Some(
+            "app" | "command" | "sh" | "bash" | "zsh" | "csh" | "scpt" | "scptd" | "applescript"
+                | "terminal" | "workflow" | "action" | "inetloc" | "webloc" | "fileloc" | "pkg"
+                | "mpkg" | "dmg" | "iso" | "jar" | "jnlp" | "exe" | "msi" | "bat" | "cmd" | "ps1"
+                | "vbs" | "js" | "mjs" | "html" | "htm" | "svg" | "xhtml"
+        )
+    )
 }
 
 /// Writes the attachment to a temp folder and opens it with the default app.
 #[tauri::command]
 async fn open_attachment(app: tauri::AppHandle, engine: E<'_>, id: i64, index: usize) -> R<()> {
     let (name, bytes) = engine.attachment(id, index).await.map_err(err)?;
+    let safe = safe_filename(&name);
+    if is_dangerous_extension(&safe) {
+        return Err(format!("“{safe}” can run code or scripts, so Mailvern won't open it directly. Save it to Downloads first if you trust the sender."));
+    }
     let dir = std::env::temp_dir().join("Mailvern").join(format!("{id}-{index}"));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join(safe_name(&name));
-    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    let path = write_unique_file(&dir, &safe, &bytes)?;
+    quarantine_file(&path);
     app.opener().open_path(path.to_string_lossy(), None::<&str>).map_err(|e| e.to_string())
 }
 
@@ -375,8 +412,8 @@ async fn open_attachment(app: tauri::AppHandle, engine: E<'_>, id: i64, index: u
 async fn save_attachment(app: tauri::AppHandle, engine: E<'_>, id: i64, index: usize) -> R<String> {
     let (name, bytes) = engine.attachment(id, index).await.map_err(err)?;
     let dir = dirs::download_dir().ok_or("No Downloads folder")?;
-    let path = unique_path(&dir, &safe_name(&name));
-    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    let path = write_unique_file(&dir, &safe_filename(&name), &bytes)?;
+    quarantine_file(&path);
     let _ = app.opener().reveal_item_in_dir(&path);
     Ok(path.to_string_lossy().into())
 }
@@ -418,22 +455,19 @@ async fn attachment_files(engine: E<'_>, id: i64) -> R<Vec<FileInfo>> {
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for (name, bytes) in files {
-        let path = unique_path(&dir, &safe_name(&name));
-        std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
-        out.push(FileInfo { path: path.to_string_lossy().into(), name: safe_name(&name), size: bytes.len() as u64 });
+        let safe = safe_filename(&name);
+        let path = write_unique_file(&dir, &safe, &bytes)?;
+        out.push(FileInfo { path: path.to_string_lossy().into(), name: safe, size: bytes.len() as u64 });
     }
     Ok(out)
 }
 
 /// Reads an image file as a data: URL for inserting into the editor.
-#[tauri::command]
+#[tauri::command(async)]
 fn read_image(path: String) -> R<String> {
     use base64::Engine as _;
-    let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
-    if meta.len() > 15 * 1024 * 1024 {
-        return Err("Image is larger than 15 MB".into());
-    }
-    let mime = match PathBuf::from(&path).extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
+    const MAX: u64 = 15 * 1024 * 1024;
+    let mime = match Path::new(&path).extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
         Some("png") => "image/png",
         Some("jpg") | Some("jpeg") => "image/jpeg",
         Some("gif") => "image/gif",
@@ -441,7 +475,19 @@ fn read_image(path: String) -> R<String> {
         Some("heic") => "image/heic",
         _ => return Err("Not a supported image".into()),
     };
-    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("Not a regular file".into());
+    }
+    if meta.len() > MAX {
+        return Err("Image is larger than 15 MB".into());
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    file.take(MAX + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > MAX {
+        return Err("Image is larger than 15 MB".into());
+    }
     Ok(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)))
 }
 
@@ -470,18 +516,20 @@ fn contacts(engine: E, query: String) -> R<Vec<mail_core::model::Addr>> {
 
 #[tauri::command]
 fn open_url(app: tauri::AppHandle, url: String) -> R<()> {
-    if !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:")) {
+    let parsed = tauri::Url::parse(url.trim()).map_err(|_| "Unsupported link".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https" | "mailto") {
         return Err("Unsupported link".into());
     }
-    app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string())
+    app.opener().open_url(parsed.as_str(), None::<&str>).map_err(|e| e.to_string())
 }
 
 /// The app's own pages, which the webview may navigate between.
 fn is_app_url(app: &tauri::AppHandle, url: &tauri::Url) -> bool {
     match url.scheme() {
-        "tauri" | "about" | "data" | "blob" | "asset" | "ipc" => true,
+        "tauri" | "asset" | "ipc" => true,
+        "about" => matches!(url.as_str(), "about:blank" | "about:srcdoc"),
         "http" | "https" => {
-            url.host_str() == Some("tauri.localhost")
+            (url.host_str() == Some("tauri.localhost") && url.port().is_none())
                 || (tauri::is_dev() && app.config().build.dev_url.as_ref().is_some_and(|d| d.origin() == url.origin()))
         }
         _ => false,

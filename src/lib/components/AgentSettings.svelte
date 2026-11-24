@@ -29,8 +29,9 @@
     busy = false;
   }
 
-  const token = $derived(access?.token ?? "");
+  const token = $derived(access?.token && /^[A-Za-z0-9_-]+$/.test(access.token) ? access.token : "");
   const header = $derived(`Authorization: Bearer ${token}`);
+  const shQuote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
   /**
    * One-line setup for each agent, in the agents' own commands. Each can be run again:
    * it replaces the earlier entry, which is how a new token reaches an agent after a reset.
@@ -39,9 +40,9 @@
   const commands = $derived<Record<string, string>>(
     access && token
       ? {
-          "Claude Code": `claude mcp remove mailvern -s user >/dev/null 2>&1; claude mcp add --transport http --scope user mailvern ${access.url} --header "Authorization: Bearer ${token}"`,
-          Codex: `codex mcp remove mailvern >/dev/null 2>&1; printf '\\n[mcp_servers.mailvern]\\nurl = "${access.url}"\\nhttp_headers = { Authorization = "Bearer ${token}" }\\n' >> ~/.codex/config.toml`,
-          Opencode: `opencode mcp add --global mailvern --url ${access.url} --header "Authorization=Bearer ${token}"`,
+          "Claude Code": `claude mcp remove mailvern -s user >/dev/null 2>&1; claude mcp add --transport http --scope user mailvern ${shQuote(access.url)} --header ${shQuote(`Authorization: Bearer ${token}`)}`,
+          Codex: `codex mcp remove mailvern >/dev/null 2>&1; mkdir -p ~/.codex && printf '\\n[mcp_servers.mailvern]\\nurl = "%s"\\nhttp_headers = { Authorization = "Bearer %s" }\\n' ${shQuote(access.url)} ${shQuote(token)} >> ~/.codex/config.toml`,
+          Opencode: `opencode mcp add --global mailvern --url ${shQuote(access.url)} --header ${shQuote(`Authorization=Bearer ${token}`)}`,
         }
       : {},
   );
@@ -81,7 +82,7 @@
   <label class="toggle">
     <span class="text">
       <span class="label">Let agents on this Mac use Mailvern</span>
-      <span class="detail">Read mail and save drafts. Never send, move or delete.</span>
+      <span class="detail">Read mail, save drafts, and propose rules. Nothing sends, moves or deletes without your approval.</span>
     </span>
     <input
       type="checkbox"
