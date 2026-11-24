@@ -2,13 +2,15 @@
   import type { Snippet } from "svelte";
   import { keymap } from "../shortcuts.svelte";
 
-  let { label, onclose, onkeydown, children, small = false }: {
+  let { label, onclose, onkeydown, children, small = false, medium = false }: {
     label: string;
     onclose: () => void;
     onkeydown?: (e: KeyboardEvent) => void;
     children: Snippet;
     /** A small dialog sized to its content, instead of the settings sheet. */
     small?: boolean;
+    /** A medium dialog (e.g. shortcuts cheat sheet). */
+    medium?: boolean;
   } = $props();
 
   let sheet = $state<HTMLDivElement>();
@@ -35,7 +37,7 @@
     if (downOnScrim && e.target === e.currentTarget) onclose();
     downOnScrim = false;
   }}>
-  <div class="sheet" class:small role="dialog" aria-label={label} tabindex="-1" bind:this={sheet}>
+  <div class="sheet" class:small class:medium role="dialog" aria-label={label} tabindex="-1" bind:this={sheet}>
     {@render children()}
   </div>
 </div>
@@ -47,14 +49,15 @@
     z-index: 60;
     display: grid;
     place-items: center;
-    background: rgba(20, 18, 14, 0.18);
+    background: rgba(20, 18, 14, 0.24);
     animation: fade 0.12s ease-out;
   }
   .sheet {
     display: flex;
-    width: min(900px, calc(100vw - 48px));
+    width: min(920px, calc(100vw - 48px));
     height: min(720px, calc(100vh - 64px));
     background: var(--panel);
+    border: 1px solid var(--sheet-border);
     border-radius: 14px;
     box-shadow: var(--shadow);
     overflow: hidden;
@@ -63,8 +66,14 @@
   }
   .sheet.small {
     flex-direction: column;
-    width: min(340px, calc(100vw - 48px));
+    width: min(350px, calc(100vw - 48px));
     height: auto;
     max-height: min(520px, calc(100vh - 64px));
+  }
+  .sheet.medium {
+    flex-direction: column;
+    width: min(580px, calc(100vw - 48px));
+    height: auto;
+    max-height: min(640px, calc(100vh - 64px));
   }
 </style>

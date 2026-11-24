@@ -39,12 +39,22 @@ function prepareFrameBody(html: string): string {
 }
 
 /** A self-contained document for the sandboxed reading frame. Scripts never run. */
-export function frameDoc(body: string, allowRemote: boolean): string {
+export function frameDoc(body: string, allowRemote: boolean, plain = false): string {
   const remote = allowRemote ? " https: http:" : "";
   const csp = `default-src 'none'; img-src data: cid:${remote}; style-src 'unsafe-inline'${remote}; font-src data:${remote}; media-src data:${remote}`;
+  const colorScheme = plain ? "light dark" : "light";
+  const darkOverride = plain
+    ? `<style>
+  @media (prefers-color-scheme: dark) {
+    html,body{background:#1b1b1a;color:#edece9}
+    a{color:#5d87ff}
+    blockquote{border-left-color:#3a3936;color:#a6a39c}
+  }
+</style>`
+    : "";
   return `<!doctype html><html><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="${csp}">
-<meta name="color-scheme" content="light">
+<meta name="color-scheme" content="${colorScheme}">
 <style>
   html,body{margin:0;padding:0;background:#fff;overflow:hidden}
   body{padding:4px 2px 12px;display:flow-root;font:14px/1.55 -apple-system,BlinkMacSystemFont,"Helvetica Neue",sans-serif;color:#1d1c1a;word-wrap:break-word;overflow-wrap:anywhere}
@@ -53,7 +63,7 @@ export function frameDoc(body: string, allowRemote: boolean): string {
   pre{white-space:pre-wrap}
   a{color:#2459e0}
   blockquote{margin:0 0 0 2px;padding-left:12px;border-left:2px solid #e3e1dc;color:#55524c}
-</style></head><body>${prepareFrameBody(body)}</body></html>`;
+</style>${darkOverride}</head><body>${prepareFrameBody(body)}</body></html>`;
 }
 
 const XHTML_NS = "http://www.w3.org/1999/xhtml";

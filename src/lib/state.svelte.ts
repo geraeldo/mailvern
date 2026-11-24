@@ -10,7 +10,7 @@ export type ComposeMode = "new" | "reply" | "replyAll" | "forward" | "draft";
 /** A message to reopen in the composer: a saved draft, or one taken back out of the outbox. */
 export type Restore = { message: Outgoing; attachments: FileInfo[]; unsaved?: boolean };
 export type ComposeInit = { mode: ComposeMode; source?: Detail; accountId?: number; to?: string[]; restore?: Restore; key: number };
-export type SettingsSection = "general" | "rules" | "ai" | "agents" | "shortcuts";
+export type SettingsSection = "general" | "accounts" | "rules" | "ai" | "agents" | "shortcuts";
 export type SyncStatus = { state: "syncing" | "idle" | "error"; message: string | null };
 /** One thing AI search did, shown while it works. */
 export type AiStep = { kind: "search" | "read" | "attachment" | "count" | "thread" | "folders" | "note"; text: string; done: boolean; error?: boolean };
@@ -74,10 +74,16 @@ export const ui = $state({
   /** AI search results, shown in the list instead of the word search while set. */
   ai: null as AiSearch | null,
   compose: null as ComposeInit | null,
-  /** App settings (shortcuts and, later, other preferences). */
+  /** Unified app & account settings modal. */
   settings: null as SettingsSection | null,
-  /** Account settings: the account being edited, or "new". */
-  accountSettings: null as number | "new" | null,
+  /** Selected account inside Settings › Accounts (account id, or "new"). */
+  accountTarget: "new" as number | "new",
+  /** Quick keyboard shortcut cheat-sheet overlay ("?"). */
+  shortcutHelp: false,
+  /** Sidebar collapsed state & persisted pane widths. */
+  sidebarCollapsed: false,
+  sideWidth: 214,
+  listWidth: 336,
   picker: null as Picker | null,
   status: {} as Record<number, SyncStatus>,
   toast: null as { text: string; undo?: () => void } | null,
@@ -93,14 +99,18 @@ export const ui = $state({
 });
 
 export function openSettings(section: SettingsSection = "general") {
-  ui.accountSettings = null;
+  ui.shortcutHelp = false;
+  if (section === "accounts" && typeof ui.accountTarget === "number" && !ui.accounts.some((a) => a.id === ui.accountTarget)) {
+    ui.accountTarget = ui.accounts[0]?.id ?? "new";
+  }
   ui.settings = section;
 }
 
-/** Opens account settings on the given account, "new" for the add form, or the first account. */
+/** Opens unified Settings directly on the given account, "new" for the add form, or the first account. */
 export function openAccountSettings(target: number | "new" | null = null) {
-  ui.settings = null;
-  ui.accountSettings = target ?? ui.accounts[0]?.id ?? "new";
+  ui.shortcutHelp = false;
+  ui.accountTarget = target ?? ui.accounts[0]?.id ?? "new";
+  ui.settings = "accounts";
 }
 
 export function accountLabel(a: Account): string {
@@ -199,15 +209,35 @@ export async function loadAccounts() {
 }
 
 export async function loadPrefs() {
-  const [undo, threads, icons] = await Promise.all([
+  const [undo, threads, icons, sideW, listW, sideCol] = await Promise.all([
     api.getSetting("undo_send"),
     api.getSetting("threads"),
     api.getSetting("sender_icons"),
+    api.getSetting("side_width"),
+    api.getSetting("list_width"),
+    api.getSetting("sidebar_collapsed"),
   ]);
   const n = Number(undo);
   if (undo != null && Number.isFinite(n)) ui.undoSend = n;
   ui.threaded = threads !== "off";
   ui.senderIcons = icons !== "off";
+  const sw = Number(sideW);
+  if (sideW != null && Number.isFinite(sw) && sw >= 170 && sw <= 320) ui.sideWidth = sw;
+  const lw = Number(listW);
+  if (listW != null && Number.isFinite(lw) && lw >= 260 && lw <= 480) ui.listWidth = lw;
+  ui.sidebarCollapsed = sideCol === "on";
+}
+
+export function setPaneWidths(side: number, list: number) {
+  ui.sideWidth = Math.round(Math.max(170, Math.min(320, side)));
+  ui.listWidth = Math.round(Math.max(260, Math.min(480, list)));
+  api.setSetting("side_width", String(ui.sideWidth)).catch(() => {});
+  api.setSetting("list_width", String(ui.listWidth)).catch(() => {});
+}
+
+export function toggleSidebar() {
+  ui.sidebarCollapsed = !ui.sidebarCollapsed;
+  api.setSetting("sidebar_collapsed", ui.sidebarCollapsed ? "on" : "off").catch(() => {});
 }
 
 export async function setSenderIcons(on: boolean) {
@@ -324,7 +354,9 @@ export async function loadList(reset = true) {
     return;
   }
   if (my !== listSeq) return;
-  ui.list = reset ? rows : [...ui.list, ...rows];
+  const hidden = hiddenPendingIds();
+  const filtered = hidden.size ? rows.filter((r) => !hidden.has(r.id)) : rows;
+  ui.list = reset ? filtered : [...ui.list, ...filtered];
   ui.listReady = true;
   if (q) ui.hasMore = false;
   // A conversation's row moves to its newest message when one arrives: follow it.
@@ -375,6 +407,7 @@ function clearOpen() {
 }
 
 export function setView(v: View) {
+  commitPending();
   reachedStart.delete(viewKey(v));
   ui.view = v;
   // Picking a folder while searching searches there instead.
@@ -579,18 +612,76 @@ export function selectedRows(): Summary[] {
 /** Every message behind some rows (a conversation row stands for all its messages in the view). */
 export const idsOf = (rows: Summary[]) => [...new Set(rows.flatMap((r) => (r.ids?.length ? r.ids : [r.id])))];
 
-/** Takes rows off the list and opens the next one. Returns their message ids. */
+/** Takes rows off the list (opening the next row only if the currently open row was removed). Returns their message ids. */
 function removeRows(rows: Summary[]): number[] {
   const gone = new Set(rows.map((r) => r.id));
   const first = ui.list.findIndex((m) => gone.has(m.id));
+  const openRemoved = ui.selectedId != null && gone.has(ui.selectedId);
   ui.list = ui.list.filter((m) => !gone.has(m.id));
-  ui.selectedIds = [];
-  const next = first < 0 ? null : (ui.list[first] ?? ui.list[first - 1] ?? null);
-  openMessage(next ? next.id : null);
+  ui.selectedIds = ui.selectedIds.filter((id) => !gone.has(id));
+  if (openRemoved) {
+    const next = first < 0 ? null : (ui.list[first] ?? ui.list[first - 1] ?? null);
+    openMessage(next ? next.id : null);
+  }
   return idsOf(rows);
 }
 
-// ---------- actions ----------
+// ---------- actions & deferred undo ----------
+
+type PendingUndo = {
+  rowIds: Set<number>;
+  snapshot: { row: Summary; index: number }[];
+  unreadDeltas: Map<number, number>;
+  prevSelectedId: number | null;
+  prevSelectedIds: number[];
+  timer: ReturnType<typeof setTimeout>;
+  commit: () => void;
+};
+
+let pendingUndo: PendingUndo | null = null;
+const committingIds = new Set<number>();
+
+function hiddenPendingIds(): Set<number> {
+  if (!pendingUndo && !committingIds.size) return committingIds;
+  const s = new Set<number>(committingIds);
+  if (pendingUndo) for (const id of pendingUndo.rowIds) s.add(id);
+  return s;
+}
+
+/** Immediately commits any pending undoable action (called before another action, view change, or window close). */
+export function commitPending() {
+  if (!pendingUndo) return;
+  const p = pendingUndo;
+  pendingUndo = null;
+  clearTimeout(p.timer);
+  p.commit();
+}
+
+function revertPending() {
+  if (!pendingUndo) return;
+  const p = pendingUndo;
+  pendingUndo = null;
+  clearTimeout(p.timer);
+  // Restore rows into ui.list at their original positions.
+  const next = [...ui.list];
+  const ordered = [...p.snapshot].sort((a, b) => a.index - b.index);
+  for (const { row, index } of ordered) {
+    if (!next.some((m) => m.id === row.id)) {
+      next.splice(Math.min(index, next.length), 0, row);
+    }
+  }
+  ui.list = next;
+  for (const [fid, delta] of p.unreadDeltas) {
+    const f = folderById(fid);
+    if (f) f.unread += delta;
+  }
+  if (p.prevSelectedIds.length > 1) {
+    ui.selectedIds = p.prevSelectedIds;
+  } else if (p.prevSelectedId != null && p.rowIds.has(p.prevSelectedId)) {
+    openMessage(p.prevSelectedId);
+  }
+  toast("Undone", { ms: 1600 });
+}
 
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
 export function toast(text: string, opts: { undo?: () => void; ms?: number } = {}) {
@@ -639,14 +730,41 @@ async function run(p: Promise<unknown>): Promise<boolean> {
 
 const counted = (verb: string, n: number) => (n > 1 ? `${verb} ${n} items` : verb);
 
-/** Removes the selected rows and runs `call` on their messages. */
-function bulk(verb: string, call: (ids: number[]) => Promise<unknown>) {
-  const rows = selectedRows();
+/** Removes rows optimistically with a 4.5s Undo window before committing to the backend. */
+function deferBulk(label: string, rows: Summary[], call: (ids: number[]) => Promise<unknown>) {
   if (!rows.length) return;
+  commitPending();
+  const rowIds = new Set(rows.map((r) => r.id));
+  const snapshot = rows
+    .map((row) => ({ row, index: ui.list.findIndex((m) => m.id === row.id) }))
+    .filter((x) => x.index >= 0);
+  const unreadDeltas = new Map<number, number>();
+  for (const r of rows) {
+    if (!r.seen) {
+      unreadDeltas.set(r.folderId, (unreadDeltas.get(r.folderId) ?? 0) + 1);
+      const f = folderById(r.folderId);
+      if (f && f.unread > 0) f.unread = Math.max(0, f.unread - 1);
+    }
+  }
+  const prevSelectedId = ui.selectedId;
+  const prevSelectedIds = [...ui.selectedIds];
   const ids = removeRows(rows);
-  run(call(ids)).then((ok) => {
-    if (ok) toast(counted(verb, rows.length));
-  });
+
+  const commit = () => {
+    for (const id of rowIds) committingIds.add(id);
+    run(call(ids)).finally(() => {
+      for (const id of rowIds) committingIds.delete(id);
+    });
+  };
+  const ms = 4500;
+  const timer = setTimeout(() => {
+    if (pendingUndo?.timer === timer) {
+      pendingUndo = null;
+      commit();
+    }
+  }, ms);
+  pendingUndo = { rowIds, snapshot, unreadDeltas, prevSelectedId, prevSelectedIds, timer, commit };
+  toast(label, { undo: revertPending, ms });
 }
 
 /** Checks the server for new mail in just this folder (or unified folder). */
@@ -659,8 +777,10 @@ export function checkAccountForMail(accountId: number) {
   api.syncAccount(accountId).catch((e) => toast(String(e)));
 }
 
-export const archiveSelected = () => bulk("Archived", api.archive);
-export const trashSelected = () => bulk("Deleted", api.trash);
+export const archiveRows = (rows: Summary[]) => deferBulk(counted("Archived", rows.length), rows, api.archive);
+export const trashRows = (rows: Summary[]) => deferBulk(counted("Deleted", rows.length), rows, api.trash);
+export const archiveSelected = () => archiveRows(selectedRows());
+export const trashSelected = () => trashRows(selectedRows());
 
 /** True when the selection sits in a Junk folder, so the junk action means "Not Junk". */
 export function selectedIsJunk(): boolean {
@@ -669,21 +789,29 @@ export function selectedIsJunk(): boolean {
 
 /** Moves the selection to Junk, or back to the Inbox if it's already in Junk. */
 export function toggleJunk() {
-  if (selectedIsJunk()) bulk("Moved to Inbox", api.notJunk);
-  else bulk("Moved to Junk", api.junk);
+  const rows = selectedRows();
+  if (selectedIsJunk()) deferBulk(counted("Moved to Inbox", rows.length), rows, api.notJunk);
+  else deferBulk(counted("Moved to Junk", rows.length), rows, api.junk);
 }
 
-/** Read / unread. Marking read covers whole conversations; unread marks just their newest message. */
-export function toggleSeen() {
-  const rows = selectedRows();
+/** Read / unread for arbitrary rows (used by toolbar and row hover quick-actions). */
+export function toggleSeenRows(rows: Summary[]) {
   if (!rows.length) return;
   const seen = rows.some((r) => !r.seen);
-  for (const r of rows) r.seen = seen;
+  for (const r of rows) {
+    if (r.seen !== seen) {
+      r.seen = seen;
+      const f = folderById(r.folderId);
+      if (f) f.unread = Math.max(0, f.unread + (seen ? -1 : 1));
+    }
+  }
   const ids = seen ? idsOf(rows) : rows.map((r) => r.id);
   for (const t of ui.thread) if (ids.includes(t.id)) t.seen = seen;
   if (ui.detail && ids.includes(ui.detail.id)) ui.detail.seen = seen;
   run(api.setSeen(ids, seen));
 }
+
+export const toggleSeen = () => toggleSeenRows(selectedRows());
 
 /** Flags the newest message of each conversation; unflagging clears every message. */
 export function toggleFlag() {
@@ -707,22 +835,25 @@ export async function markAllRead(view: MailView) {
   await run(api.markRead(view));
 }
 
-export function snoozeSelected() {
-  const rows = selectedRows();
+export function snoozeTargetRows(rows: Summary[]) {
   if (rows.length) ui.picker = { kind: "snooze", rows };
+}
+
+export function snoozeSelected() {
+  snoozeTargetRows(selectedRows());
 }
 
 export function snoozeRows(rows: Summary[], until: Date) {
   const gone = new Set(rows.map((r) => r.id));
   const shown = ui.list.filter((m) => gone.has(m.id));
-  const ids = shown.length ? removeRows(shown) : idsOf(rows);
-  run(api.snooze(ids, toUnix(until))).then((ok) => {
-    if (ok) toast(`Snoozed until ${whenLabel(until)}`);
-  });
+  const target = shown.length ? shown : rows;
+  deferBulk(`Snoozed until ${whenLabel(until)}`, target, (ids) => api.snooze(ids, toUnix(until)));
 }
 
+export const unsnoozeRows = (rows: Summary[]) => deferBulk(counted("Unsnoozed", rows.length), rows, api.unsnooze);
+
 export function unsnoozeSelected() {
-  bulk("Unsnoozed", api.unsnooze);
+  unsnoozeRows(selectedRows());
 }
 
 export function moveSelected() {
@@ -739,10 +870,8 @@ export function moveSelected() {
 export function moveRows(rows: Summary[], folder: Folder) {
   const gone = new Set(rows.map((r) => r.id));
   const shown = ui.list.filter((m) => gone.has(m.id));
-  const ids = shown.length ? removeRows(shown) : idsOf(rows);
-  run(api.moveTo(ids, folder.id)).then((ok) => {
-    if (ok) toast(`Moved to ${folder.name}`);
-  });
+  const target = shown.length ? shown : rows;
+  deferBulk(`Moved to ${folder.name}`, target, (ids) => api.moveTo(ids, folder.id));
 }
 
 // ---------- writing ----------
@@ -832,4 +961,10 @@ export async function trustSender(email: string) {
     ui.trustedSenders = [...ui.trustedSenders, e];
     await api.setSetting("trusted_senders", JSON.stringify(ui.trustedSenders));
   }
+}
+
+export async function untrustSender(email: string) {
+  const e = email.toLowerCase();
+  ui.trustedSenders = ui.trustedSenders.filter((x) => x !== e);
+  await api.setSetting("trusted_senders", JSON.stringify(ui.trustedSenders));
 }

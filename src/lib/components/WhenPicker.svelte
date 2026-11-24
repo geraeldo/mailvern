@@ -18,17 +18,29 @@
   const customDate = $derived(custom ? new Date(custom) : null);
   const valid = $derived(!!customDate && !isNaN(customDate.getTime()) && customDate.getTime() > Date.now());
 
+  let active = $state(0);
+
   function pick(d: Date) {
     onpick(d);
     onclose();
   }
 
   function onkeydown(e: KeyboardEvent) {
+    if (e.target instanceof HTMLInputElement) return;
     // Number keys pick a preset.
     const n = Number(e.key);
-    if (!e.metaKey && !e.ctrlKey && n >= 1 && n <= presets.length && !(e.target instanceof HTMLInputElement)) {
+    if (!e.metaKey && !e.ctrlKey && n >= 1 && n <= presets.length) {
       e.preventDefault();
       pick(presets[n - 1].at);
+    } else if (e.key === "ArrowDown") {
+      e.preventDefault();
+      active = Math.min(presets.length - 1, active + 1);
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      active = Math.max(0, active - 1);
+    } else if (e.key === "Enter" && presets[active]) {
+      e.preventDefault();
+      pick(presets[active].at);
     }
   }
 </script>
@@ -37,7 +49,7 @@
   <div class="head">{title}</div>
   <div class="list">
     {#each presets as p, i (p.label)}
-      <button class="choice" onclick={() => pick(p.at)}>
+      <button class="choice" class:active={i === active} onmouseenter={() => (active = i)} onclick={() => pick(p.at)}>
         <span class="key">{i + 1}</span>
         <span class="label">{p.label}</span>
         <span class="when">{whenLabel(p.at)}</span>
@@ -66,7 +78,7 @@
     color: var(--text);
     font-size: 13.5px;
   }
-  .choice:hover, .choice:focus-visible { background: var(--hover); outline: none; }
+  .choice:hover, .choice.active, .choice:focus-visible { background: var(--hover); outline: none; }
   .key {
     width: 18px;
     height: 18px;

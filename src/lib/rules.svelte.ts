@@ -7,9 +7,16 @@ export const rulesUi = $state({
   loaded: false,
   /** The rule being edited (id 0 for a new one), or null for the list. */
   draft: null as Rule | null,
+  /** Snapshot of the draft when it opened, to tell whether the user made unsaved edits. */
+  draftOrigin: "",
   /** A message to describe a rule from ("Create Rule › Describe…"): the AI starts from its headers. */
   source: null as RuleFacts | null,
 });
+
+export function isRuleDraftDirty(): boolean {
+  if (!rulesUi.draft) return false;
+  return JSON.stringify($state.snapshot(rulesUi.draft)) !== rulesUi.draftOrigin;
+}
 
 export async function loadRules() {
   try {
@@ -112,6 +119,23 @@ export function actionText(a: RuleAction): string {
   }
 }
 
+/** Just the matching conditions in plain words (without account or actions). */
+export function conditionsSummary(r: Rule): string {
+  const when = r.conditions.length ? r.conditions.map(condText).join(r.matchAll ? " and " : " or ") : "any new mail";
+  const except = r.exceptions.length ? `, except ${r.exceptions.map(condText).join(" or ")}` : "";
+  return `When ${when}${except}`;
+}
+
+/** Just the actions in plain words: "Mark as read, archive". */
+export function actionsSummary(r: Rule): string {
+  return r.actions
+    .map((a, i) => {
+      const t = actionText(a);
+      return i === 0 ? t.replace(/^./, (c) => c.toUpperCase()) : t;
+    })
+    .join(", ");
+}
+
 /** One line for the list: "If from contains “github”: archive, mark as read". */
 export function ruleSummary(r: Rule): string {
   const when = r.conditions.length ? r.conditions.map(condText).join(r.matchAll ? " and " : " or ") : "any new mail";
@@ -123,7 +147,9 @@ export function ruleSummary(r: Rule): string {
 
 /** Opens Settings › Rules on the editor, on `draft` or a blank rule. */
 export function openRuleEditor(draft: Rule | null = null) {
-  rulesUi.draft = structuredClone($state.snapshot(draft ?? blankRule())) as Rule;
+  const clone = structuredClone($state.snapshot(draft ?? blankRule())) as Rule;
+  rulesUi.draft = clone;
+  rulesUi.draftOrigin = JSON.stringify(clone);
   rulesUi.source = null;
   openSettings("rules");
 }

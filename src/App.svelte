@@ -8,7 +8,7 @@
   import Reader from "./lib/components/Reader.svelte";
   import Composer from "./lib/components/Composer.svelte";
   import Settings from "./lib/components/Settings.svelte";
-  import AccountSettings from "./lib/components/AccountSettings.svelte";
+  import ShortcutHelp from "./lib/components/ShortcutHelp.svelte";
   import WhenPicker from "./lib/components/WhenPicker.svelte";
   import MovePicker from "./lib/components/MovePicker.svelte";
   import { api, type MailEvent } from "./lib/api";
@@ -20,7 +20,7 @@
     ui, loadAccounts, loadFolders, loadList, loadTrusted, loadPrefs, loadOutbox, refreshThread, move, compose,
     archiveSelected, trashSelected, toggleJunk, toggleSeen, toggleFlag, accountById, openSettings, openAccountSettings,
     moveSelected, snoozeSelected, unsnoozeSelected, selectAll, extendSelection, clearSelection, snoozeRows, moveRows,
-    selectedRows, roleOf, toast, undoToast, copyThread, openMessage,
+    selectedRows, roleOf, toast, undoToast, copyThread, openMessage, commitPending, setPaneWidths, toggleSidebar,
   } from "./lib/state.svelte";
   import { snoozePresets } from "./lib/when";
   import { exitAi } from "./lib/ai/search.svelte";
@@ -31,6 +31,7 @@
   let notify = false;
   /** Rules waiting for approval, to say so when an agent adds one. */
   let pendingRules = 0;
+  let resizing = $state<"side" | "list" | null>(null);
 
   let pending: ReturnType<typeof setTimeout> | undefined;
   function scheduleRefresh() {
@@ -81,11 +82,50 @@
     const unFocus = getCurrentWindow().onFocusChanged(({ payload: focused }) => {
       if (focused) refreshBadge();
     });
+    const onUnload = () => commitPending();
+    window.addEventListener("beforeunload", onUnload);
     return () => {
+      commitPending();
+      window.removeEventListener("beforeunload", onUnload);
       un.then((f) => f());
       unFocus.then((f) => f());
     };
   });
+
+  function startResize(which: "side" | "list", e: PointerEvent) {
+    e.preventDefault();
+    resizing = which;
+    const startX = e.clientX;
+    const startSide = ui.sideWidth;
+    const startList = ui.listWidth;
+    document.body.style.cursor = "col-resize";
+
+    const onMove = (ev: PointerEvent) => {
+      const dx = ev.clientX - startX;
+      if (which === "side") {
+        ui.sideWidth = Math.round(Math.max(170, Math.min(320, startSide + dx)));
+      } else {
+        const maxList = Math.min(480, Math.max(260, window.innerWidth - (ui.sidebarCollapsed ? 0 : ui.sideWidth) - 360));
+        ui.listWidth = Math.round(Math.max(260, Math.min(maxList, startList + dx)));
+      }
+    };
+    const onUp = () => {
+      resizing = null;
+      document.body.style.cursor = "";
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+      setPaneWidths(ui.sideWidth, ui.listWidth);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+  }
+
+  function resetPane(which: "side" | "list") {
+    if (which === "side") setPaneWidths(214, ui.listWidth);
+    else setPaneWidths(ui.sideWidth, 336);
+  }
 
   function typing(e: KeyboardEvent) {
     const t = e.target as HTMLElement;
@@ -120,8 +160,23 @@
     if (keymap.recording) return;
     const combo = comboOf(e);
     if (!combo) return;
-    // Composer, pickers and the settings popups handle their own keys.
-    if (ui.compose || ui.settings || ui.accountSettings || ui.picker) return;
+    // Composer, pickers, shortcut guide and the settings popup handle their own keys.
+    if (ui.compose || ui.settings || ui.picker || ui.shortcutHelp) return;
+    if (combo === "mod+alt+s") {
+      e.preventDefault();
+      toggleSidebar();
+      return;
+    }
+    if (combo === "mod+z" && !typing(e) && ui.toast?.undo) {
+      e.preventDefault();
+      undoToast();
+      return;
+    }
+    if (e.key === "?" && !e.metaKey && !e.ctrlKey && !e.altKey && !typing(e)) {
+      e.preventDefault();
+      ui.shortcutHelp = true;
+      return;
+    }
     if (combo === "escape" && !typing(e) && clearSelection()) {
       e.preventDefault();
       return;
@@ -139,13 +194,39 @@
     e.preventDefault();
     run[action]();
   }
+
+  const gridCols = $derived(
+    ui.sidebarCollapsed
+      ? `minmax(260px, ${ui.listWidth}px) minmax(0, 1fr)`
+      : `minmax(170px, ${ui.sideWidth}px) minmax(260px, ${ui.listWidth}px) minmax(0, 1fr)`,
+  );
 </script>
 
 <svelte:window onkeydown={onKey} oncontextmenu={(e) => { if (!allowNativeMenu(e)) e.preventDefault(); }} />
 
-<div class="app">
-  <Sidebar />
-  <MessageList bind:this={list} />
+<div class="app" class:resizing={!!resizing} style:grid-template-columns={gridCols}>
+  {#if !ui.sidebarCollapsed}
+    <div class="pane">
+      <Sidebar />
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div
+        class="splitter"
+        class:active={resizing === "side"}
+        title="Drag to resize sidebar (double-click to reset)"
+        onpointerdown={(e) => startResize("side", e)}
+        ondblclick={() => resetPane("side")}></div>
+    </div>
+  {/if}
+  <div class="pane">
+    <MessageList bind:this={list} />
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div
+      class="splitter"
+      class:active={resizing === "list"}
+      title="Drag to resize list (double-click to reset)"
+      onpointerdown={(e) => startResize("list", e)}
+      ondblclick={() => resetPane("list")}></div>
+  </div>
   <Reader />
 </div>
 
@@ -159,8 +240,8 @@
   <Settings />
 {/if}
 
-{#if ui.accountSettings}
-  <AccountSettings />
+{#if ui.shortcutHelp}
+  <ShortcutHelp onclose={() => (ui.shortcutHelp = false)} />
 {/if}
 
 {#if ui.picker?.kind === "snooze"}
@@ -182,7 +263,7 @@
   <div class="toast" role="status">
     <span>{ui.toast.text}</span>
     {#if ui.toast.undo}
-      <button class="undo" onclick={undoToast}>Undo</button>
+      <button type="button" class="undo" onclick={undoToast}>Undo</button>
     {/if}
   </div>
 {/if}
@@ -190,13 +271,33 @@
 <style>
   .app {
     display: grid;
-    /* Sidebar and list give up width before the reader does, down to the 900px minimum window. */
-    grid-template-columns: clamp(188px, 18vw, 236px) clamp(290px, 30vw, 390px) minmax(0, 1fr);
     /* One row exactly the window's height, so each column scrolls on its own. */
     grid-template-rows: minmax(0, 100%);
     height: 100%;
   }
   .app > :global(*) { min-height: 0; }
+  .app.resizing :global(iframe) { pointer-events: none; }
+  .pane { position: relative; min-width: 0; min-height: 0; height: 100%; }
+  .splitter {
+    position: absolute;
+    top: 0;
+    right: -3px;
+    bottom: 0;
+    width: 6px;
+    z-index: 15;
+    cursor: col-resize;
+  }
+  .splitter::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 2px;
+    width: 2px;
+    background: transparent;
+    transition: background 0.12s;
+  }
+  .splitter:hover::after, .splitter.active::after { background: var(--accent); opacity: 0.55; }
   .toast {
     position: fixed;
     left: 50%;
@@ -220,13 +321,16 @@
   }
   .undo {
     border: 0;
-    padding: 0;
+    padding: 2px 6px;
+    margin: -2px -4px -2px 0;
+    border-radius: 5px;
     background: none;
     color: #8fb4ff;
     font: inherit;
     font-weight: 600;
   }
+  .undo:hover { background: rgba(143, 180, 255, 0.14); }
   @media (prefers-color-scheme: dark) {
-    .toast { background: #3a3936; }
+    .toast { background: #2c2b29; border: 1px solid var(--line-strong); }
   }
 </style>

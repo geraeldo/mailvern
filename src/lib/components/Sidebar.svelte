@@ -1,6 +1,9 @@
 <script lang="ts">
   import Icon from "./Icon.svelte";
-  import { ui, setView, compose, openSettings, openAccountSettings, accountLabel, reorderAccounts, reorderFolders, unifiedRoles } from "../state.svelte";
+  import {
+    ui, setView, compose, openSettings, openAccountSettings, accountLabel,
+    reorderAccounts, reorderFolders, unifiedRoles, toggleSidebar,
+  } from "../state.svelte";
   import { sortable } from "../sortable";
   import { accountMenu, allAccountsMenu, folderMenu } from "../menus";
   import { hint } from "../shortcuts.svelte";
@@ -28,8 +31,11 @@
     return { visible, extra, hiddenUnread };
   }
 
-  /** Inbox or a custom folder of this account has unread mail (drafts, sent, junk, etc. don't count). */
-  const hasUnread = (accountId: number) => ui.folders.some((f) => f.accountId === accountId && showCount(f));
+  const showCount = (f: Folder) => f.unread > 0 && (f.role === "inbox" || !f.role);
+
+  /** Total unread count for an account (shown subtly when collapsed instead of a dot). */
+  const accountUnread = (accountId: number) =>
+    ui.folders.filter((f) => f.accountId === accountId && showCount(f)).reduce((n, f) => n + f.unread, 0);
 
   /** All Accounts: each standard folder that at least one account has, with unread summed across accounts. */
   const unified = $derived(
@@ -40,6 +46,7 @@
       })
       .filter((r) => r.present),
   );
+  const showUnified = $derived(ui.accounts.length > 1);
   /** Mail waiting for a later time, or that failed. Messages just sent (still undoable) don't count. */
   const scheduled = $derived(ui.outbox.filter((o) => o.error || o.sendAt * 1000 > Date.now() + (ui.undoSend + 5) * 1000));
   const syncing = $derived(Object.values(ui.status).some((s) => s.state === "syncing"));
@@ -48,12 +55,15 @@
   // While searching, the scope is what's highlighted.
   const searching = $derived(!!ui.query.trim());
   const isActive = (f: Folder) =>
-    searching ? ui.searchScope.kind === "folder" && ui.searchScope.folderId === f.id : ui.view.kind === "folder" && ui.view.folderId === f.id;
+    searching
+      ? ui.searchScope.kind === "folder" && ui.searchScope.folderId === f.id
+      : (ui.view.kind === "folder" && ui.view.folderId === f.id) ||
+        (!showUnified && ui.view.kind === "unified" && f.role === ui.view.role);
   const isUnifiedActive = (role: string) =>
     searching ? ui.searchScope.kind === "unified" && ui.searchScope.role === role : ui.view.kind === "unified" && ui.view.role === role;
   const isAccountScope = (id: number) => searching && ui.searchScope.kind === "account" && ui.searchScope.accountId === id;
 
-  const everyCollapsed = () => allCollapsed && ui.accounts.every((a) => collapsed[a.id]);
+  const everyCollapsed = () => (!showUnified || allCollapsed) && ui.accounts.every((a) => collapsed[a.id]);
   function setAllCollapsed(value: boolean) {
     allCollapsed = value;
     collapsed = Object.fromEntries(ui.accounts.map((a) => [a.id, value]));
@@ -64,18 +74,20 @@
     e.preventDefault();
     folderMenu(view, unread);
   }
-  const showCount = (f: Folder) => f.unread > 0 && (f.role === "inbox" || !f.role);
 </script>
 
 <aside class="side">
   <header data-tauri-drag-region>
-    <button class="icon-btn" title={hint("New message", "compose")} onclick={() => compose()}>
-      <Icon name="compose" size={17} />
+    <button class="icon-btn" title="Hide sidebar  ⌥⌘S" aria-label="Hide sidebar" onclick={toggleSidebar}>
+      <Icon name="sidebar" size={16} />
+    </button>
+    <button class="icon-btn compose-btn" title={hint("New message", "compose")} aria-label="New message" onclick={() => compose()}>
+      <Icon name="compose" size={16} />
     </button>
   </header>
 
   <nav class="scroll">
-    {#if ui.accounts.length}
+    {#if showUnified}
       <div class="group all">
         <div class="head-row">
           <button
@@ -84,7 +96,7 @@
             oncontextmenu={(e) => { e.preventDefault(); allAccountsMenu(fold(allCollapsed, () => (allCollapsed = !allCollapsed))); }}>
             <span class="glyph"><Icon name="inboxes" size={12} stroke={2} /></span>
             <span class="label">All Accounts</span>
-            <span class="chev" class:open={!allCollapsed}><Icon name="chevron" size={12} stroke={2} /></span>
+            <span class="chev" class:open={!allCollapsed} class:closed={allCollapsed}><Icon name="chevron" size={12} stroke={2} /></span>
           </button>
         </div>
         {#if !allCollapsed}
@@ -116,6 +128,7 @@
       {#each ui.accounts as acc (acc.id)}
         {@const fs = foldersFor(acc.id)}
         {@const st = ui.status[acc.id]}
+        {@const unreadTotal = accountUnread(acc.id)}
         <div class="group" data-id={acc.id}>
           <div class="head-row">
             <button
@@ -124,13 +137,15 @@
               title={acc.email}
               onclick={() => (collapsed[acc.id] = !collapsed[acc.id])}
               oncontextmenu={(e) => { e.preventDefault(); accountMenu(acc, fold(!!collapsed[acc.id], () => (collapsed[acc.id] = !collapsed[acc.id]))); }}>
-              <span class="dot" style:background={acc.color || "var(--muted)"}></span>
+              <span class="acc-bar" style:background={acc.color || "var(--muted)"}></span>
               <span class="label">{accountLabel(acc)}</span>
               {#if st?.state === "error"}
-                <span class="warn" title={st.message ?? ""}><Icon name="alert" size={13} /></span>
+                <span class="warn" title={st.message ?? "Connection error"}><Icon name="alert" size={13} /></span>
               {/if}
-              {#if hasUnread(acc.id)}<span class="unread" title="Unread mail"></span>{/if}
-              <span class="chev" class:open={!collapsed[acc.id]}><Icon name="chevron" size={12} stroke={2} /></span>
+              {#if collapsed[acc.id] && unreadTotal}
+                <span class="count">{unreadTotal}</span>
+              {/if}
+              <span class="chev" class:open={!collapsed[acc.id]} class:closed={!!collapsed[acc.id]}><Icon name="chevron" size={12} stroke={2} /></span>
             </button>
           </div>
           {#if !collapsed[acc.id]}
@@ -146,12 +161,19 @@
                   <span class="label">{f.name}</span>
                   {#if showCount(f)}<span class="count">{f.unread}</span>{/if}
                 </button>
+                {#if !showUnified && f.role === "inbox" && (scheduled.length || ui.view.kind === "outbox")}
+                  <button class="item" class:active={ui.view.kind === "outbox" && !ui.query} onclick={() => setView({ kind: "outbox" })}>
+                    <Icon name="outbox" />
+                    <span class="label">Scheduled</span>
+                    <span class="count" class:failed={scheduled.some((o) => o.error)}>{scheduled.length || ""}</span>
+                  </button>
+                {/if}
               {/each}
             </div>
             {#if fs.extra}
               <button class="more" onclick={() => (showMore[acc.id] = !showMore[acc.id])}>
                 {showMore[acc.id] ? "Less" : "More"}
-                {#if fs.hiddenUnread}<span class="unread" title="Unread mail in hidden folders"></span>{/if}
+                {#if fs.hiddenUnread}<span class="more-unread" title="Unread mail in hidden folders"></span>{/if}
               </button>
             {/if}
           {/if}
@@ -167,18 +189,24 @@
   </nav>
 
   <footer>
-    <button class="icon-btn" title={hint("Settings", "settings")} onclick={() => openSettings()}>
-      <Icon name="settings" />
+    <button class="icon-btn" title={hint("Settings", "settings")} aria-label="Settings" onclick={() => openSettings()}>
+      <Icon name="settings" size={16} />
     </button>
-    <button class="icon-btn" title="Accounts" onclick={() => openAccountSettings()}>
-      <Icon name="at" />
+    <button class="icon-btn" title="Keyboard shortcuts  ?" aria-label="Keyboard shortcuts" onclick={() => (ui.shortcutHelp = true)}>
+      <Icon name="help" size={16} />
     </button>
-    <span class="sync" title={errors.length ? `${errors.length} account(s) can't connect` : ""}>
+    <span class="sync">
       {#if errors.length && !syncing}
-        <span class="err"><Icon name="alert" size={13} /></span>
+        <button
+          class="err-pill"
+          title={errors[0][1].message || `${errors.length} account(s) can't connect — click to fix`}
+          onclick={() => openAccountSettings(Number(errors[0][0]))}>
+          <Icon name="alert" size={12} />
+          <span>{errors.length > 1 ? `${errors.length} errors` : "Sync error"}</span>
+        </button>
       {/if}
     </span>
-    <button class="icon-btn" title={syncing ? "Checking for mail…" : hint("Check for mail", "sync")} onclick={() => api.syncNow()}>
+    <button class="icon-btn" title={syncing ? "Checking for mail…" : hint("Check for mail", "sync")} aria-label="Check for mail" onclick={() => api.syncNow()}>
       <span class:spin={syncing}><Icon name="refresh" size={15} /></span>
     </button>
   </footer>
@@ -199,8 +227,10 @@
     display: flex;
     align-items: center;
     justify-content: flex-end;
-    padding: 0 12px;
+    gap: 2px;
+    padding: 0 10px 0 82px;
   }
+  .compose-btn { color: var(--text); }
   nav { flex: 1; padding: 2px 10px 12px; }
   .item, .group-head, .more, .add {
     display: flex;
@@ -221,10 +251,11 @@
   .item :global(svg) { flex: none; color: var(--muted); }
   .item.active :global(svg) { color: var(--text); }
   .label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .count { font-size: 12px; font-variant-numeric: tabular-nums; color: var(--muted); font-weight: 500; }
+  .count { font-size: 12px; font-variant-numeric: tabular-nums; color: var(--muted); font-weight: 500; flex: none; }
   .item.active .count { color: var(--text-2); }
   .count.failed { color: var(--danger); }
   .group { padding-top: 6px; background: var(--side); border-radius: 8px; }
+  .group:first-child { padding-top: 0; }
   .group:global([data-dragging]), .item:global([data-dragging]) { box-shadow: 0 6px 20px rgba(20, 18, 14, 0.14); }
   .item:global([data-dragging]) { background: var(--panel); }
   .group:global([data-dragging]) .group-head { background: var(--hover); }
@@ -234,24 +265,41 @@
   .group-head.scoped { background: var(--active); color: var(--text); }
   .group.all { margin-bottom: 8px; }
   .glyph { display: grid; place-items: center; width: 16px; flex: none; color: var(--muted); }
-  .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; margin: 0 4px 0 4px; }
-  .chev { display: grid; color: var(--muted); opacity: 0; transition: transform 0.15s, opacity 0.12s; }
+  /* Vertical bar instead of a round dot so account colors never resemble unread dots. */
+  .acc-bar { width: 3px; height: 12px; border-radius: 2px; flex: none; margin: 0 6px 0 7px; }
+  .chev { display: grid; color: var(--muted); opacity: 0; transition: transform 0.15s, opacity 0.12s; flex: none; }
+  .chev.closed { opacity: 0.7; }
   .head-row:hover .chev { opacity: 1; }
   .chev.open { transform: rotate(90deg); }
-  .warn { color: var(--danger); display: grid; }
-  .unread { width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--accent); }
-  .more .unread { margin-left: -3px; }
+  .warn { color: var(--danger); display: grid; flex: none; }
+  .more-unread { width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--accent); margin-left: -3px; }
   .more { font-size: 12px; color: var(--muted); padding-left: 34px; height: 26px; }
   .add { color: var(--accent); font-weight: 500; }
   footer {
     flex: none;
     display: flex;
     align-items: center;
-    gap: 4px;
-    padding: 10px 12px;
+    gap: 2px;
+    padding: 8px 10px;
+    border-top: 1px solid var(--line);
   }
-  .sync { flex: 1; display: flex; justify-content: center; color: var(--muted); }
+  .sync { flex: 1; min-width: 0; display: flex; justify-content: center; color: var(--muted); }
+  .err-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    max-width: 100%;
+    height: 24px;
+    padding: 0 8px;
+    border: 0;
+    border-radius: 99px;
+    background: var(--danger-soft);
+    color: var(--danger);
+    font-size: 11.5px;
+    font-weight: 550;
+  }
+  .err-pill:hover { filter: brightness(0.95); }
+  .err-pill span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   footer .icon-btn > span { display: grid; }
   .spin { animation: spin 1s linear infinite; }
-  .err { display: grid; color: var(--danger); }
 </style>

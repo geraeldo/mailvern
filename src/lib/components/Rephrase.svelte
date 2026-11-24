@@ -3,7 +3,7 @@
   import { MODES, rephrase, type RephraseContext } from "../ai/rephrase";
   import { writeReady, ai } from "../ai/config.svelte";
   import { htmlToPlain } from "../ai/text";
-  import { toast } from "../state.svelte";
+  import { toast, openSettings } from "../state.svelte";
 
   let {
     editor,
@@ -57,11 +57,13 @@
       return;
     }
     if (!ai.hasKey) {
-      toast("Add an OpenRouter key in Settings › Models");
+      openSettings("ai");
+      toast("Add an OpenRouter key first");
       return;
     }
     if (!writeReady()) {
-      toast("Choose a writing model in Settings › Models");
+      openSettings("ai");
+      toast("Choose a writing model first");
       return;
     }
     if (!editor) return;

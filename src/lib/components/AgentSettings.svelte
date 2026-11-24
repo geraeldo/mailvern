@@ -3,6 +3,7 @@
   import { ask } from "@tauri-apps/plugin-dialog";
   import { api, type AgentAccess } from "../api";
   import Icon from "./Icon.svelte";
+  import Switch from "./Switch.svelte";
 
   // Access for coding agents on this Mac, through the MCP server in the app (crates/mail-mcp).
   let access = $state<AgentAccess | null>(null);
@@ -32,21 +33,16 @@
   const token = $derived(access?.token && /^[A-Za-z0-9_-]+$/.test(access.token) ? access.token : "");
   const header = $derived(`Authorization: Bearer ${token}`);
   const shQuote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
-  /**
-   * One-line setup for each agent, in the agents' own commands. Each can be run again:
-   * it replaces the earlier entry, which is how a new token reaches an agent after a reset.
-   * Codex has no flag for a header, so its entry goes straight into its config file.
-   */
   const commands = $derived<Record<string, string>>(
     access && token
       ? {
           "Claude Code": `claude mcp remove mailvern -s user >/dev/null 2>&1; claude mcp add --transport http --scope user mailvern ${shQuote(access.url)} --header ${shQuote(`Authorization: Bearer ${token}`)}`,
           Codex: `codex mcp remove mailvern >/dev/null 2>&1; mkdir -p ~/.codex && printf '\\n[mcp_servers.mailvern]\\nurl = "%s"\\nhttp_headers = { Authorization = "Bearer %s" }\\n' ${shQuote(access.url)} ${shQuote(token)} >> ~/.codex/config.toml`,
-          Opencode: `opencode mcp add --global mailvern --url ${shQuote(access.url)} --header ${shQuote(`Authorization=Bearer ${token}`)}`,
+          OpenCode: `opencode mcp add --global mailvern --url ${shQuote(access.url)} --header ${shQuote(`Authorization=Bearer ${token}`)}`,
         }
       : {},
   );
-  const tabs = ["Claude Code", "Codex", "Opencode", "Other"];
+  const tabs = ["Claude Code", "Codex", "OpenCode", "Other"];
   /** The token stays off the screen; Copy gives the real thing. */
   const masked = (s: string) => (token ? s.replaceAll(token, "••••••••") : s);
 
@@ -79,19 +75,22 @@
 </script>
 
 <section>
-  <label class="toggle">
-    <span class="text">
-      <span class="label">Let agents on this Mac use Mailvern</span>
-      <span class="detail">Read mail, save drafts, and propose rules. Nothing sends, moves or deletes without your approval.</span>
-    </span>
-    <input
-      type="checkbox"
-      role="switch"
-      checked={access?.enabled ?? false}
-      disabled={busy || !access}
-      onchange={(e) => change(api.setAgentAccess(e.currentTarget.checked))}
-    />
-  </label>
+  <div class="toggle-card">
+    <label class="toggle">
+      <span class="text">
+        <span class="label">
+          Let agents on this Mac use Mailvern
+          {#if access?.running}<span class="live"><span class="live-dot"></span>Running</span>{/if}
+        </span>
+        <span class="detail">Read mail, save drafts, and propose rules. Nothing sends, moves or deletes without your approval.</span>
+      </span>
+      <Switch
+        checked={access?.enabled ?? false}
+        disabled={busy || !access}
+        label="Let agents on this Mac use Mailvern"
+        onchange={(on) => change(api.setAgentAccess(on))} />
+    </label>
+  </div>
   {#if failed}
     <p class="err">{failed}</p>
   {:else if access?.enabled && access.error}
@@ -107,13 +106,13 @@
         <div class="banner">
           <Icon name="refresh" size={14} />
           <span>New token. Rerun the command for each agent.</span>
-          <button class="btn ghost sm" onclick={() => (wasReset = false)}>Done</button>
+          <button type="button" class="btn ghost sm" onclick={() => (wasReset = false)}>Done</button>
         </div>
       {/if}
 
       <div class="seg" role="tablist">
         {#each tabs as t (t)}
-          <button role="tab" aria-selected={tab === t} class:on={tab === t} onclick={() => (tab = t)}>
+          <button type="button" role="tab" aria-selected={tab === t} class:on={tab === t} onclick={() => (tab = t)}>
             {t}
             {#if wasReset}
               {#if redone.includes(t)}
@@ -130,14 +129,14 @@
         <div class="field-row">
           <span class="key">URL</span>
           <code>{access.url}</code>
-          <button class="icon-btn" title="Copy URL" onclick={() => copy(access!.url, "url", "Other")}>
+          <button type="button" class="icon-btn" title="Copy URL" onclick={() => copy(access!.url, "url", "Other")}>
             <Icon name={copied === "url" ? "check" : "copy"} size={14} />
           </button>
         </div>
         <div class="field-row">
           <span class="key">Header</span>
           <code>{masked(header)}</code>
-          <button class="icon-btn" title="Copy header" onclick={() => copy(header, "header", "Other")}>
+          <button type="button" class="icon-btn" title="Copy header" onclick={() => copy(header, "header", "Other")}>
             <Icon name={copied === "header" ? "check" : "copy"} size={14} />
           </button>
         </div>
@@ -145,7 +144,7 @@
       {:else}
         <div class="cmd">
           <code>{masked(commands[tab])}</code>
-          <button class="btn sm" onclick={() => copy(commands[tab], tab)}>
+          <button type="button" class="btn sm" onclick={() => copy(commands[tab], tab)}>
             <Icon name={copied === tab ? "check" : "copy"} size={13} />
             {copied === tab ? "Copied" : "Copy"}
           </button>
@@ -155,7 +154,7 @@
 
       <div class="foot">
         <span class="detail">Access token <code class="inline">{masked(token)}</code></span>
-        <button class="btn ghost sm danger" disabled={busy} onclick={reset}>Reset</button>
+        <button type="button" class="btn ghost sm danger" disabled={busy} onclick={reset}>Reset token</button>
       </div>
     </div>
   </section>
@@ -169,40 +168,30 @@
   section + section { margin-top: 24px; }
   h3 { margin: 0 0 8px; font-size: 12px; font-weight: 600; color: var(--muted); }
 
-  .toggle { display: flex; align-items: center; gap: 16px; padding: 4px 0; cursor: default; }
+  .toggle-card {
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--panel);
+    overflow: hidden;
+  }
+  .toggle { display: flex; align-items: center; gap: 16px; padding: 12px 14px; cursor: default; }
+  .toggle:hover { background: var(--hover); }
   .text { flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-  .label { font-size: 13.5px; }
+  .label { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 13.5px; color: var(--text); }
+  .live {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 1px 7px;
+    border-radius: 99px;
+    background: color-mix(in srgb, var(--success) 14%, transparent);
+    color: var(--success);
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--success); }
   .detail { font-size: 12.5px; color: var(--muted); }
   .err { margin: 8px 0 0; font-size: 12.5px; color: var(--danger); }
-
-  /* A switch, drawn on the native checkbox. */
-  input[role="switch"] {
-    appearance: none;
-    flex: none;
-    position: relative;
-    width: 34px;
-    height: 20px;
-    margin: 0;
-    border-radius: 10px;
-    background: var(--line-strong);
-    transition: background 0.15s;
-    cursor: default;
-  }
-  input[role="switch"]::after {
-    content: "";
-    position: absolute;
-    top: 2px;
-    left: 2px;
-    width: 16px;
-    height: 16px;
-    border-radius: 50%;
-    background: #fff;
-    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
-    transition: transform 0.15s;
-  }
-  input[role="switch"]:checked { background: var(--accent); }
-  input[role="switch"]:checked::after { transform: translateX(14px); }
-  input[role="switch"]:disabled { opacity: 0.5; }
 
   .card {
     display: flex;
@@ -211,6 +200,7 @@
     padding: 12px;
     border: 1px solid var(--line);
     border-radius: var(--radius);
+    background: var(--panel);
     transition: border-color 0.2s;
   }
   .card.reset { border-color: var(--accent); }
@@ -243,6 +233,7 @@
     font-weight: 500;
     color: var(--muted);
   }
+  .seg button:hover:not(.on) { color: var(--text); }
   .seg button.on { background: var(--panel); color: var(--text); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08); }
   .mark { display: inline-grid; place-items: center; }
   .mark.due { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
@@ -253,6 +244,7 @@
     color: var(--text-2);
     overflow-wrap: anywhere;
     user-select: text;
+    -webkit-user-select: text;
   }
   .cmd {
     display: flex;
@@ -262,7 +254,7 @@
     border-radius: 8px;
     background: var(--hover);
   }
-  .cmd code { flex: 1; min-width: 0; padding-top: 3px; }
+  .cmd code { flex: 1; min-width: 0; padding-top: 4px; }
   .field-row {
     display: flex;
     align-items: center;
@@ -276,7 +268,6 @@
   .key { width: 46px; flex: none; font-size: 11.5px; color: var(--muted); }
   .hint { margin: -2px 0 0; font-size: 12px; color: var(--muted); }
 
-  .btn.sm { height: 26px; padding: 0 10px; font-size: 12px; flex: none; }
   .foot {
     display: flex;
     align-items: center;
@@ -288,5 +279,5 @@
   .foot .detail { display: flex; align-items: center; gap: 6px; }
   code.inline { letter-spacing: 1px; color: var(--muted); }
 
-  .note { margin: 20px 0 0; font-size: 12px; line-height: 1.5; color: var(--muted); }
+  .note { margin: 16px 0 0; font-size: 12px; line-height: 1.5; color: var(--muted); }
 </style>

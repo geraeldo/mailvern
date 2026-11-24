@@ -12,6 +12,7 @@
     placeholder = "",
     minHeight = 200,
     oninput,
+    aboveBar,
     children,
   }: {
     html?: string;
@@ -19,6 +20,7 @@
     placeholder?: string;
     minHeight?: number;
     oninput?: () => void;
+    aboveBar?: Snippet;
     children?: Snippet;
   } = $props();
 
@@ -28,6 +30,8 @@
   let saved: Range | null = null;
   let active = $state<Record<string, boolean>>({});
   let block = $state("div");
+  let align = $state<"alignLeft" | "alignCenter" | "alignRight">("alignLeft");
+  let textColor = $state("#d6402e");
 
   const TEXT_COLORS = ["#1d1c1a", "#6b6862", "#d6402e", "#e0882a", "#c9a400", "#3f8f4a", "#2f9c95", "#2459e0", "#7a5af8", "#c2417a"];
   const HIGHLIGHTS = ["#fff3a3", "#d7f5d0", "#dbe7ff", "#ffdcec", "#ffe3c2"];
@@ -64,6 +68,7 @@
     restoreSelection();
     document.execCommand("styleWithCSS", false, "true");
     document.execCommand(cmd, false, value);
+    if (cmd === "foreColor" && value) textColor = value;
     pop = null;
     refresh();
     oninput?.();
@@ -81,6 +86,11 @@
     };
     const b = String(document.queryCommandValue("formatBlock") || "div").toLowerCase();
     block = STYLES.some((s) => s.tag === b) ? b : "div";
+    align = document.queryCommandState("justifyCenter")
+      ? "alignCenter"
+      : document.queryCommandState("justifyRight")
+        ? "alignRight"
+        : "alignLeft";
   }
 
   function toggle(p: Pop) {
@@ -185,7 +195,16 @@
   const keep = (e: MouseEvent) => e.preventDefault();
 </script>
 
-<svelte:window onmousedown={(e) => { if (pop && !(e.target as Element).closest?.(".pop, .has-pop")) pop = null; }} />
+<svelte:window
+  onmousedown={(e) => { if (pop && !(e.target as Element).closest?.(".pop, .has-pop")) pop = null; }}
+  onkeydowncapture={(e) => {
+    if (pop && e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      pop = null;
+      restoreSelection();
+    }
+  }} />
 
 <div class="editor">
   <div
@@ -203,6 +222,10 @@
     onblur={keepSelection}
     onkeydown={onKey}
     onpaste={onPaste}></div>
+
+  {#if aboveBar}
+    {@render aboveBar()}
+  {/if}
 
   <div class="bar">
     <div class="tools">
@@ -226,7 +249,7 @@
       <button type="button" class="icon-btn" class:on={active.strike} title="Strikethrough  ⌘⇧X" onmousedown={keep} onclick={() => exec("strikeThrough")}><Icon name="strike" size={15} /></button>
       <span class="has-pop">
         <button type="button" class="icon-btn" title="Color" onmousedown={keep} onclick={() => toggle("color")}>
-          <span class="color-a">A</span>
+          <span class="color-a" style:border-bottom-color={textColor}>A</span>
         </button>
         {#if pop === "color"}
           <div class="pop colors">
@@ -250,12 +273,12 @@
       <button type="button" class="icon-btn" class:on={active.ul} title="Bulleted list  ⌘⇧8" onmousedown={keep} onclick={() => exec("insertUnorderedList")}><Icon name="list" size={15} /></button>
       <button type="button" class="icon-btn" class:on={active.ol} title="Numbered list  ⌘⇧7" onmousedown={keep} onclick={() => exec("insertOrderedList")}><Icon name="olist" size={15} /></button>
       <span class="has-pop">
-        <button type="button" class="icon-btn" title="Align" onmousedown={keep} onclick={() => toggle("align")}><Icon name="alignLeft" size={15} /></button>
+        <button type="button" class="icon-btn" title="Align" onmousedown={keep} onclick={() => toggle("align")}><Icon name={align} size={15} /></button>
         {#if pop === "align"}
           <div class="pop row">
-            <button type="button" class="icon-btn" title="Left" onmousedown={keep} onclick={() => exec("justifyLeft")}><Icon name="alignLeft" size={15} /></button>
-            <button type="button" class="icon-btn" title="Center" onmousedown={keep} onclick={() => exec("justifyCenter")}><Icon name="alignCenter" size={15} /></button>
-            <button type="button" class="icon-btn" title="Right" onmousedown={keep} onclick={() => exec("justifyRight")}><Icon name="alignRight" size={15} /></button>
+            <button type="button" class="icon-btn" class:on={align === "alignLeft"} title="Left" onmousedown={keep} onclick={() => exec("justifyLeft")}><Icon name="alignLeft" size={15} /></button>
+            <button type="button" class="icon-btn" class:on={align === "alignCenter"} title="Center" onmousedown={keep} onclick={() => exec("justifyCenter")}><Icon name="alignCenter" size={15} /></button>
+            <button type="button" class="icon-btn" class:on={align === "alignRight"} title="Right" onmousedown={keep} onclick={() => exec("justifyRight")}><Icon name="alignRight" size={15} /></button>
           </div>
         {/if}
       </span>

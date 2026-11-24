@@ -17,9 +17,9 @@
   let input = $state<HTMLInputElement>();
   let listEl = $state<HTMLDivElement>();
   let root = $state<HTMLDivElement>();
-  /** Opens upward when there's more room above, and the list fits the room it has. */
-  let up = $state(false);
-  let listMax = $state(320);
+  let popEl = $state<HTMLDivElement>();
+  let trigger = $state<HTMLButtonElement>();
+  let place = $state({ left: 0, top: "auto", bottom: "auto", listMax: 300 });
 
   const shown = $derived.by(() => {
     const words = query.toLowerCase().split(/\s+/).filter(Boolean);
@@ -33,10 +33,17 @@
     if (!open) return;
     if (root) {
       const r = root.getBoundingClientRect();
+      const popWidth = Math.min(380, window.innerWidth - 24);
       const below = window.innerHeight - r.bottom - 16;
       const above = r.top - 16;
-      up = below < 300 && above > below;
-      listMax = Math.max(120, Math.min(320, (up ? above : below) - 60));
+      const up = below < 280 && above > below;
+      const left = Math.max(12, Math.min(r.right - popWidth, window.innerWidth - popWidth - 12));
+      place = {
+        left,
+        top: up ? "auto" : `${r.bottom + 6}px`,
+        bottom: up ? `${window.innerHeight - r.top + 6}px` : "auto",
+        listMax: Math.max(120, Math.min(300, (up ? above : below) - 56)),
+      };
     }
     query = "";
     active = 0;
@@ -53,14 +60,20 @@
     }
   }
 
+  function close(refocus = false) {
+    open = false;
+    if (refocus) trigger?.focus();
+  }
+
   function pick(m: ModelInfo) {
     onpick(m);
-    open = false;
+    close(true);
   }
 
   function onKey(e: KeyboardEvent) {
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault();
+      if (!shown.length) return;
       active = Math.max(0, Math.min(shown.length - 1, active + (e.key === "ArrowDown" ? 1 : -1)));
       listEl?.querySelectorAll<HTMLElement>(".opt")[active]?.scrollIntoView({ block: "nearest" });
     } else if (e.key === "Enter" && shown[active]) {
@@ -69,20 +82,31 @@
     } else if (e.key === "Escape") {
       e.preventDefault();
       e.stopPropagation();
-      open = false;
+      close(true);
     }
   }
 </script>
 
-<svelte:window onmousedown={(e) => { if (open && !(e.target as Element).closest?.(".picker")) open = false; }} />
+<svelte:window
+  onmousedown={(e) => {
+    const t = e.target as Node;
+    if (open && !root?.contains(t) && !popEl?.contains(t)) close();
+  }}
+  onresize={() => open && close()}
+  onscrollcapture={(e) => { if (open && !popEl?.contains(e.target as Node)) close(); }} />
 
 <div class="picker" bind:this={root}>
-  <button class="current" onclick={toggle}>
+  <button type="button" class="current" class:open bind:this={trigger} aria-expanded={open} onclick={toggle}>
     <span class="name">{value?.name ?? "Choose a model"}</span>
     <span class="caret"><Icon name="chevronDown" size={13} stroke={2} /></span>
   </button>
   {#if open}
-    <div class="pop" class:up>
+    <div
+      class="pop"
+      bind:this={popEl}
+      style:left="{place.left}px"
+      style:top={place.top}
+      style:bottom={place.bottom}>
       <input
         bind:this={input}
         bind:value={query}
@@ -91,14 +115,14 @@
         class="search"
         placeholder="Search models"
         spellcheck="false" />
-      <div class="list scroll" bind:this={listEl} style:max-height="{listMax}px">
+      <div class="list scroll" bind:this={listEl} style:max-height="{place.listMax}px">
         {#if loading}
           <div class="note"><span class="spinner"></span></div>
         {:else if error}
           <div class="note">{error}</div>
         {:else}
           {#each shown as m, i (m.id)}
-            <button class="opt" class:on={m.id === value?.id} class:active={i === active} onmouseenter={() => (active = i)} onclick={() => pick(m)}>
+            <button type="button" class="opt" class:on={m.id === value?.id} class:active={i === active} onmouseenter={() => (active = i)} onclick={() => pick(m)}>
               <span class="row1">
                 <span class="mname">{m.name}</span>
                 {#if m.vision}<span class="tag">Images</span>{/if}
@@ -117,7 +141,7 @@
 
 <style>
   /* Never shrinks under the label next to it; the model name truncates instead. */
-  .picker { position: relative; flex: none; max-width: min(260px, 45%); }
+  .picker { position: relative; flex: none; max-width: min(260px, 48%); }
   .current {
     display: inline-flex;
     align-items: center;
@@ -130,15 +154,13 @@
     background: var(--field);
     font-size: 13px;
   }
-  .current:hover { background: var(--hover); }
-  .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .caret { display: grid; color: var(--muted); }
+  .current:hover, .current.open { background: var(--hover); }
+  .name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .caret { display: grid; flex: none; color: var(--muted); }
   .pop {
-    position: absolute;
-    right: 0;
-    top: calc(100% + 6px);
-    z-index: 30;
-    width: 380px;
+    position: fixed;
+    z-index: 100;
+    width: min(380px, calc(100vw - 24px));
     padding: 6px;
     background: var(--panel);
     border: 1px solid var(--line);
@@ -146,7 +168,6 @@
     box-shadow: var(--shadow);
     animation: rise 0.12s ease-out;
   }
-  .pop.up { top: auto; bottom: calc(100% + 6px); }
   .search {
     width: 100%;
     height: 32px;
@@ -157,13 +178,16 @@
     outline: none;
     font-size: 13px;
   }
-  .search:focus { border-color: var(--accent); }
+  .search:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
   .list { margin-top: 6px; }
   .opt {
     display: flex;
     flex-direction: column;
+    align-items: stretch;
     gap: 1px;
     width: 100%;
+    max-width: 100%;
+    overflow: hidden;
     padding: 6px 8px;
     border: 0;
     border-radius: 7px;
@@ -172,11 +196,11 @@
   }
   .opt.active { background: var(--hover); }
   .opt.on { background: var(--selected); }
-  .row1 { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text); }
+  .row1 { display: flex; align-items: center; gap: 6px; width: 100%; min-width: 0; font-size: 13px; color: var(--text); }
   .row1 :global(svg) { color: var(--accent); margin-left: auto; flex: none; }
-  .mname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .tag { flex: none; padding: 0 5px; border-radius: 4px; background: var(--hover); color: var(--muted); font-size: 10.5px; font-weight: 600; line-height: 16px; }
-  .row2 { font-size: 11.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row2 { display: block; width: 100%; font-size: 11.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .note { display: grid; place-items: center; padding: 18px; color: var(--muted); font-size: 12.5px; }
   .spinner {
     width: 16px;

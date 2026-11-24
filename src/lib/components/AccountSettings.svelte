@@ -1,15 +1,25 @@
 <script lang="ts">
   import { ask } from "@tauri-apps/plugin-dialog";
-  import { untrack } from "svelte";
   import Icon from "./Icon.svelte";
   import Editor from "./Editor.svelte";
   import MailFrame from "./MailFrame.svelte";
-  import Modal from "./Modal.svelte";
-  import { ui, loadAccounts, loadFolders, setView, toast, accountLabel } from "../state.svelte";
+  import { ui, loadAccounts, loadFolders, setView, toast, checkAccountForMail } from "../state.svelte";
   import { api, type Account } from "../api";
   import { accountColors } from "../format";
-  import { guessServers } from "../providers";
+  import { detectProvider, guessServers } from "../providers";
   import { sanitize } from "../html";
+
+  let {
+    target,
+    firstRun = false,
+    onselect,
+    onclose,
+  }: {
+    target: number | "new";
+    firstRun?: boolean;
+    onselect?: (id: number | "new") => void;
+    onclose?: () => void;
+  } = $props();
 
   function blank(): Account {
     return {
@@ -27,46 +37,87 @@
     };
   }
 
-  const target = untrack(() => ui.accountSettings);
-  const firstId = typeof target === "number" ? target : 0;
+  function fromTarget(t: number | "new"): Account {
+    if (typeof t === "number") {
+      const a = ui.accounts.find((x) => x.id === t);
+      if (a) return { ...a };
+    }
+    return blank();
+  }
 
-  let selected = $state<number>(firstId);
-  let draft = $state<Account>(fromId(firstId));
+  let draft = $state<Account>(blank());
+  let originSnapshot = $state("");
   let password = $state("");
-  let advanced = $state(firstId === 0);
+  let advanced = $state(false);
+  let customize = $state(false);
   let saving = $state(false);
   let error = $state<string | null>(null);
   let sigEl = $state<HTMLDivElement>();
   let sigMode = $state<"visual" | "html">("visual");
   let sigHtml = $state("");
   let sigKey = $state(0);
-  let hostsTouched = firstId !== 0;
+  let hostsTouched = false;
+  let loadedTarget: number | "new" | null = null;
 
-  function fromId(id: number): Account {
-    const a = ui.accounts.find((x) => x.id === id);
-    return a ? { ...a } : blank();
+  const provider = $derived(detectProvider(draft.email));
+
+  function snapshotOf(a: Account, sig: string): string {
+    return JSON.stringify({
+      label: a.label,
+      name: a.name,
+      email: a.email,
+      imapHost: a.imapHost,
+      imapPort: a.imapPort,
+      smtpHost: a.smtpHost,
+      smtpPort: a.smtpPort,
+      color: a.color,
+      signature: sig,
+    });
   }
 
-  function choose(id: number) {
-    selected = id;
-    draft = fromId(id);
+  function loadTarget(t: number | "new") {
+    const next = fromTarget(t);
+    draft = next;
     password = "";
     error = null;
-    advanced = id === 0;
+    advanced = false;
+    customize = next.id !== 0;
     sigMode = "visual";
+    sigHtml = next.signature;
     sigKey++;
-    hostsTouched = id !== 0;
+    hostsTouched = next.id !== 0;
+    originSnapshot = snapshotOf(next, next.signature);
+    loadedTarget = t;
   }
 
-  function onEmail() {
-    if (hostsTouched || draft.id) return;
-    const s = guessServers(draft.email);
-    if (s) Object.assign(draft, s);
-  }
+  $effect(() => {
+    if (target !== loadedTarget) loadTarget(target);
+  });
 
   function currentSignature(): string {
     const html = sigMode === "html" ? sanitize(sigHtml) : (sigEl?.innerHTML ?? draft.signature);
     return html.trim().replace(/^(<br\s*\/?>|\s|<div><br\s*\/?><\/div>)+$/i, "");
+  }
+
+  export function isDirty(): boolean {
+    if (password.length > 0) return true;
+    return snapshotOf(draft, currentSignature()) !== originSnapshot;
+  }
+
+  function onEmail() {
+    if (hostsTouched || draft.id) return;
+    const p = detectProvider(draft.email);
+    if (p) {
+      Object.assign(draft, p.servers);
+      advanced = false;
+      return;
+    }
+    const s = guessServers(draft.email);
+    if (s) {
+      Object.assign(draft, s);
+      // Custom domain: reveal servers so the user can confirm/adjust.
+      advanced = true;
+    }
   }
 
   function setSigMode(mode: "visual" | "html") {
@@ -80,7 +131,7 @@
     sigMode = mode;
   }
 
-  async function save() {
+  export async function save() {
     if (saving) return;
     error = null;
     if (!draft.email.includes("@")) {
@@ -98,6 +149,7 @@
     }
     saving = true;
     try {
+      const wasFirst = ui.accounts.length === 0;
       const saved = await api.saveAccount(
         { ...draft, email: draft.email.trim(), label: draft.label.trim(), name: draft.name.trim(), signature: currentSignature() },
         password || null,
@@ -106,13 +158,17 @@
       const keepHtml = sigHtml;
       await loadAccounts();
       await loadFolders();
-      choose(saved.id);
+      loadTarget(saved.id);
       if (keepMode === "html") {
         sigMode = "html";
         sigHtml = keepHtml;
       }
-      toast("Saved");
-      if (ui.accounts.length === 1) setView({ kind: "unified", role: "inbox" });
+      onselect?.(saved.id);
+      toast(wasFirst ? "Account connected" : "Saved");
+      if (wasFirst) {
+        setView({ kind: "unified", role: "inbox" });
+        onclose?.();
+      }
     } catch (e) {
       error = String(e);
     } finally {
@@ -136,7 +192,9 @@
       await loadAccounts();
       await loadFolders();
       setView({ kind: "unified", role: "inbox" });
-      choose(ui.accounts[0]?.id ?? 0);
+      const next = ui.accounts[0]?.id ?? "new";
+      loadTarget(next);
+      onselect?.(next);
     } catch (e) {
       error = String(e);
     } finally {
@@ -144,60 +202,34 @@
     }
   }
 
-  function close() {
-    ui.accountSettings = null;
-  }
-
   function onKey(e: KeyboardEvent) {
-    if (e.metaKey && e.key === "s") {
+    if (e.metaKey && e.key.toLowerCase() === "s") {
       e.preventDefault();
       save();
     }
   }
 </script>
 
-<Modal label="Accounts" onclose={close} onkeydown={onKey}>
-  <aside>
-    <div class="side-title">Accounts</div>
-    {#each ui.accounts as a (a.id)}
-      <button class="nav acc" class:active={selected === a.id} onclick={() => choose(a.id)}>
-        <span class="dot" style:background={a.color || "var(--muted)"}></span>
-        <span class="acc-text">
-          <span class="acc-name">{accountLabel(a)}</span>
-          <span class="acc-mail">{a.email}</span>
-        </span>
-        {#if ui.status[a.id]?.state === "error"}<span class="warn"><Icon name="alert" size={13} /></span>{/if}
-      </button>
-    {/each}
-    <button class="nav add" class:active={selected === 0} onclick={() => choose(0)}>
-      <Icon name="plus" size={15} /> Add account
-    </button>
-  </aside>
+<svelte:window onkeydown={onKey} />
 
-  <main class="scroll">
-    <header>
-      <h2>
-        {#if draft.id}{accountLabel(draft)}{:else}New account{/if}
-      </h2>
-      <button class="icon-btn" title="Close  Esc" onclick={close}><Icon name="x" /></button>
-    </header>
+<div class="acc-pane">
+  {#if firstRun && !draft.id}
+    <p class="welcome">Connect an email account over IMAP and SMTP. Your credentials stay in your Mac's Keychain.</p>
+  {/if}
 
-    {#if draft.id && ui.status[draft.id]?.state === "error"}
-      <div class="notice">{ui.status[draft.id].message}</div>
-    {/if}
+  {#if draft.id && ui.status[draft.id]?.state === "error"}
+    <div class="notice">
+      <Icon name="alert" size={15} />
+      <span class="notice-msg">{ui.status[draft.id].message || "Couldn't connect to this account."}</span>
+      <button type="button" class="btn sm" onclick={() => checkAccountForMail(draft.id)}>Retry</button>
+    </div>
+  {/if}
 
+  <div class="card">
     <div class="grid">
       <label>
-        <span>Label</span>
-        <input class="field" bind:value={draft.label} placeholder="Work, Personal…" />
-      </label>
-      <label>
-        <span>Sender name</span>
-        <input class="field" bind:value={draft.name} placeholder="Your name" />
-      </label>
-      <label>
         <span>Email</span>
-        <input class="field" bind:value={draft.email} oninput={onEmail} placeholder="you@company.com" spellcheck="false" />
+        <input class="field" bind:value={draft.email} oninput={onEmail} placeholder="you@company.com" spellcheck="false" autocomplete="username" />
       </label>
       <label>
         <span>Password</span>
@@ -208,32 +240,61 @@
           placeholder={draft.id ? "Saved in Keychain" : "Password or app password"}
           autocomplete="off" />
       </label>
-      <div class="wide">
-        <span class="lbl">Color</span>
-        <div class="swatches">
-          {#each accountColors as c (c)}
-            <button
-              class="swatch"
-              class:on={draft.color === c}
-              style:background={c}
-              aria-label="Color"
-              onclick={() => (draft.color = c)}></button>
-          {/each}
+    </div>
+
+    {#if !draft.id && provider}
+      <div class="detected">
+        <span class="detected-ok"><Icon name="check" size={13} stroke={2.4} /> {provider.name} servers configured</span>
+        <button type="button" class="link" onclick={() => (advanced = !advanced)}>{advanced ? "Hide servers" : "Edit"}</button>
+      </div>
+    {/if}
+    {#if !draft.id && provider?.passwordHint}
+      <p class="hint">{provider.passwordHint}</p>
+    {/if}
+  </div>
+
+  {#if draft.id || customize}
+    <section>
+      <div class="sec-title">Profile</div>
+      <div class="card">
+        <div class="grid">
+          <label>
+            <span>Label</span>
+            <input class="field" bind:value={draft.label} placeholder="Work, Personal…" />
+          </label>
+          <label>
+            <span>Sender name</span>
+            <input class="field" bind:value={draft.name} placeholder="Your name" />
+          </label>
+          <div class="wide">
+            <span class="lbl">Color</span>
+            <div class="swatches">
+              {#each accountColors as c (c)}
+                <button
+                  type="button"
+                  class="swatch"
+                  class:on={draft.color === c}
+                  style:background={c}
+                  aria-label="Account color"
+                  onclick={() => (draft.color = c)}></button>
+              {/each}
+            </div>
+          </div>
         </div>
       </div>
-    </div>
+    </section>
 
     <section>
       <div class="sec-head">
-        <h3>Signature</h3>
+        <span class="sec-title">Signature</span>
         <div class="seg" role="tablist">
-          <button role="tab" class:on={sigMode === "visual"} onclick={() => setSigMode("visual")}>Visual</button>
-          <button role="tab" class:on={sigMode === "html"} onclick={() => setSigMode("html")}>HTML</button>
+          <button type="button" role="tab" aria-selected={sigMode === "visual"} class:on={sigMode === "visual"} onclick={() => setSigMode("visual")}>Visual</button>
+          <button type="button" role="tab" aria-selected={sigMode === "html"} class:on={sigMode === "html"} onclick={() => setSigMode("html")}>HTML</button>
         </div>
       </div>
       {#if sigMode === "visual"}
         <div class="sig">
-          {#key `${selected}-${sigKey}`}
+          {#key `${target}-${sigKey}`}
             <Editor bind:el={sigEl} html={sanitize(draft.signature)} minHeight={110} placeholder="Write or paste your signature" />
           {/key}
         </div>
@@ -247,17 +308,24 @@
         </div>
       {/if}
     </section>
+  {:else}
+    <button type="button" class="disclose" onclick={() => (customize = true)}>
+      <span class="chev"><Icon name="chevron" size={12} stroke={2} /></span>
+      Customize name, color &amp; signature
+    </button>
+  {/if}
 
-    <section>
-      <button class="disclose" onclick={() => (advanced = !advanced)}>
-        <span class="chev" class:open={advanced}><Icon name="chevron" size={12} stroke={2} /></span>
-        Servers
-      </button>
-      {#if advanced}
+  <section>
+    <button type="button" class="disclose" onclick={() => (advanced = !advanced)}>
+      <span class="chev" class:open={advanced}><Icon name="chevron" size={12} stroke={2} /></span>
+      Servers (IMAP &amp; SMTP)
+    </button>
+    {#if advanced}
+      <div class="card servers-card">
         <div class="grid servers">
           <label>
             <span>Incoming (IMAP)</span>
-            <input class="field" bind:value={draft.imapHost} oninput={() => (hostsTouched = true)} spellcheck="false" />
+            <input class="field" bind:value={draft.imapHost} oninput={() => (hostsTouched = true)} placeholder="imap.example.com" spellcheck="false" />
           </label>
           <label class="port">
             <span>Port</span>
@@ -265,7 +333,7 @@
           </label>
           <label>
             <span>Outgoing (SMTP)</span>
-            <input class="field" bind:value={draft.smtpHost} oninput={() => (hostsTouched = true)} spellcheck="false" />
+            <input class="field" bind:value={draft.smtpHost} oninput={() => (hostsTouched = true)} placeholder="smtp.example.com" spellcheck="false" />
           </label>
           <label class="port">
             <span>Port</span>
@@ -273,83 +341,86 @@
           </label>
         </div>
         <p class="hint">SSL on 993 and 465. STARTTLS on 587.</p>
-      {/if}
-    </section>
+      </div>
+    {/if}
+  </section>
 
-    {#if error}<div class="error">{error}</div>{/if}
+  {#if error}<div class="error">{error}</div>{/if}
 
-    <footer>
-      {#if draft.id}
-        <button class="btn ghost danger" onclick={remove}>Remove</button>
-      {/if}
-      <span class="grow"></span>
-      <button class="btn primary" disabled={saving} onclick={save} title="Save  ⌘S">
-        {saving ? "Connecting…" : draft.id ? "Save" : "Add account"}
-      </button>
-    </footer>
-  </main>
-</Modal>
+  <footer>
+    {#if draft.id}
+      <button type="button" class="btn ghost danger" disabled={saving} onclick={remove}>Remove account</button>
+    {/if}
+    <span class="grow"></span>
+    <button type="button" class="btn primary" disabled={saving} onclick={save} title="Save  ⌘S">
+      {saving ? "Connecting…" : draft.id ? "Save changes" : "Connect account"}
+    </button>
+  </footer>
+</div>
 
 <style>
-  aside {
-    width: 240px;
-    flex: none;
-    display: flex;
-    flex-direction: column;
-    padding: 18px 10px 12px;
-    background: var(--side);
-    border-right: 1px solid var(--line);
-    overflow-y: auto;
+  .acc-pane { display: flex; flex-direction: column; gap: 18px; }
+  .welcome { margin: -4px 0 2px; font-size: 13.5px; color: var(--muted); line-height: 1.5; }
+  .card {
+    padding: 14px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--panel);
   }
-  .side-title { font-size: 12px; font-weight: 600; color: var(--muted); padding: 0 10px 10px; }
-  .nav {
+  .notice {
     display: flex;
     align-items: center;
     gap: 10px;
-    width: 100%;
-    padding: 8px 10px;
-    border: 0;
-    border-radius: 8px;
-    background: transparent;
-    text-align: left;
-    font-size: 13.5px;
-    color: var(--text-2);
-  }
-  .nav:hover { background: var(--hover); }
-  .nav.active { background: var(--active); color: var(--text); }
-  .nav :global(svg) { color: var(--muted); flex: none; }
-  .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
-  .acc-text { display: flex; flex-direction: column; min-width: 0; flex: 1; }
-  .acc-name { font-weight: 500; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .acc-mail { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .nav.add { color: var(--accent); font-weight: 500; margin-top: 6px; }
-  .nav.add :global(svg) { color: var(--accent); }
-  .grow { flex: 1; }
-  .warn { color: var(--danger); display: grid; }
-  main { flex: 1; display: flex; flex-direction: column; padding: 0 28px 22px; min-width: 0; }
-  header { display: flex; align-items: center; justify-content: space-between; height: 64px; flex: none; margin-right: -10px; }
-  h2 { margin: 0; font-size: 18px; font-weight: 650; letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .notice, .error {
-    margin-bottom: 16px;
     padding: 10px 12px;
     border-radius: 8px;
-    background: rgba(214, 64, 46, 0.08);
+    background: var(--danger-soft);
     color: var(--danger);
     font-size: 13px;
     -webkit-user-select: text;
     user-select: text;
   }
-  .error { margin: 18px 0 0; }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .notice :global(svg) { flex: none; }
+  .notice-msg { flex: 1; min-width: 0; }
+  .error {
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: var(--danger-soft);
+    color: var(--danger);
+    font-size: 13px;
+    -webkit-user-select: text;
+    user-select: text;
+  }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
   .wide { grid-column: span 2; }
   label { display: flex; flex-direction: column; gap: 6px; }
   label span, .lbl { font-size: 12.5px; font-weight: 500; color: var(--text-2); }
-  .swatches { display: flex; gap: 8px; margin-top: 8px; }
-  .swatch { width: 22px; height: 22px; border-radius: 50%; border: 0; padding: 0; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.08); }
+  .detected {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--line);
+    font-size: 12.5px;
+  }
+  .detected-ok { display: inline-flex; align-items: center; gap: 6px; color: var(--success); font-weight: 500; }
+  .link { border: 0; padding: 0; background: none; color: var(--accent); font-size: 12.5px; font-weight: 500; cursor: pointer; }
+  .link:hover { text-decoration: underline; }
+  .swatches { display: flex; gap: 8px; margin-top: 4px; }
+  .swatch {
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    border: 0;
+    padding: 0;
+    box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.08);
+    transition: transform 0.12s, box-shadow 0.12s;
+  }
+  .swatch:hover { transform: scale(1.1); }
   .swatch.on { box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--text); }
-  section { margin-top: 26px; }
-  .sec-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
-  h3 { margin: 0; font-size: 13.5px; font-weight: 600; }
+  section { display: flex; flex-direction: column; gap: 8px; }
+  .sec-head { display: flex; align-items: center; justify-content: space-between; }
+  .sec-title { font-size: 12px; font-weight: 600; color: var(--muted); }
   .seg { display: inline-flex; padding: 2px; border-radius: 8px; background: var(--hover); }
   .seg button {
     height: 24px;
@@ -361,42 +432,57 @@
     font-weight: 500;
     color: var(--muted);
   }
+  .seg button:hover:not(.on) { color: var(--text); }
   .seg button.on { background: var(--panel); color: var(--text); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08); }
   .sig {
     display: flex;
     flex-direction: column;
-    min-height: 180px;
+    min-height: 170px;
     padding: 10px 14px;
     border: 1px solid var(--line-strong);
-    border-radius: 10px;
+    border-radius: var(--radius);
+    background: var(--field);
   }
   .sig.html { padding: 0; }
   textarea {
     flex: 1;
-    min-height: 180px;
+    min-height: 170px;
     padding: 12px 14px;
     border: 0;
-    border-radius: 10px;
+    border-radius: var(--radius);
     outline: none;
     background: transparent;
     resize: vertical;
     font: 12.5px/1.55 ui-monospace, "SF Mono", Menlo, monospace;
   }
-  .preview-label { font-size: 12px; font-weight: 600; color: var(--muted); margin: 14px 0 6px; }
-  .preview { padding: 12px 14px; border-radius: 10px; background: #fff; border: 1px solid var(--line); }
+  .preview-label { font-size: 12px; font-weight: 600; color: var(--muted); margin-top: 6px; }
+  .preview { padding: 12px 14px; border-radius: var(--radius); background: #fff; border: 1px solid var(--line); }
   .disclose {
-    display: flex;
+    display: inline-flex;
     align-items: center;
+    align-self: flex-start;
     gap: 6px;
     border: 0;
     background: none;
-    padding: 0;
-    font-size: 13.5px;
-    font-weight: 600;
+    padding: 4px 6px;
+    margin-left: -6px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 550;
+    color: var(--text-2);
   }
+  .disclose:hover { background: var(--hover); color: var(--text); }
   .chev { display: grid; color: var(--muted); transition: transform 0.15s; }
   .chev.open { transform: rotate(90deg); }
-  .servers { grid-template-columns: 1fr 96px; margin-top: 14px; }
-  .hint { margin: 10px 0 0; font-size: 12px; color: var(--muted); }
-  footer { display: flex; align-items: center; gap: 8px; margin-top: auto; padding-top: 24px; }
+  .servers-card { margin-top: 2px; }
+  .servers { grid-template-columns: 1fr 96px; }
+  .hint { margin: 8px 0 0; font-size: 12px; color: var(--muted); }
+  .grow { flex: 1; }
+  footer {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding-top: 12px;
+    border-top: 1px solid var(--line);
+  }
 </style>

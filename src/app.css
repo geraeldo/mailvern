@@ -2,18 +2,27 @@
   --bg: #ffffff;
   --side: #f6f5f2;
   --panel: #ffffff;
+  --surface: #faf9f6;
   --line: #ebe9e4;
   --line-strong: #dedbd4;
+  --sheet-border: rgba(20, 18, 14, 0.08);
   --text: #1d1c1a;
   --text-2: #43403b;
   --muted: #6b6760;
   --hover: rgba(29, 28, 26, 0.045);
-  --active: rgba(29, 28, 26, 0.075);
+  --active: rgba(29, 28, 26, 0.08);
   --accent: #2459e0;
+  --accent-hover: #1d4cc4;
   --accent-soft: #eaf0ff;
   --accent-text: #ffffff;
   --selected: #eef2fc;
   --danger: #d6402e;
+  --danger-soft: rgba(214, 64, 46, 0.1);
+  --warn: #b8741a;
+  --warn-soft: #fff1dc;
+  --warn-text: #8c5200;
+  --flag: #e0882a;
+  --success: #2f8f4e;
   --field: #ffffff;
   --shadow: 0 1px 2px rgba(20, 18, 14, 0.06), 0 12px 40px rgba(20, 18, 14, 0.14);
   --radius: 10px;
@@ -26,18 +35,28 @@
     --bg: #1b1b1a;
     --side: #222221;
     --panel: #1b1b1a;
+    --surface: #232322;
     --line: #2d2c2a;
     --line-strong: #3a3936;
+    --sheet-border: rgba(255, 255, 255, 0.1);
     --text: #edece9;
     --text-2: #d3d0c9;
     --muted: #a6a39c;
-    --hover: rgba(255, 255, 255, 0.05);
-    --active: rgba(255, 255, 255, 0.08);
+    --hover: rgba(255, 255, 255, 0.055);
+    --active: rgba(255, 255, 255, 0.09);
     --accent: #5d87ff;
+    --accent-hover: #6e95ff;
     --accent-soft: rgba(93, 135, 255, 0.16);
     --selected: rgba(93, 135, 255, 0.14);
+    --danger: #f06a59;
+    --danger-soft: rgba(240, 106, 89, 0.16);
+    --warn: #f0a748;
+    --warn-soft: rgba(240, 167, 72, 0.16);
+    --warn-text: #ffca7a;
+    --flag: #f2a046;
+    --success: #52c275;
     --field: #252524;
-    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 16px 48px rgba(0, 0, 0, 0.5);
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.35), 0 16px 48px rgba(0, 0, 0, 0.55);
   }
 }
 
@@ -68,6 +87,14 @@ input, textarea, [contenteditable="true"] {
 
 button { cursor: default; }
 
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+input:focus-visible, textarea:focus-visible, [contenteditable="true"]:focus-visible {
+  outline: none;
+}
+
 ::selection { background: var(--accent-soft); }
 
 .btn {
@@ -80,17 +107,22 @@ button { cursor: default; }
   border-radius: 8px;
   border: 1px solid var(--line-strong);
   background: var(--panel);
+  color: var(--text);
   font-weight: 500;
   font-size: 13px;
-  transition: background 0.12s, border-color 0.12s, opacity 0.12s;
+  white-space: nowrap;
+  transition: background 0.12s, border-color 0.12s, color 0.12s, opacity 0.12s, transform 0.08s;
 }
-.btn:hover { background: var(--hover); }
-.btn:disabled { opacity: 0.5; }
+.btn.sm { height: 28px; padding: 0 10px; font-size: 12.5px; border-radius: 7px; }
+.btn:hover:not(:disabled) { background: var(--hover); }
+.btn:active:not(:disabled) { transform: scale(0.985); }
+.btn:disabled { opacity: 0.45; }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
-.btn.primary:hover { filter: brightness(1.06); }
-.btn.ghost { border-color: transparent; background: transparent; }
-.btn.ghost:hover { background: var(--hover); }
+.btn.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+.btn.ghost { border-color: transparent; background: transparent; color: var(--text-2); }
+.btn.ghost:hover:not(:disabled) { background: var(--hover); color: var(--text); }
 .btn.danger { color: var(--danger); }
+.btn.danger:hover:not(:disabled) { background: var(--danger-soft); border-color: transparent; color: var(--danger); }
 
 .icon-btn {
   display: inline-grid;
@@ -103,8 +135,9 @@ button { cursor: default; }
   color: var(--text-2);
   transition: background 0.12s, color 0.12s;
 }
-.icon-btn:hover { background: var(--hover); color: var(--text); }
-.icon-btn:active { background: var(--active); }
+.icon-btn:hover:not(:disabled) { background: var(--hover); color: var(--text); }
+.icon-btn:active:not(:disabled) { background: var(--active); }
+.icon-btn:disabled { opacity: 0.35; }
 .icon-btn.on { color: var(--accent); }
 
 .field {
@@ -118,6 +151,7 @@ button { cursor: default; }
   transition: border-color 0.12s, box-shadow 0.12s;
 }
 .field:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.field::placeholder { color: var(--muted); }
 
 .scroll { overflow-y: auto; overscroll-behavior: contain; }
 /* No custom scrollbar styling: macOS draws native overlay scrollbars that appear while scrolling. */

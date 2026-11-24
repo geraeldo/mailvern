@@ -16,7 +16,8 @@
   let showSteps = $state<Record<number, boolean>>({});
   /** Cited messages, for the hover preview. */
   let rows = $state<Record<number, Summary>>({});
-  let hover = $state<{ id: number; x: number; y: number } | null>(null);
+  let hover = $state<{ id: number; x: number; top: string; bottom: string } | null>(null);
+  let copiedTurn = $state<number | null>(null);
 
   const running = $derived(aiRunning(s));
 
@@ -69,18 +70,47 @@
     const c = (e.target as Element).closest?.<HTMLElement>(".cite");
     if (!c) return;
     const r = c.getBoundingClientRect();
-    hover = { id: Number(c.dataset.id), x: Math.max(8, Math.min(r.left - 8, window.innerWidth - 312)), y: r.bottom + 6 };
+    const x = Math.max(8, Math.min(r.left - 8, window.innerWidth - 312));
+    const above = r.bottom + 140 > window.innerHeight && r.top > 140;
+    hover = {
+      id: Number(c.dataset.id),
+      x,
+      top: above ? "auto" : `${r.bottom + 6}px`,
+      bottom: above ? `${window.innerHeight - r.top + 6}px` : "auto",
+    };
   }
 
   function onOut(e: MouseEvent) {
     if ((e.target as Element).closest?.(".cite")) hover = null;
   }
 
+  function resizeInput() {
+    if (!inputEl) return;
+    inputEl.style.height = "auto";
+    inputEl.style.height = `${Math.min(120, inputEl.scrollHeight)}px`;
+  }
+
   function send() {
     const q = followUp.trim();
     if (!q || running) return;
     followUp = "";
+    if (inputEl) inputEl.style.height = "auto";
     askFollowUp(q);
+  }
+
+  async function copyTurn(t: AiTurn, i: number) {
+    const parts = [
+      t.answer,
+      ...t.facts.map((f) => `${f.label}: ${f.value}`),
+      t.details,
+    ]
+      .filter(Boolean)
+      .map((p) => p.replace(/\s*\[\d+(?:\s*,\s*\d+)*\]/g, ""));
+    try {
+      await api.copyText(parts.join("\n\n"));
+      copiedTurn = i;
+      setTimeout(() => copiedTurn === i && (copiedTurn = null), 1600);
+    } catch {}
   }
 
   function retry(i: number) {
@@ -133,8 +163,14 @@
         {#if !t.running}
           <div class="foot">
             {#if t.steps.length}
-              <button class="link quiet" onclick={() => (showSteps[i] = !showSteps[i])}>
+              <button type="button" class="link quiet" onclick={() => (showSteps[i] = !showSteps[i])}>
                 How I found this <Icon name={showSteps[i] ? "chevronDown" : "chevron"} size={11} stroke={2} />
+              </button>
+            {/if}
+            {#if t.answer}
+              <button type="button" class="link quiet" onclick={() => copyTurn(t, i)}>
+                <Icon name={copiedTurn === i ? "check" : "copy"} size={11} stroke={2} />
+                {copiedTurn === i ? "Copied" : "Copy"}
               </button>
             {/if}
             {#if cost(t.cost)}<span>{cost(t.cost)}</span>{/if}
@@ -158,6 +194,7 @@
       rows="1"
       placeholder={running ? "Working on it…" : "Ask a follow-up"}
       spellcheck="true"
+      oninput={resizeInput}
       onkeydown={(e) => {
         if (e.key === "Enter" && !e.shiftKey) {
           e.preventDefault();
@@ -165,15 +202,15 @@
         }
       }}></textarea>
     {#if running}
-      <button class="icon-btn" title="Stop" onclick={stopAiSearch}><Icon name="stop" size={15} /></button>
+      <button type="button" class="icon-btn" title="Stop" onclick={stopAiSearch}><Icon name="stop" size={15} /></button>
     {:else}
-      <button class="icon-btn send" title="Ask  ↩" disabled={!followUp.trim()} onclick={send}><Icon name="sent" size={15} /></button>
+      <button type="button" class="icon-btn send" title="Ask  ↩" disabled={!followUp.trim()} onclick={send}><Icon name="sent" size={15} /></button>
     {/if}
   </div>
   <div class="model">{s.model}</div>
 
   {#if hover && preview}
-    <div class="peek" style:left="{hover.x}px" style:top="{hover.y}px">
+    <div class="peek" style:left="{hover.x}px" style:top={hover.top} style:bottom={hover.bottom}>
       <div class="peek-head">
         <span class="peek-from">{displayName(preview.fromName, preview.fromAddr)}</span>
         <span class="peek-date">{shortDate(preview.date)}</span>

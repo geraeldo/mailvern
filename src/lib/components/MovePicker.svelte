@@ -17,11 +17,14 @@
   let filter = $state("");
   let active = $state(0);
   let input = $state<HTMLInputElement>();
+  let listEl = $state<HTMLDivElement>();
 
   const folders = $derived(
-    ui.folders.filter(
-      (f) => f.accountId === accountId && !exclude.includes(f.id) && f.role !== "snoozed" && f.name.toLowerCase().includes(filter.trim().toLowerCase()),
-    ),
+    ui.folders.filter((f) => {
+      if (f.accountId !== accountId || exclude.includes(f.id) || f.role === "snoozed") return false;
+      const q = filter.trim().toLowerCase();
+      return !q || f.name.toLowerCase().includes(q) || f.path.toLowerCase().includes(q);
+    }),
   );
   const acc = $derived(accountById(accountId));
 
@@ -35,13 +38,21 @@
     onclose();
   }
 
+  function scrollActive() {
+    queueMicrotask(() => listEl?.querySelectorAll<HTMLElement>(".choice")[active]?.scrollIntoView({ block: "nearest" }));
+  }
+
   function onkeydown(e: KeyboardEvent) {
     if (e.key === "ArrowDown") {
       e.preventDefault();
+      if (!folders.length) return;
       active = Math.min(folders.length - 1, active + 1);
+      scrollActive();
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
+      if (!folders.length) return;
       active = Math.max(0, active - 1);
+      scrollActive();
     } else if (e.key === "Enter") {
       e.preventDefault();
       pick(folders[active]);
@@ -58,7 +69,7 @@
     <Icon name="search" size={14} />
     <input bind:this={input} bind:value={filter} oninput={() => (active = 0)} placeholder="Folder name" spellcheck="false" />
   </div>
-  <div class="list scroll">
+  <div class="list scroll" bind:this={listEl}>
     {#each folders as f, i (f.id)}
       <button class="choice" class:active={i === active} onmouseenter={() => (active = i)} onclick={() => pick(f)}>
         <Icon name={roleIcon[f.role ?? ""] ?? "folder"} size={15} />

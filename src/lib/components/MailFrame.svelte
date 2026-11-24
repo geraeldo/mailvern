@@ -1,13 +1,13 @@
 <script lang="ts">
   import { frameDoc } from "../html";
 
-  let { html, allowRemote }: { html: string; allowRemote: boolean } = $props();
+  let { html, allowRemote, plain = false }: { html: string; allowRemote: boolean; plain?: boolean } = $props();
   let frame: HTMLIFrameElement;
   let h = $state(40);
   let ro: ResizeObserver | undefined;
   let watched: HTMLElement | null = null;
 
-  const doc = $derived(frameDoc(html, allowRemote));
+  const doc = $derived(frameDoc(html, allowRemote, plain));
 
   // Starts sizing the frame to the current document's body once it has been parsed. Returns false
   // while the frame still shows the previous document (or the initial blank one).
@@ -52,6 +52,7 @@
 <iframe
   bind:this={frame}
   title="Message"
+  class:plain
   sandbox="allow-same-origin"
   srcdoc={doc}
   onload={track}
@@ -63,5 +64,8 @@
     width: 100%;
     border: 0;
     background: #fff;
+  }
+  iframe.plain {
+    background: transparent;
   }
 </style>

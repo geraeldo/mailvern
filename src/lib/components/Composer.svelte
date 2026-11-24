@@ -292,6 +292,15 @@
       toast("Add a recipient");
       return;
     }
+    const invalid = [
+      ...(toField?.invalidAddresses() ?? []),
+      ...(ccField?.invalidAddresses() ?? []),
+      ...(bccField?.invalidAddresses() ?? []),
+    ];
+    if (invalid.length) {
+      toast(`Check the email address: ${invalid[0]}`);
+      return;
+    }
     sending = true;
     try {
       if (!subject.trim() && !(await ask("Send without a subject?", { title: "Mailvern", okLabel: "Send", cancelLabel: "Cancel" }))) return;
@@ -367,12 +376,13 @@
             onchange={(id) => (accountId = id)} />
         </div>
       {/if}
-      <div class="to-wrap">
-        <RecipientField bind:this={toField} label="To" bind:value={to} autofocus={focusTo} />
-        {#if !showCc}
-          <button class="cc-toggle" onclick={() => (showCc = true)}>Cc Bcc</button>
-        {/if}
-      </div>
+      <RecipientField bind:this={toField} label="To" bind:value={to} autofocus={focusTo}>
+        {#snippet trailing()}
+          {#if !showCc}
+            <button type="button" class="cc-toggle" onclick={() => (showCc = true)}>Cc Bcc</button>
+          {/if}
+        {/snippet}
+      </RecipientField>
       {#if showCc}
         <RecipientField bind:this={ccField} label="Cc" bind:value={cc} />
         <RecipientField bind:this={bccField} label="Bcc" bind:value={bcc} />
@@ -384,30 +394,40 @@
 
     <div class="body">
       <Editor bind:el={editorEl} html={initialHtml} oninput={changed}>
+        {#snippet aboveBar()}
+          {#if files.length}
+            <div class="files">
+              {#each files as f (f.path)}
+                <span class="file" title={f.name}>
+                  <span class="ficon"><Icon name="file" size={14} /></span>
+                  <span class="fname">{f.name}</span>
+                  <span class="fsize">{fileSize(f.size)}</span>
+                  <button type="button" aria-label={`Remove ${f.name}`} onclick={() => { files = files.filter((x) => x.path !== f.path); changed(); }}><Icon name="x" size={12} /></button>
+                </span>
+              {/each}
+            </div>
+          {/if}
+        {/snippet}
         <Rephrase editor={editorEl} context={rephraseContext} onapplied={changed} />
-        <button class="icon-btn" title="Attach files" onclick={pickFiles}><Icon name="clip" size={16} /></button>
+        <button type="button" class="icon-btn" title="Attach files" aria-label="Attach files" onclick={pickFiles}><Icon name="clip" size={16} /></button>
         <span class="send-group">
-          <button class="btn primary send" disabled={sending} onclick={() => send()} title={hint("Send", "send")}>
+          <button type="button" class="btn primary send" disabled={sending} onclick={() => send()} title={hint("Send", "send")}>
             {#if sending}<span class="spinner"></span>{/if}
             {sending ? "Sending" : "Send"}
           </button>
-          <button class="btn primary later" disabled={sending} onclick={() => (laterOpen = true)} title="Send later" aria-label="Send later">
+          <button type="button" class="btn primary later" disabled={sending} onclick={() => (laterOpen = true)} title="Send later" aria-label="Send later">
             <Icon name="chevronDown" size={14} stroke={2.25} />
           </button>
         </span>
       </Editor>
     </div>
 
-    {#if files.length}
-      <div class="files">
-        {#each files as f (f.path)}
-          <span class="file">
-            <Icon name="file" size={14} />
-            <span class="fname">{f.name}</span>
-            <span class="fsize">{fileSize(f.size)}</span>
-            <button aria-label="Remove" onclick={() => { files = files.filter((x) => x.path !== f.path); changed(); }}><Icon name="x" size={12} /></button>
-          </span>
-        {/each}
+    {#if dropping}
+      <div class="drop-overlay" aria-hidden="true">
+        <div class="drop-box">
+          <Icon name="clip" size={22} />
+          <span>Drop files to attach</span>
+        </div>
       </div>
     {/if}
   </div>
@@ -428,12 +448,14 @@
     animation: fade 0.12s ease-out;
   }
   .sheet {
+    position: relative;
     display: flex;
     flex-direction: column;
     width: min(760px, calc(100vw - 48px));
     height: min(720px, calc(100vh - 64px));
     padding: 0 24px 18px;
     background: var(--panel);
+    border: 1px solid var(--sheet-border);
     border-radius: 14px;
     box-shadow: var(--shadow);
     animation: rise 0.16s cubic-bezier(0.2, 0.8, 0.2, 1);
@@ -441,6 +463,30 @@
     transition: outline-color 0.12s;
   }
   .sheet.dropping { outline-color: var(--accent); }
+  .drop-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 30;
+    display: grid;
+    place-items: center;
+    border-radius: 14px;
+    background: color-mix(in srgb, var(--panel) 84%, transparent);
+    backdrop-filter: blur(2px);
+    pointer-events: none;
+  }
+  .drop-box {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    padding: 24px 36px;
+    border: 2px dashed var(--accent);
+    border-radius: 12px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-size: 14px;
+    font-weight: 550;
+  }
   header { display: flex; align-items: center; gap: 2px; height: 52px; margin-right: -10px; }
   .title { font-weight: 600; font-size: 15px; }
   .saved { flex: 1; margin-left: 10px; color: var(--muted); font-size: 12.5px; }
@@ -453,17 +499,14 @@
     border-bottom: 1px solid var(--line);
   }
   .label { width: 52px; flex: none; color: var(--muted); font-size: 13px; }
-  .to-wrap { position: relative; }
   .cc-toggle {
-    position: absolute;
-    right: 0;
-    top: 10px;
     border: 0;
     background: none;
     color: var(--muted);
     font-size: 12.5px;
-    padding: 2px 4px;
-    border-radius: 5px;
+    padding: 3px 6px;
+    border-radius: 6px;
+    white-space: nowrap;
   }
   .cc-toggle:hover { color: var(--text); background: var(--hover); }
   .subject { border-bottom: 1px solid var(--line); }
@@ -496,7 +539,7 @@
     border-top-color: #fff;
     animation: spin 0.8s linear infinite;
   }
-  .files { display: flex; flex-wrap: wrap; gap: 6px; padding-top: 12px; }
+  .files { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 0 10px; border-top: 1px solid var(--line); }
   .file {
     display: inline-flex;
     align-items: center;
@@ -507,10 +550,12 @@
     border-radius: 8px;
     color: var(--text-2);
     font-size: 12.5px;
-    max-width: 280px;
+    max-width: min(280px, 100%);
+    min-width: 0;
   }
-  .fname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font-weight: 500; }
-  .fsize { color: var(--muted); white-space: nowrap; }
-  .file button { display: grid; place-items: center; width: 22px; height: 22px; border: 0; border-radius: 5px; background: none; color: var(--muted); }
+  .ficon { display: grid; flex: none; color: var(--muted); }
+  .fname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font-weight: 500; }
+  .fsize { flex: none; color: var(--muted); white-space: nowrap; }
+  .file button { flex: none; display: grid; place-items: center; width: 22px; height: 22px; border: 0; border-radius: 5px; background: none; color: var(--muted); }
   .file button:hover { background: var(--hover); color: var(--text); }
 </style>

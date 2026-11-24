@@ -2,19 +2,22 @@
   import { untrack } from "svelte";
   import Icon from "./Icon.svelte";
   import Avatar from "./Avatar.svelte";
-  import { ui, openMessage, loadMore, viewTitle, setQuery, openAccountSettings, openSettings, clickRow, isSelected, roleOf, editDraft, accountById,
-    beginSearch, searchScopes, scopeKey, scopeLabel, setSearchScope, setView } from "../state.svelte";
+  import {
+    ui, openMessage, loadMore, viewTitle, setQuery, openAccountSettings, openSettings, clickRow, isSelected, roleOf,
+    editDraft, accountById, accountLabel, beginSearch, searchScopes, scopeKey, scopeLabel, setSearchScope, setView,
+    archiveRows, trashRows, toggleSeenRows, snoozeTargetRows, unsnoozeRows, compose, toggleSidebar,
+    aiSourceTurn, aiRunning,
+  } from "../state.svelte";
   import { hint } from "../shortcuts.svelte";
   import { messageMenu } from "../menus";
   import { shortDate, displayName } from "../format";
   import { whenLabel } from "../when";
   import { addrOf } from "../avatars.svelte";
-  import { api } from "../api";
+  import { api, type Summary } from "../api";
   import { ai, searchReady } from "../ai/config.svelte";
   import { runAiSearch, stopAiSearch } from "../ai/search.svelte";
-  import { aiSourceTurn, aiRunning } from "../state.svelte";
 
-  const ROW = 76;
+  const ROW = 78;
   const OVERSCAN = 8;
 
   let scroller = $state<HTMLDivElement>();
@@ -29,6 +32,11 @@
   const start = $derived(Math.max(0, Math.floor(scrollTop / ROW) - OVERSCAN));
   const end = $derived(Math.min(ui.list.length, Math.ceil((scrollTop + height) / ROW) + OVERSCAN));
   const visible = $derived(ui.list.slice(start, end));
+  /** Show quiet account tags on rows when viewing multiple accounts together. */
+  const showAccountTag = $derived(
+    ui.accounts.length > 1 && (ui.view.kind === "unified" || (!!ui.query.trim() && ui.searchScope.kind !== "account" && ui.searchScope.kind !== "folder") || !!ui.ai),
+  );
+  const autoAskAi = $derived(ai.hasKey && draft.trim().endsWith("?"));
 
   async function onScroll() {
     if (!scroller) return;
@@ -140,10 +148,26 @@
     searchOpen = false;
     if (ui.query) setQuery("");
   }
+
+  function rowKey(m: Summary, e: KeyboardEvent) {
+    if (e.target !== e.currentTarget) return;
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      openMessage(m.id);
+    }
+  }
 </script>
 
 <section class="list">
-  <header data-tauri-drag-region>
+  <header class:collapsed-side={ui.sidebarCollapsed} data-tauri-drag-region>
+    {#if ui.sidebarCollapsed && !searchOpen}
+      <button type="button" class="icon-btn" title="Show sidebar  ⌥⌘S" aria-label="Show sidebar" onclick={toggleSidebar}>
+        <Icon name="sidebar" size={16} />
+      </button>
+      <button type="button" class="icon-btn" title={hint("New message", "compose")} aria-label="New message" onclick={() => compose()}>
+        <Icon name="compose" size={16} />
+      </button>
+    {/if}
     {#if searchOpen}
       <div class="search">
         <Icon name="search" size={15} />
@@ -154,7 +178,7 @@
           onkeydown={(e) => {
             if (e.key === "Escape") closeSearch();
             // ⌘↩, or a question (ending in "?"), asks AI.
-            if (e.key === "Enter" && (e.metaKey || (ai.hasKey && draft.trim().endsWith("?")))) {
+            if (e.key === "Enter" && (e.metaKey || autoAskAi)) {
               e.preventDefault();
               askAi();
               return;
@@ -167,19 +191,20 @@
           }}
           placeholder="Search {scopeLabel(ui.searchScope)}"
           spellcheck="false" />
-        <button class="icon-btn small" onclick={closeSearch} aria-label="Close search"><Icon name="x" size={14} /></button>
+        <button type="button" class="icon-btn small" onclick={closeSearch} aria-label="Close search"><Icon name="x" size={14} /></button>
       </div>
     {:else}
       <h1 data-tauri-drag-region>{viewTitle()}</h1>
-      <button class="icon-btn" title={hint("Search", "search")} onclick={focusSearch}><Icon name="search" /></button>
+      <button type="button" class="icon-btn" title={hint("Search", "search")} aria-label="Search" onclick={focusSearch}><Icon name="search" /></button>
     {/if}
   </header>
+
   {#if searchOpen && !ui.ai}
     <div class="scopes" role="radiogroup" aria-label="Search in">
       {#each searchScopes() as s (scopeKey(s))}
         {@const on = scopeKey(s) === scopeKey(ui.searchScope)}
-        <button class="scope" class:on role="radio" aria-checked={on} onclick={() => setSearchScope(s)}>
-          {#if s.kind === "account"}<span class="dot" style:background={accountById(s.accountId)?.color || "var(--muted)"}></span>{/if}
+        <button type="button" class="scope" class:on role="radio" aria-checked={on} onclick={() => setSearchScope(s)}>
+          {#if s.kind === "account"}<span class="scope-bar" style:background={accountById(s.accountId)?.color || "var(--muted)"}></span>{/if}
           {scopeLabel(s)}
         </button>
       {/each}
@@ -187,10 +212,10 @@
   {/if}
 
   {#if searchOpen && draft.trim() && !ui.ai}
-    <button class="ask" onclick={askAi}>
+    <button type="button" class="ask" onclick={askAi}>
       <Icon name="sparkle" size={14} />
       <span class="ask-text">{ai.hasKey ? "Ask AI" : "Set up AI search"}<span class="ask-q">{ai.hasKey ? ` “${draft.trim()}”` : ""}</span></span>
-      <span class="kbd">⌘↩</span>
+      <span class="kbd">{autoAskAi ? "↩" : "⌘↩"}</span>
     </button>
   {/if}
   {#if ui.ai}
@@ -207,7 +232,7 @@
   {#if ui.view.kind === "outbox"}
     <div class="scroll body">
       {#each ui.outbox as o (o.id)}
-        <button class="row out" class:selected={o.id === ui.outboxSelected} onclick={() => (ui.outboxSelected = o.id)}>
+        <button type="button" class="row out" class:selected={o.id === ui.outboxSelected} onclick={() => (ui.outboxSelected = o.id)}>
           <span class="mark">{#if o.error}<span class="err-dot" title={o.error}></span>{/if}</span>
           <span class="pic"><Avatar name={outboxTo(o.message.to.slice(0, 1))} email={addrOf(o.message.to[0] ?? o.message.cc[0] ?? "")} size={34} /></span>
           <span class="main">
@@ -220,68 +245,120 @@
           </span>
         </button>
       {:else}
-        <div class="empty"><Icon name="check" size={22} /></div>
+        <div class="empty">
+          <Icon name="check" size={22} />
+          <p class="empty-title">No scheduled mail</p>
+        </div>
       {/each}
     </div>
   {:else}
-  <div class="scroll body" bind:this={scroller} bind:clientHeight={height} onscroll={onScroll}>
-    {#if ui.listReady && !ui.list.length && !ui.searchingServer && !running}
-      <div class="empty">
-        {#if ui.ai}
-          No sources
-        {:else if ui.query}
-          No results
-        {:else if !ui.accounts.length}
-          <button class="btn primary" onclick={() => openAccountSettings("new")}>Add your first account</button>
-        {:else}
-          <Icon name="check" size={22} />
-        {/if}
-      </div>
-    {/if}
-    <div style:height="{ui.list.length * ROW + (ui.loadingOlder || ui.searchingServer ? 56 : 0)}px" style:position="relative">
-      {#if ui.loadingOlder}
-        <div class="older" style:top="{ui.list.length * ROW}px"><span class="spinner"></span></div>
-      {:else if ui.searchingServer}
-        <div class="older" style:top="{ui.list.length * ROW}px"><span class="spinner"></span><span class="searching">Searching servers…</span></div>
+    <div class="scroll body" bind:this={scroller} bind:clientHeight={height} onscroll={onScroll}>
+      {#if ui.listReady && !ui.list.length && !ui.searchingServer && !running}
+        <div class="empty">
+          {#if ui.ai}
+            <p class="empty-title">No sources found</p>
+            <p class="empty-sub">Try phrasing the question differently.</p>
+          {:else if ui.query}
+            <p class="empty-title">No results for “{ui.query.trim()}”</p>
+            <p class="empty-sub">Try another scope above, or press ⌘↩ to ask AI.</p>
+          {:else if !ui.accounts.length}
+            <p class="empty-title">Welcome to Mailvern</p>
+            <button type="button" class="btn primary" onclick={() => openAccountSettings("new")}>Add your first account</button>
+          {:else}
+            <span class="empty-icon"><Icon name="check" size={20} /></span>
+            <p class="empty-title">{viewTitle() === "Inbox" ? "All caught up" : `Nothing in ${viewTitle()}`}</p>
+            {#if viewTitle() === "Inbox"}
+              <p class="empty-sub">Enjoy the quiet.</p>
+            {/if}
+          {/if}
+        </div>
       {/if}
-      {#each visible as m, i (m.id)}
-        <button
-          class="row"
-          class:unread={!m.seen}
-          class:selected={isSelected(m.id)}
-          class:multi={ui.selectedIds.length > 1}
-          style:transform="translateY({(start + i) * ROW}px)"
-          onclick={(e) => clickRow(m, e)}
-          ondblclick={() => onDouble(m.id)}
-          oncontextmenu={(e) => { e.preventDefault(); messageMenu(m); }}>
-          <span class="mark" class:num={ui.ai && numbered}>
-            {#if ui.ai && numbered}<span class="n">{start + i + 1}</span>{:else if !m.seen}<span class="unread-dot"></span>{/if}
-          </span>
-          <span class="pic"><Avatar name={m.fromName} email={m.fromAddr} size={34} lookup={roleOf(m) !== "junk"} /></span>
-          <span class="main">
-            <span class="line1">
-              <span class="from">
-                {#if roleOf(m) === "drafts"}<span class="draft">Draft</span>{/if}
-                {displayName(m.fromName, m.fromAddr) || "(no sender)"}
+      <div style:height="{ui.list.length * ROW + (ui.loadingOlder || ui.searchingServer ? 56 : 0)}px" style:position="relative">
+        {#if ui.loadingOlder}
+          <div class="older" style:top="{ui.list.length * ROW}px"><span class="spinner"></span></div>
+        {:else if ui.searchingServer}
+          <div class="older" style:top="{ui.list.length * ROW}px"><span class="spinner"></span><span class="searching">Searching servers…</span></div>
+        {/if}
+        {#each visible as m, i (m.id)}
+          {@const rowRole = roleOf(m)}
+          {@const acc = showAccountTag ? accountById(m.accountId) : undefined}
+          <div
+            role="button"
+            tabindex="0"
+            class="row"
+            class:unread={!m.seen}
+            class:selected={isSelected(m.id)}
+            class:multi={ui.selectedIds.length > 1}
+            style:transform="translateY({(start + i) * ROW}px)"
+            onclick={(e) => clickRow(m, e)}
+            onkeydown={(e) => rowKey(m, e)}
+            ondblclick={() => onDouble(m.id)}
+            oncontextmenu={(e) => { e.preventDefault(); messageMenu(m); }}>
+            <span class="mark">
+              {#if ui.ai && numbered}<span class="n">{start + i + 1}</span>{:else if !m.seen}<span class="unread-dot" aria-label="Unread"></span>{/if}
+            </span>
+            <span class="pic"><Avatar name={m.fromName} email={m.fromAddr} size={34} lookup={rowRole !== "junk"} /></span>
+            <span class="main">
+              <span class="line1">
+                <span class="from">
+                  {#if rowRole === "drafts"}<span class="draft">Draft</span>{/if}
+                  {displayName(m.fromName, m.fromAddr) || "(no sender)"}
+                </span>
+                {#if m.count > 1}<span class="count">{m.count}</span>{/if}
+                <span class="meta-right">
+                  {#if m.flagged}<span class="flag"><Icon name="flag" size={12} stroke={2} /></span>{/if}
+                  {#if m.hasAttachments}<span class="clip"><Icon name="clip" size={12} stroke={2} /></span>{/if}
+                  {#if m.snoozedUntil}
+                    <span class="date snoozed" title="Comes back {whenLabel(new Date(m.snoozedUntil * 1000))}"><Icon name="clock" size={11} stroke={2} /> {whenLabel(new Date(m.snoozedUntil * 1000))}</span>
+                  {:else}
+                    <span class="date">{shortDate(m.date)}</span>
+                  {/if}
+                </span>
+                <span class="quick" role="group" aria-label="Quick actions">
+                  {#if rowRole !== "archive"}
+                    <button type="button" class="qbtn" title={hint("Archive", "archive")} aria-label="Archive" onclick={(e) => { e.stopPropagation(); archiveRows([m]); }}>
+                      <Icon name="archive" size={13} />
+                    </button>
+                  {/if}
+                  {#if rowRole !== "trash"}
+                    <button type="button" class="qbtn" title={hint("Delete", "delete")} aria-label="Delete" onclick={(e) => { e.stopPropagation(); trashRows([m]); }}>
+                      <Icon name="trash" size={13} />
+                    </button>
+                  {/if}
+                  <button
+                    type="button"
+                    class="qbtn"
+                    title={m.seen ? "Mark as unread" : "Mark as read"}
+                    aria-label={m.seen ? "Mark as unread" : "Mark as read"}
+                    onclick={(e) => { e.stopPropagation(); toggleSeenRows([m]); }}>
+                    <Icon name={m.seen ? "unread" : "mailOpen"} size={13} />
+                  </button>
+                  {#if rowRole !== "snoozed"}
+                    <button type="button" class="qbtn" title={hint("Snooze", "snooze")} aria-label="Snooze" onclick={(e) => { e.stopPropagation(); snoozeTargetRows([m]); }}>
+                      <Icon name="clock" size={13} />
+                    </button>
+                  {:else}
+                    <button type="button" class="qbtn" title="Unsnooze" aria-label="Unsnooze" onclick={(e) => { e.stopPropagation(); unsnoozeRows([m]); }}>
+                      <Icon name="clock" size={13} />
+                    </button>
+                  {/if}
+                </span>
               </span>
-              {#if m.count > 1}<span class="count">{m.count}</span>{/if}
-              {#if m.flagged}<span class="flag"><Icon name="flag" size={12} stroke={2} /></span>{/if}
-              {#if m.hasAttachments}<span class="clip"><Icon name="clip" size={12} stroke={2} /></span>{/if}
-              {#if m.snoozedUntil}
-                <span class="date snoozed" title="Comes back {whenLabel(new Date(m.snoozedUntil * 1000))}"><Icon name="clock" size={11} stroke={2} /> {whenLabel(new Date(m.snoozedUntil * 1000))}</span>
-              {:else}
-                <span class="date">{shortDate(m.date)}</span>
-              {/if}
+              <span class="subject">{m.subject || "(no subject)"}</span>
+              <span class="snippet">
+                <span class="snip">{m.snippet}</span>
+                {#if acc}
+                  <span class="acc-tag" title={acc.email}>
+                    <span class="acc-bar" style:background={acc.color || "var(--muted)"}></span>
+                    <span class="acc-name">{accountLabel(acc)}</span>
+                  </span>
+                {/if}
+              </span>
             </span>
-            <span class="subject">{m.subject || "(no subject)"}</span>
-            <span class="snippet">
-              <span class="snip">{m.snippet}</span>
-            </span>
-          </span>
-        </button>
-      {/each}
+          </div>
+        {/each}
+      </div>
     </div>
-  </div>
   {/if}
 </section>
 
@@ -299,9 +376,11 @@
     flex: none;
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
     padding: 0 10px 0 20px;
   }
+  /* Leave clear space for macOS traffic lights when the sidebar is collapsed. */
+  header.collapsed-side { padding-left: 84px; }
   h1 {
     flex: 1;
     margin: 0;
@@ -324,6 +403,7 @@
     background: var(--hover);
     color: var(--muted);
   }
+  header.collapsed-side .search { margin-left: 0; }
   .search input { flex: 1; min-width: 0; border: 0; outline: none; background: transparent; color: var(--text); }
   .icon-btn.small { width: 24px; height: 24px; }
   .scopes {
@@ -352,7 +432,7 @@
   }
   .scope:hover { background: var(--hover); color: var(--text); }
   .scope.on { background: var(--text); border-color: var(--text); color: var(--panel); }
-  .scope .dot { width: 7px; height: 7px; border-radius: 50%; }
+  .scope-bar { width: 3px; height: 10px; border-radius: 2px; flex: none; }
   .ask {
     flex: none;
     display: flex;
@@ -378,19 +458,20 @@
     left: 0;
     right: 0;
     top: 0;
-    height: 76px;
+    height: 78px;
     display: flex;
     gap: 2px;
-    padding: 11px 16px 0 6px;
+    padding: 11px 14px 0 4px;
     border: 0;
     background: transparent;
     text-align: left;
     color: var(--text);
+    outline-offset: -2px;
   }
   .row::after {
     content: "";
     position: absolute;
-    left: 20px;
+    left: 64px;
     right: 0;
     bottom: 0;
     height: 1px;
@@ -416,16 +497,17 @@
     font-variant-numeric: tabular-nums;
   }
   .draft { color: var(--danger); font-weight: 600; margin-right: 4px; }
-  .date.snoozed, .date.late { display: inline-flex; align-items: center; gap: 3px; color: #b8741a; }
+  .date.snoozed, .date.late { display: inline-flex; align-items: center; gap: 3px; color: var(--warn); }
   .date.late { color: var(--danger); }
   .searching { margin-left: 8px; font-size: 12px; color: var(--muted); }
   .row.selected::after { opacity: 0; }
-  .mark { width: 14px; flex: none; display: flex; justify-content: center; padding-top: 6px; }
+  /* Fixed mark width keeps avatar and text columns perfectly aligned across normal & AI citation views. */
+  .mark { width: 20px; flex: none; display: flex; justify-content: center; padding-top: 6px; }
   .unread-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
-  .mark.num { width: 26px; padding-top: 2px; }
   .n {
     min-width: 17px;
     height: 17px;
+    margin-top: -3px;
     padding: 0 4px;
     border-radius: 5px;
     background: var(--accent-soft);
@@ -449,8 +531,8 @@
   .sources-head :global(svg) { color: var(--accent); }
   .spinner.small { width: 11px; height: 11px; border-width: 1.5px; }
   .pic { flex: none; padding-top: 1px; margin-right: 10px; }
-  .main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
-  .line1 { display: flex; align-items: center; gap: 6px; }
+  .main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .line1 { display: flex; align-items: center; gap: 6px; min-height: 20px; }
   .from {
     flex: 1;
     min-width: 0;
@@ -461,14 +543,45 @@
     color: var(--text-2);
   }
   .unread .from { font-weight: 650; color: var(--text); }
+  .meta-right { display: inline-flex; align-items: center; gap: 6px; flex: none; }
+  .quick { display: none; align-items: center; gap: 1px; flex: none; margin: -2px -4px -2px 0; }
+  .row:hover .meta-right, .row:focus-within .meta-right { display: none; }
+  .row:hover .quick, .row:focus-within .quick { display: inline-flex; }
+  .qbtn {
+    display: inline-grid;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--muted);
+    transition: background 0.1s, color 0.1s;
+  }
+  .qbtn:hover { background: var(--active); color: var(--text); }
+
   .date { flex: none; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
-  .flag { color: #e0882a; display: grid; }
+  .flag { color: var(--flag); display: grid; }
   .clip { color: var(--muted); display: grid; }
   .subject, .snippet { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .subject { font-size: 13px; color: var(--text-2); }
   .unread .subject { color: var(--text); font-weight: 500; }
-  .snippet { font-size: 12.5px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .snippet { font-size: 12.5px; color: var(--muted); display: flex; align-items: center; gap: 8px; }
   .snip { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Quiet right-side account indicator using a vertical bar + label — never looks like a round unread dot. */
+  .acc-tag {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    max-width: 82px;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--muted);
+  }
+  .acc-bar { width: 3px; height: 9px; border-radius: 2px; flex: none; }
+  .acc-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
   .older { position: absolute; left: 0; right: 0; height: 56px; display: flex; align-items: center; justify-content: center; }
   .spinner {
     width: 16px;
@@ -481,9 +594,25 @@
   .empty {
     position: absolute;
     inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 24px;
+    text-align: center;
+    color: var(--muted);
+  }
+  .empty-icon {
     display: grid;
     place-items: center;
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    background: var(--hover);
     color: var(--muted);
-    font-size: 13px;
+    margin-bottom: 4px;
   }
+  .empty-title { margin: 0; font-size: 14px; font-weight: 550; color: var(--text-2); }
+  .empty-sub { margin: 0; font-size: 12.5px; color: var(--muted); max-width: 240px; line-height: 1.45; }
 </style>

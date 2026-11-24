@@ -30,6 +30,8 @@ export function sortable(node: HTMLElement, options: SortableOptions) {
     if (opts.handle) {
       const handle = target.closest(opts.handle);
       if (!handle || !el.contains(handle)) return;
+    } else if (target.closest('input, textarea, select, [role="switch"]')) {
+      return;
     }
     // Ignore presses that belong to a nested sortable list.
     const nested = target.closest("[data-sortable]");
@@ -48,8 +50,12 @@ export function sortable(node: HTMLElement, options: SortableOptions) {
         if (Math.abs(dy) < THRESHOLD) return;
         started = true;
         rects = list.map((i) => i.getBoundingClientRect());
-        const next = rects[from + 1] ?? rects[from - 1];
-        const gap = next ? Math.abs(next.top - rects[from].top) - rects[from].height : 0;
+        const gap =
+          from + 1 < rects.length
+            ? rects[from + 1].top - rects[from].bottom
+            : from > 0
+              ? rects[from].top - rects[from - 1].bottom
+              : 0;
         step = rects[from].height + Math.max(0, gap);
         el.style.position = "relative";
         el.style.zIndex = "5";

@@ -17,6 +17,7 @@
   let el: HTMLDivElement;
 
   const d = $derived(ui.details[m.id]);
+  const isPlain = $derived(!!d && !d.html);
   const body = $derived(d ? (d.html ?? textToHtml(d.text ?? "")) : "");
   const remote = $derived(!!d?.html && hasRemoteContent(d.html));
   const trusted = $derived(ui.trustedSenders.includes(m.fromAddr.toLowerCase()));
@@ -51,11 +52,11 @@
   const sender = $derived<Addr>({ name: m.fromName, email: m.fromAddr });
   const collapsible = $derived(ui.thread.length > 1);
 
-  // Clicking anywhere on the header folds the message back up, unless the
-  // click hit one of its buttons or ended a text selection.
+  // Clicking non-text header areas folds the message back up; clicking selectable sender/recipient
+  // text or action buttons won't accidentally collapse while trying to copy an address.
   function headerClick(e: MouseEvent) {
     if (!collapsible) return;
-    if ((e.target as HTMLElement).closest("button, a")) return;
+    if ((e.target as HTMLElement).closest("button, a, .who")) return;
     if (window.getSelection()?.toString()) return;
     open = false;
   }
@@ -83,19 +84,23 @@
 
 <div class="msg" class:open bind:this={el}>
   {#if !open}
-    <button class="collapsed" onclick={() => (open = true)}>
+    <button type="button" class="collapsed" onclick={() => (open = true)}>
       <Avatar name={m.fromName} email={m.fromAddr} size={26} lookup={roleOf(m) !== "junk"} />
       <span class="cname" class:unread={!m.seen}>
         {#if isDraft}<span class="draft">Draft</span>{/if}
         {displayName(m.fromName, m.fromAddr)}
       </span>
       <span class="csnip">{m.snippet}</span>
+      {#if m.flagged}<span class="cflag"><Icon name="flag" size={12} stroke={2} /></span>{/if}
+      {#if m.hasAttachments}<span class="cclip"><Icon name="clip" size={12} stroke={2} /></span>{/if}
       <span class="cdate">{shortDate(m.date)}</span>
     </button>
   {:else}
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <div class="meta" class:collapsible role="presentation" onclick={headerClick}>
-      <button class="avatar" disabled={!collapsible} onclick={() => (open = false)} title={collapsible ? "Collapse" : undefined}><Avatar name={m.fromName} email={m.fromAddr} size={38} lookup={roleOf(m) !== "junk"} /></button>
+      <button type="button" class="avatar" disabled={!collapsible} onclick={() => (open = false)} title={collapsible ? "Collapse message" : undefined}>
+        <Avatar name={m.fromName} email={m.fromAddr} size={38} lookup={roleOf(m) !== "junk"} />
+      </button>
       <div class="who">
         <div class="line">
           {#if isDraft}<span class="draft">Draft</span>{/if}
@@ -111,16 +116,17 @@
       <div class="when" title={longDate(m.date)}>
         <div>{shortDate(m.date)}</div>
         {#if acc && ui.accounts.length > 1}
-          <div class="acc" title={acc.email}><span class="dot" style:background={acc.color || "var(--muted)"}></span>{accountLabel(acc)}</div>
+          <div class="acc" title={acc.email}><span class="acc-bar" style:background={acc.color || "var(--muted)"}></span>{accountLabel(acc)}</div>
         {/if}
       </div>
       <div class="own">
         {#if isDraft}
-          <button class="btn small" disabled={!d} onclick={() => d && editDraft(d)}><Icon name="pencil" size={13} /> Edit</button>
+          <button type="button" class="btn sm" disabled={!d} onclick={() => d && editDraft(d)}><Icon name="pencil" size={13} /> Edit</button>
         {:else if ui.thread.length > 1}
-          <button class="icon-btn small" title="Reply" disabled={!d} onclick={() => compose("reply", { source: d })}><Icon name="reply" size={15} /></button>
-          <button class="icon-btn small" title="Reply all" disabled={!d} onclick={() => compose("replyAll", { source: d })}><Icon name="replyAll" size={15} /></button>
-          <button class="icon-btn small" title="Forward" disabled={!d} onclick={() => compose("forward", { source: d })}><Icon name="forward" size={15} /></button>
+          <button type="button" class="icon-btn small" title="Reply" aria-label="Reply" disabled={!d} onclick={() => compose("reply", { source: d })}><Icon name="reply" size={15} /></button>
+          <button type="button" class="icon-btn small" title="Reply all" aria-label="Reply all" disabled={!d} onclick={() => compose("replyAll", { source: d })}><Icon name="replyAll" size={15} /></button>
+          <button type="button" class="icon-btn small" title="Forward" aria-label="Forward" disabled={!d} onclick={() => compose("forward", { source: d })}><Icon name="forward" size={15} /></button>
+          <button type="button" class="icon-btn small fold-btn" title="Collapse message" aria-label="Collapse message" onclick={() => (open = false)}><Icon name="chevronDown" size={14} /></button>
         {/if}
       </div>
     </div>
@@ -130,12 +136,12 @@
         <div class="files">
           {#each d.attachments as a (a.index)}
             <div class="file">
-              <button class="openf" onclick={() => openFile(a.index)} title="Open">
+              <button type="button" class="openf" onclick={() => openFile(a.index)} title={`Open ${a.filename}`}>
                 <span class="ficon"><Icon name="file" size={16} /></span>
                 <span class="fname">{a.filename}</span>
                 <span class="fsize">{fileSize(a.size)}</span>
               </button>
-              <button class="icon-btn dl" title="Save to Downloads" onclick={() => save(a.index)}>
+              <button type="button" class="icon-btn dl" title="Save to Downloads" aria-label={`Download ${a.filename}`} onclick={() => save(a.index)}>
                 <Icon name="download" size={15} />
               </button>
             </div>
@@ -147,13 +153,13 @@
         <div class="images">
           <Icon name="image" size={15} />
           <span>Images hidden</span>
-          <button class="link" onclick={() => (showImages = true)}>Show</button>
-          <button class="link" onclick={() => trustSender(m.fromAddr)}>Always from this sender</button>
+          <button type="button" class="link" onclick={() => (showImages = true)}>Show once</button>
+          <button type="button" class="link" title={`Always load remote images from ${m.fromAddr}`} onclick={() => trustSender(m.fromAddr)}>Always from {displayName(m.fromName, m.fromAddr)}</button>
         </div>
       {/if}
 
-      <div class="paper">
-        <MailFrame html={body} {allowRemote} />
+      <div class="paper" class:plain={isPlain}>
+        <MailFrame html={body} {allowRemote} plain={isPlain} />
       </div>
     {:else if error}
       <div class="err">{error}</div>
@@ -171,22 +177,25 @@
     display: flex;
     align-items: center;
     gap: 10px;
-    width: 100%;
-    height: 48px;
-    padding: 0 4px;
+    width: calc(100% + 16px);
+    margin: 4px -8px;
+    height: 44px;
+    padding: 0 10px;
     border: 0;
+    border-radius: 8px;
     background: transparent;
     text-align: left;
     color: var(--text);
   }
   .collapsed:hover { background: var(--hover); }
-  .cname { flex: none; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13.5px; color: var(--text-2); }
+  .cname { flex: none; max-width: 38%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13.5px; color: var(--text-2); }
   .cname.unread { font-weight: 650; color: var(--text); }
   .csnip { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 13px; }
-  .cdate { flex: none; color: var(--muted); font-size: 12px; }
+  .cflag { color: var(--flag); display: grid; flex: none; }
+  .cclip { color: var(--muted); display: grid; flex: none; }
+  .cdate { flex: none; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
   .draft { color: var(--danger); font-weight: 600; margin-right: 4px; }
   .meta { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 18px; }
-  .meta.collapsible { cursor: pointer; }
   .avatar { flex: none; border: 0; padding: 0; background: none; border-radius: 50%; display: grid; }
   .avatar:disabled { cursor: default; opacity: 1; }
   .who { flex: 1; min-width: 80px; -webkit-user-select: text; user-select: text; }
@@ -194,27 +203,29 @@
   .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: none; max-width: 100%; }
   .addr { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .to { color: var(--muted); font-size: 13px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .when { flex: none; text-align: right; color: var(--muted); font-size: 12.5px; white-space: nowrap; padding-top: 2px; }
-  .acc { display: flex; align-items: center; justify-content: flex-end; gap: 6px; margin-top: 3px; }
-  .dot { width: 6px; height: 6px; border-radius: 50%; }
+  .when { flex: none; text-align: right; color: var(--muted); font-size: 12.5px; white-space: nowrap; padding-top: 2px; font-variant-numeric: tabular-nums; }
+  .acc { display: flex; align-items: center; justify-content: flex-end; gap: 5px; margin-top: 3px; font-size: 11.5px; }
+  .acc-bar { width: 3px; height: 9px; border-radius: 2px; flex: none; }
   .own { flex: none; display: flex; gap: 0; margin: -4px -6px 0 0; }
   .icon-btn.small { width: 28px; height: 28px; }
+  .fold-btn :global(svg) { transform: rotate(180deg); }
   @container (max-width: 520px) {
     .meta { gap: 10px; }
     .own .icon-btn.small { width: 24px; }
   }
-  .btn.small { height: 28px; padding: 0 10px; display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; }
   .files { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
   .file {
     display: flex;
     align-items: center;
     border: 1px solid var(--line-strong);
     border-radius: 9px;
-    max-width: 300px;
+    max-width: min(300px, 100%);
     overflow: hidden;
+    transition: border-color 0.12s;
   }
   .file:hover { border-color: var(--muted); }
   .openf {
+    flex: 1;
     display: flex;
     align-items: center;
     gap: 8px;
@@ -225,14 +236,17 @@
     background: transparent;
     text-align: left;
   }
-  .ficon { color: var(--muted); display: grid; }
-  .fname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 500; }
-  .fsize { color: var(--muted); font-size: 12px; white-space: nowrap; }
-  .dl { margin-right: 4px; width: 28px; height: 28px; }
+  .openf:hover { background: var(--hover); }
+  .ficon { color: var(--muted); display: grid; flex: none; }
+  .fname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 500; }
+  .fsize { flex: none; color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .dl { flex: none; margin: 0 4px 0 2px; width: 28px; height: 28px; }
   .images {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: 10px;
+    row-gap: 4px;
     margin-bottom: 16px;
     padding: 8px 12px;
     border-radius: 8px;
@@ -240,14 +254,14 @@
     color: var(--muted);
     font-size: 13px;
   }
-  .images { flex-wrap: wrap; row-gap: 4px; }
   .images span { flex: 1; white-space: nowrap; }
-  .link { border: 0; background: none; padding: 0; color: var(--accent); font-size: 13px; font-weight: 500; white-space: nowrap; }
+  .link { border: 0; background: none; padding: 0; color: var(--accent); font-size: 13px; font-weight: 500; white-space: nowrap; cursor: pointer; }
+  .link:hover { text-decoration: underline; }
   .paper { border-radius: 10px; overflow: hidden; }
   @media (prefers-color-scheme: dark) {
-    .paper { padding: 16px 18px; background: #fff; }
+    .paper:not(.plain) { padding: 16px 18px; background: #fff; }
   }
-  .err { color: var(--muted); font-size: 13px; padding: 8px 0; }
+  .err { color: var(--danger); font-size: 13px; padding: 8px 0; }
   .loading { display: grid; place-items: center; height: 80px; }
   .spinner {
     width: 18px;
