@@ -3,7 +3,7 @@
 
 use anyhow::{anyhow, Result};
 use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
-use mail_core::model::{Account, Addr, Folder, MessageSummary};
+use mail_core::model::{Account, Addr, AgentMode, AgentPermissions, Folder, MessageSummary, SnoozeUntil};
 use std::collections::HashMap;
 
 /// "2026-11-05 14:30 Thu", in local time.
@@ -22,6 +22,18 @@ pub fn to_unix(s: &str, label: &str) -> Result<i64> {
         NaiveDateTime::parse_from_str(&head, "%Y-%m-%dT%H:%M").map_err(|_| bad())?
     };
     Local.from_local_datetime(&naive).earliest().map(|d| d.timestamp()).ok_or_else(bad)
+}
+
+/// Parses a snooze target: "laterToday", "tomorrow", "nextWeek", or a local date/time.
+pub fn parse_snooze(s: &str) -> Result<i64> {
+    let trimmed = s.trim();
+    let now = Local::now();
+    match trimmed {
+        "laterToday" => Ok(mail_core::rules::snooze_until(SnoozeUntil::LaterToday, now)),
+        "tomorrow" => Ok(mail_core::rules::snooze_until(SnoozeUntil::Tomorrow, now)),
+        "nextWeek" => Ok(mail_core::rules::snooze_until(SnoozeUntil::NextWeek, now)),
+        _ => to_unix(trimmed, "until"),
+    }
 }
 
 pub fn who(name: Option<&str>, addr: &str) -> String {
@@ -62,11 +74,18 @@ pub struct Names {
     pub folders: Vec<Folder>,
     /// Account → latest sync state and error message, where known.
     pub sync: HashMap<i64, (String, Option<String>)>,
+    /// Effective MCP permissions (global default + per-account overrides).
+    pub perms: AgentPermissions,
 }
 
 impl Names {
     pub fn load(ctx: &crate::Ctx) -> Result<Names> {
-        Ok(Names { accounts: ctx.engine.accounts()?, folders: ctx.engine.folders()?, sync: ctx.sync.lock().unwrap_or_else(|e| e.into_inner()).clone() })
+        Ok(Names {
+            accounts: ctx.engine.accounts()?,
+            folders: ctx.engine.folders()?,
+            sync: ctx.sync.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            perms: ctx.engine.agent_permissions()?,
+        })
     }
 
     /// Why an account's local mail can't be relied on, if so: it can't sync, or nothing has
@@ -128,10 +147,14 @@ impl Names {
                     })
                     .collect();
                 let label = if label.is_empty() { String::new() } else { format!("{label} ") };
+                let mode = match self.perms.for_account(a.id) {
+                    AgentMode::Approval => "ask before acting",
+                    AgentMode::Auto => "automatic",
+                };
                 let state = self.trouble(a).or_else(|| self.syncing(a).then(|| "checking for mail now".to_string()));
                 let trouble = state.map(|t| format!(" · {t}")).unwrap_or_default();
                 let folders = if folders.is_empty() { "  (no folders yet)".to_string() } else { folders.join("\n") };
-                format!("Account {}: {label}<{}>{trouble}\n{folders}", a.id, a.email)
+                format!("Account {}: {label}<{}> · {mode}{trouble}\n{folders}", a.id, a.email)
             })
             .collect::<Vec<_>>()
             .join("\n\n")
@@ -180,13 +203,19 @@ mod tests {
             label: String::new(),
         };
         let folder = |id: i64, account_id: i64| Folder { id, account_id, path: "INBOX".into(), name: "Inbox".into(), role: Some("inbox".into()), unread: 2, position: None };
-        let mut names = Names { accounts: vec![acc(1, "a@x.co"), acc(2, "b@x.co"), acc(3, "c@x.co")], folders: vec![folder(5, 1), folder(6, 3)], sync: HashMap::new() };
+        let mut names = Names {
+            accounts: vec![acc(1, "a@x.co"), acc(2, "b@x.co"), acc(3, "c@x.co")],
+            folders: vec![folder(5, 1), folder(6, 3)],
+            sync: HashMap::new(),
+            perms: AgentPermissions::default(),
+        };
+        names.perms.account_modes.insert(2, AgentMode::Auto);
         // A routine check for mail is shown in the list but is no reason to doubt results.
         names.sync.insert(1, ("syncing".into(), None));
         names.sync.insert(3, ("error".into(), Some("Sign-in failed".into())));
         assert_eq!(
             names.listing(),
-            "Account 1: <a@x.co> · checking for mail now\n  folder 5: Inbox [inbox] · 2 unread\n\nAccount 2: <b@x.co> · nothing downloaded yet\n  (no folders yet)\n\nAccount 3: <c@x.co> · can't sync: Sign-in failed\n  folder 6: Inbox [inbox] · 2 unread"
+            "Account 1: <a@x.co> · ask before acting · checking for mail now\n  folder 5: Inbox [inbox] · 2 unread\n\nAccount 2: <b@x.co> · automatic · nothing downloaded yet\n  (no folders yet)\n\nAccount 3: <c@x.co> · ask before acting · can't sync: Sign-in failed\n  folder 6: Inbox [inbox] · 2 unread"
         );
         let warning = names.warning().unwrap();
         assert!(warning.contains("b@x.co (nothing downloaded yet), c@x.co (can't sync: Sign-in failed)"), "{warning}");

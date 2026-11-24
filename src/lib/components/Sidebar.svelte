@@ -204,6 +204,14 @@
           <Icon name="alert" size={12} />
           <span>{errors.length > 1 ? `${errors.length} errors` : "Sync error"}</span>
         </button>
+      {:else if ui.pendingAgentActions > 0}
+        <button
+          class="warn-pill"
+          title="Agent actions waiting for approval — click to review"
+          onclick={() => openSettings("agents")}>
+          <Icon name="code" size={12} />
+          <span>{ui.pendingAgentActions === 1 ? "1 approval" : `${ui.pendingAgentActions} approvals`}</span>
+        </button>
       {/if}
     </span>
     <button class="icon-btn" title={syncing ? "Checking for mail…" : hint("Check for mail", "sync")} aria-label="Check for mail" onclick={() => api.syncNow()}>
@@ -284,7 +292,7 @@
     border-top: 1px solid var(--line);
   }
   .sync { flex: 1; min-width: 0; display: flex; justify-content: center; color: var(--muted); }
-  .err-pill {
+  .err-pill, .warn-pill {
     display: inline-flex;
     align-items: center;
     gap: 5px;
@@ -293,13 +301,13 @@
     padding: 0 8px;
     border: 0;
     border-radius: 99px;
-    background: var(--danger-soft);
-    color: var(--danger);
     font-size: 11.5px;
     font-weight: 550;
   }
-  .err-pill:hover { filter: brightness(0.95); }
-  .err-pill span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .err-pill { background: var(--danger-soft); color: var(--danger); }
+  .warn-pill { background: var(--warn-soft); color: var(--warn-text); }
+  .err-pill:hover, .warn-pill:hover { filter: brightness(0.95); }
+  .err-pill span, .warn-pill span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   footer .icon-btn > span { display: grid; }
   .spin { animation: spin 1s linear infinite; }
 </style>

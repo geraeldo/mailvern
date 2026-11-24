@@ -17,10 +17,10 @@
   import { loadTheme } from "./lib/theme.svelte";
   import { loadAi } from "./lib/ai/config.svelte";
   import {
-    ui, loadAccounts, loadFolders, loadList, loadTrusted, loadPrefs, loadOutbox, refreshThread, move, compose,
+    ui, loadAccounts, loadFolders, loadList, loadTrusted, loadPrefs, loadOutbox, loadPendingAgentActions, refreshThread, move, compose,
     archiveSelected, trashSelected, toggleJunk, toggleSeen, toggleFlag, accountById, openSettings, openAccountSettings,
     moveSelected, snoozeSelected, unsnoozeSelected, selectAll, extendSelection, clearSelection, snoozeRows, moveRows,
-    selectedRows, roleOf, toast, undoToast, copyThread, openMessage, commitPending, setPaneWidths, toggleSidebar,
+    selectedRows, roleOf, toast, undoToast, runToastAction, copyThread, openMessage, commitPending, setPaneWidths, toggleSidebar,
   } from "./lib/state.svelte";
   import { snoozePresets } from "./lib/when";
   import { exitAi } from "./lib/ai/search.svelte";
@@ -29,6 +29,7 @@
 
   let list: MessageList;
   let notify = false;
+  let windowFocused = true;
   /** Rules waiting for approval, to say so when an agent adds one. */
   let pendingRules = 0;
   let resizing = $state<"side" | "list" | null>(null);
@@ -48,7 +49,9 @@
     (async () => {
       await loadAccounts();
       await loadPrefs();
-      await Promise.all([loadFolders(), loadList(true), loadTrusted(), loadShortcuts(), loadBadgeMode(), loadOutbox(), loadAi()]);
+      await Promise.all([
+        loadFolders(), loadList(true), loadTrusted(), loadShortcuts(), loadBadgeMode(), loadOutbox(), loadAi(), loadPendingAgentActions(),
+      ]);
       refreshBadge();
       if (!ui.accounts.length) openAccountSettings("new");
       notify = (await isPermissionGranted()) || (await requestPermission()) === "granted";
@@ -73,6 +76,33 @@
         if (rulesUi.loaded) loadRules();
         if (e.pendingApproval > pendingRules) toast("An agent added or changed a rule. Review it in Settings › Rules.", { ms: 8000 });
         pendingRules = e.pendingApproval;
+      } else if (e.kind === "agentActionsChanged") {
+        const prev = ui.pendingAgentActions;
+        ui.pendingAgentActions = e.pending;
+        if (e.pending > prev) {
+          const msg = e.pending === 1 ? "An agent action is waiting for your approval." : `${e.pending} agent actions are waiting for your approval.`;
+          toast(msg, { ms: 8000, action: { label: "Review", fn: () => openSettings("agents") } });
+          if (notify && !windowFocused) sendNotification({ title: "Agent waiting for approval", body: msg });
+        }
+      } else if (e.kind === "agentSent") {
+        loadOutbox();
+        const who = e.to[0] ? ` to ${e.to[0].replace(/\s*<.*>$/, "")}` : "";
+        const subj = e.subject || "(no subject)";
+        const undoMs = Math.max(4000, (ui.undoSend || 5) * 1000);
+        toast(`Agent sending “${subj}”${who}`, {
+          ms: undoMs,
+          undo: ui.undoSend > 0
+            ? async () => {
+                try {
+                  await api.cancelSend(e.outboxId);
+                  loadOutbox();
+                  toast("Send cancelled");
+                } catch (err) {
+                  toast(String(err));
+                }
+              }
+            : undefined,
+        });
       } else if (e.kind === "sendFailed") {
         toast(`Couldn't send “${e.subject || "(no subject)"}”. It will retry from Scheduled.`, { ms: 6000 });
         if (notify) sendNotification({ title: "Message not sent", body: `${e.subject || "(no subject)"}: ${e.message}` });
@@ -80,6 +110,7 @@
     });
     // Bringing the window forward counts as looking at your mail: clear "new" from the badge.
     const unFocus = getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+      windowFocused = focused;
       if (focused) refreshBadge();
     });
     const onUnload = () => commitPending();
@@ -264,6 +295,8 @@
     <span>{ui.toast.text}</span>
     {#if ui.toast.undo}
       <button type="button" class="undo" onclick={undoToast}>Undo</button>
+    {:else if ui.toast.action}
+      <button type="button" class="undo" onclick={runToastAction}>{ui.toast.action.label}</button>
     {/if}
   </div>
 {/if}

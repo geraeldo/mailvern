@@ -96,6 +96,8 @@
           <span class="nav-lbl">{s.label}</span>
           {#if s.id === "rules" && rulesUi.rules.some((r) => r.needsApproval)}
             <span class="pill-warn" title="Rules waiting for approval"></span>
+          {:else if s.id === "agents" && ui.pendingAgentActions > 0}
+            <span class="pill-warn" title="Agent actions waiting for approval"></span>
           {/if}
         </button>
       {/each}

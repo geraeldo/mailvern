@@ -86,10 +86,12 @@ export const ui = $state({
   listWidth: 336,
   picker: null as Picker | null,
   status: {} as Record<number, SyncStatus>,
-  toast: null as { text: string; undo?: () => void } | null,
+  toast: null as { text: string; undo?: () => void; action?: { label: string; fn: () => void } } | null,
   trustedSenders: [] as string[],
   outbox: [] as OutboxItem[],
   outboxSelected: null as number | null,
+  /** Pending MCP agent actions waiting for user approval. */
+  pendingAgentActions: 0,
   /** Group messages into conversations. */
   threaded: true,
   /** Seconds a sent message can be taken back. */
@@ -684,10 +686,18 @@ function revertPending() {
 }
 
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
-export function toast(text: string, opts: { undo?: () => void; ms?: number } = {}) {
-  ui.toast = { text, undo: opts.undo };
+export function toast(text: string, opts: { undo?: () => void; action?: { label: string; fn: () => void }; ms?: number } = {}) {
+  ui.toast = { text, undo: opts.undo, action: opts.action };
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => (ui.toast = null), opts.ms ?? 3200);
+}
+
+export async function loadPendingAgentActions() {
+  try {
+    ui.pendingAgentActions = await api.pendingAgentActionsCount();
+  } catch {
+    ui.pendingAgentActions = 0;
+  }
 }
 
 /** Copies the open conversation as plain text (for an AI chat, notes, a ticket). */
@@ -713,6 +723,13 @@ export function undoToast() {
   const undo = ui.toast?.undo;
   dismissToast();
   undo?.();
+}
+
+/** Runs the toast's primary action button and closes it. */
+export function runToastAction() {
+  const fn = ui.toast?.action?.fn;
+  dismissToast();
+  fn?.();
 }
 
 async function run(p: Promise<unknown>): Promise<boolean> {

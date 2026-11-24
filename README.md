@@ -69,13 +69,15 @@ Add an OpenRouter API key in Settings › Models and pick two models: one for se
 Turn on Settings › Agent access to let coding agents on this Mac, such as Claude Code, Codex and Opencode, use Mailvern. It is off by default. The page gives a one-line setup command for each agent.
 
 - The app serves MCP over HTTP at `http://127.0.0.1:47823/mcp`, only on this Mac and only while it is open. Every request needs the access token from the setup command. Reset the token in Settings to cut off every agent. Agents keep their own copy of the token, so after a reset run the setup command again; it replaces the old entry.
-- Agents can list accounts and folders, search (also on the mail servers), count, read messages and conversations, read attachments or save them to a temp folder, and save drafts: new messages and replies, with files attached by path. A draft gets the account's signature and, for a reply, the quoted original, and shows up in Drafts to edit and send.
-- Agents can also change any draft, including ones you wrote: the body, recipients, subject and attachments. Whatever they leave out stays, and a new body keeps the quoted original, the reply threading and your signature. A draft is found by its Message-ID in the mail itself, so this works after the app restarts. If you have the draft open in the composer, your next change there replaces the agent's.
-- Agents can't send, move, delete or mark mail. Mail is untrusted text and agents can run commands, so a person reads every draft before it goes out. Hidden files (keys, `.env`) can't be attached.
+- Agents can list accounts and folders, search (also on the mail servers), count, read messages and conversations, read attachments or save them to a temp folder, save and edit drafts (new messages and replies, with files attached by path), organize mail (mark read/unread, flag, archive, move, snooze, junk, move to Trash), delete drafts, manage rules, and (when enabled) send mail.
+- **Permissions** (Settings › Agent access): choose a default mode and optional per-account overrides so sensitive accounts stay protected while others can run autonomously:
+  - **Ask before acting** (default): agents read mail and save/edit drafts freely; mail changes, draft deletion, and rule changes queue for your approval in Mailvern › Settings › Agent access (individually or in bulk), and sending mail is disabled.
+  - **Run automatically**: agents can organize mail, manage rules, and send mail (`send_mail`, `send_draft`) right away. Sent mail still goes through Mailvern's Undo Send outbox (with an Undo toast) and deleting mail only moves to Trash, never permanently expunges.
+- Hidden files (keys, `.env`) and sensitive system/`~/Library` paths can't be attached.
 - When an account is still syncing or can't sync, the folder list and search results say so, so an agent doesn't take "nothing found" for "no such mail".
-- The tools are in `crates/mail-mcp/src/tools.rs`. The server shares the app's engine, so there is still one IMAP connection per account and the UI shows changes at once.
+- The tools are in `crates/mail-mcp/src/tools.rs`, `actions.rs` and `rules.rs`. The server shares the app's engine, so there is still one IMAP connection per account and the UI shows changes at once.
 
-To try an agent against a made-up mailbox instead of real mail:
+To try an agent against a made-up mailbox instead of real mail (pass `--auto` for automatic mode):
 
 ```bash
 cargo run -p mail-mcp --example serve

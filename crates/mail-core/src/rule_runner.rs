@@ -68,29 +68,39 @@ impl Engine {
     /// (move/archive/trash/junk/snooze), any new rule, re-enable, or change to its scope,
     /// conditions, exceptions, or actions is stored switched off and waiting for the user's
     /// approval in Mailvern.
-    pub fn save_rule(&self, mut rule: Rule, by_agent: bool) -> Result<Rule> {
+    pub fn save_rule(&self, rule: Rule, by_agent: bool) -> Result<Rule> {
+        self.save_rule_with_approval(rule, by_agent, false)
+    }
+
+    /// Adds a rule (id 0) or replaces one, optionally bypassing the `needs_approval` hold
+    /// when `auto_approve` is true (used in Auto mode or when the user approves a queued action).
+    pub fn save_rule_with_approval(&self, mut rule: Rule, by_agent: bool, auto_approve: bool) -> Result<Rule> {
         rule.name = rule.name.trim().to_string();
         self.check_rule(&rule)?;
         let old = if rule.id > 0 { Some(self.rule(rule.id)?) } else { None };
         rule.paused_reason = None;
         if by_agent {
-            let needs = rule.actions.iter().any(RuleAction::requires_approval);
-            let unapproved = match &old {
-                None => true,
-                Some(o) => {
-                    o.needs_approval
-                        || (!o.enabled && rule.enabled)
-                        || o.account_id != rule.account_id
-                        || o.match_all != rule.match_all
-                        || o.conditions != rule.conditions
-                        || o.exceptions != rule.exceptions
-                        || o.actions != rule.actions
-                }
-            };
             rule.origin = "agent".into();
-            rule.needs_approval = needs && unapproved;
-            if rule.needs_approval {
-                rule.enabled = false;
+            if auto_approve {
+                rule.needs_approval = false;
+            } else {
+                let needs = rule.actions.iter().any(RuleAction::requires_approval);
+                let unapproved = match &old {
+                    None => true,
+                    Some(o) => {
+                        o.needs_approval
+                            || (!o.enabled && rule.enabled)
+                            || o.account_id != rule.account_id
+                            || o.match_all != rule.match_all
+                            || o.conditions != rule.conditions
+                            || o.exceptions != rule.exceptions
+                            || o.actions != rule.actions
+                    }
+                };
+                rule.needs_approval = needs && unapproved;
+                if rule.needs_approval {
+                    rule.enabled = false;
+                }
             }
         } else {
             rule.origin = "user".into();

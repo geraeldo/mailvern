@@ -464,4 +464,169 @@ pub enum Event {
     /// The engine switched a rule off.
     #[serde(rename_all = "camelCase")]
     RulePaused { rule_id: i64, name: String, reason: String },
+    /// Pending agent actions were queued, approved, or rejected.
+    #[serde(rename_all = "camelCase")]
+    AgentActionsChanged { pending: usize },
+    /// An agent queued an outgoing message in automatic mode.
+    #[serde(rename_all = "camelCase")]
+    AgentSent { outbox_id: i64, account_id: i64, subject: String, to: Vec<String> },
+}
+
+// ---------- agent permissions & approval queue ----------
+
+/// How Mailvern handles mutating MCP actions for an account (or by default).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentMode {
+    /// Reads and drafts run freely; mail/rule changes wait for approval; sending is off.
+    #[default]
+    Approval,
+    /// Agents can organize and send mail and manage rules without asking.
+    Auto,
+}
+
+impl AgentMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentMode::Approval => "approval",
+            AgentMode::Auto => "auto",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "auto" => AgentMode::Auto,
+            _ => AgentMode::Approval,
+        }
+    }
+}
+
+/// Global default plus per-account MCP permission overrides.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPermissions {
+    pub default_mode: AgentMode,
+    pub account_modes: std::collections::HashMap<i64, AgentMode>,
+}
+
+impl AgentPermissions {
+    pub fn for_account(&self, account_id: i64) -> AgentMode {
+        self.account_modes.get(&account_id).copied().unwrap_or(self.default_mode)
+    }
+
+    /// True if at least one account resolves to Auto (or default is Auto when no accounts exist).
+    pub fn any_auto(&self, account_ids: &[i64]) -> bool {
+        if account_ids.is_empty() {
+            self.default_mode == AgentMode::Auto
+        } else {
+            account_ids.iter().any(|&id| self.for_account(id) == AgentMode::Auto)
+        }
+    }
+
+    /// True only if default is Auto and every account resolves to Auto.
+    pub fn all_auto(&self, account_ids: &[i64]) -> bool {
+        self.default_mode == AgentMode::Auto && account_ids.iter().all(|&id| self.for_account(id) == AgentMode::Auto)
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum AgentActionSpec {
+    #[serde(rename_all = "camelCase")]
+    MarkSeen { ids: Vec<i64>, seen: bool },
+    #[serde(rename_all = "camelCase")]
+    SetFlagged { ids: Vec<i64>, flagged: bool },
+    #[serde(rename_all = "camelCase")]
+    Archive { ids: Vec<i64> },
+    #[serde(rename_all = "camelCase")]
+    Trash { ids: Vec<i64> },
+    #[serde(rename_all = "camelCase")]
+    Junk { ids: Vec<i64>, junk: bool },
+    #[serde(rename_all = "camelCase")]
+    MoveTo { ids: Vec<i64>, folder_id: i64 },
+    #[serde(rename_all = "camelCase")]
+    Snooze { ids: Vec<i64>, until: i64 },
+    #[serde(rename_all = "camelCase")]
+    Unsnooze { ids: Vec<i64> },
+    #[serde(rename_all = "camelCase")]
+    DeleteDraft { account_id: i64, message_id: String },
+    #[serde(rename_all = "camelCase")]
+    CreateRule { rule: Rule },
+    #[serde(rename_all = "camelCase")]
+    UpdateRule { rule: Rule },
+    #[serde(rename_all = "camelCase")]
+    DeleteRule { id: i64 },
+    /// Recorded in Auto mode for the activity log (never queued as pending).
+    #[serde(rename_all = "camelCase")]
+    SendMail { to: Vec<String>, subject: String, send_at: Option<i64> },
+}
+
+impl AgentActionSpec {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            AgentActionSpec::MarkSeen { seen: true, .. } => "markRead",
+            AgentActionSpec::MarkSeen { seen: false, .. } => "markUnread",
+            AgentActionSpec::SetFlagged { flagged: true, .. } => "flag",
+            AgentActionSpec::SetFlagged { flagged: false, .. } => "unflag",
+            AgentActionSpec::Archive { .. } => "archive",
+            AgentActionSpec::Trash { .. } => "trash",
+            AgentActionSpec::Junk { junk: true, .. } => "junk",
+            AgentActionSpec::Junk { junk: false, .. } => "notJunk",
+            AgentActionSpec::MoveTo { .. } => "move",
+            AgentActionSpec::Snooze { .. } => "snooze",
+            AgentActionSpec::Unsnooze { .. } => "unsnooze",
+            AgentActionSpec::DeleteDraft { .. } => "deleteDraft",
+            AgentActionSpec::CreateRule { .. } => "createRule",
+            AgentActionSpec::UpdateRule { .. } => "updateRule",
+            AgentActionSpec::DeleteRule { .. } => "deleteRule",
+            AgentActionSpec::SendMail { .. } => "sendMail",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMessagePreview {
+    pub id: i64,
+    pub subject: String,
+    pub from_name: String,
+    pub from_addr: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentActionPreview {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<AgentMessagePreview>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_folder: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// A queued or recently executed MCP agent action.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentAction {
+    pub id: i64,
+    pub account_id: Option<i64>,
+    pub kind: String,
+    pub summary: String,
+    pub spec: AgentActionSpec,
+    pub preview: AgentActionPreview,
+    /// "pending" | "approved" | "rejected" | "failed" | "auto"
+    pub status: String,
+    pub error: Option<String>,
+    pub created_at: i64,
+    pub resolved_at: Option<i64>,
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchOutcome {
+    pub succeeded: usize,
+    pub failed: usize,
+    pub errors: Vec<String>,
 }

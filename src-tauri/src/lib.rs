@@ -273,7 +273,7 @@ fn sync_view(engine: E, view: View) -> R<()> {
 }
 
 fn is_restricted_setting(key: &str) -> bool {
-    matches!(key, agents::ENABLED | agents::LEGACY_TOKEN)
+    matches!(key, agents::ENABLED | agents::MODE | agents::LEGACY_TOKEN)
 }
 
 #[tauri::command(async)]
@@ -701,6 +701,14 @@ pub fn run() {
             agents::agent_access,
             agents::set_agent_access,
             agents::reset_agent_token,
+            agents::set_agent_mode,
+            agents::set_agent_account_mode,
+            agents::agent_actions,
+            agents::pending_agent_actions_count,
+            agents::approve_agent_action,
+            agents::reject_agent_action,
+            agents::approve_all_agent_actions,
+            agents::reject_all_agent_actions,
             rules,
             save_rule,
             delete_rule,

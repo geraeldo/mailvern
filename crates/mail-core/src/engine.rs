@@ -49,6 +49,11 @@ impl Drop for Handle {
 #[path = "rule_runner.rs"]
 mod rule_runner;
 
+#[path = "agent_actions.rs"]
+mod agent_actions;
+
+pub use agent_actions::AGENT_MODE_KEY;
+
 /// The public API the UI talks to. Every read is served from the local database.
 /// Cloning is cheap: clones share everything.
 #[derive(Clone)]
@@ -562,6 +567,42 @@ impl Engine {
 
     pub fn trash(&self, ids: &[i64]) -> Result<()> {
         self.move_role(ids, "trash")
+    }
+
+    /// Returns `(account_id, folder_id, folder_role)` for a cached message id.
+    pub fn message_folder_role(&self, id: i64) -> Result<(i64, i64, Option<String>)> {
+        let (acc, folder_id, _, _) = self.db.locate(id)?;
+        let (_, _, role) = self.db.folder(folder_id)?;
+        Ok((acc, folder_id, role))
+    }
+
+    /// Moves messages to Trash, refusing any already in Trash so an agent can never
+    /// permanently expunge mail. Returns how many messages were moved.
+    pub fn move_to_trash_only(&self, ids: &[i64]) -> Result<usize> {
+        let g = self.group_ids(ids)?;
+        for (_, folder_id) in g.keys() {
+            let (_, _, from_role) = self.db.folder(*folder_id)?;
+            if from_role.as_deref() == Some("trash") {
+                return Err(anyhow!(
+                    "One or more messages are already in Trash. Agents can't permanently delete mail; empty Trash in Mailvern."
+                ));
+            }
+        }
+        let mut moved = Vec::new();
+        let mut accounts = Vec::new();
+        for ((acc, folder_id), msgs) in g {
+            let uids = msgs.iter().map(|m| m.1).collect();
+            self.send_cmd(acc, Cmd::Move { folder_id, uids, to: Target::Role("trash") })?;
+            moved.extend(msgs.iter().map(|m| m.0));
+            if !accounts.contains(&acc) {
+                accounts.push(acc);
+            }
+        }
+        self.db.delete_messages(&moved)?;
+        for account_id in accounts {
+            let _ = self.events.send(Event::Changed { account_id });
+        }
+        Ok(moved.len())
     }
 
     /// Moves to the Junk folder. On Gmail, iCloud, Fastmail and others this also trains their spam filter.

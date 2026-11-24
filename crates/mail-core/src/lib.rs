@@ -11,4 +11,4 @@ mod smtp;
 pub mod text;
 mod worker;
 
-pub use engine::Engine;
+pub use engine::{Engine, AGENT_MODE_KEY};

@@ -242,6 +242,63 @@ export function installMock() {
     if (r.actions.some((a: any) => a.type === "move") && r.accountId == null) throw "Choose an account: a rule that moves mail to a folder works in one account";
   };
 
+  const agentAccountModes: Record<number, "approval" | "auto"> = { 2: "auto" };
+  const agentActions: any[] = [
+    {
+      id: 1,
+      accountId: 1,
+      kind: "archive",
+      summary: "Archive 2 messages",
+      spec: { type: "archive", ids: [1, 2] },
+      preview: {
+        messages: [
+          { id: 1, subject: "Q4 planning — draft agenda", fromName: "Maya Chen", fromAddr: "maya@northwind.io" },
+          { id: 2, subject: "Invoice #2041 for November", fromName: "Jordan Blake", fromAddr: "jordan@figment.studio" },
+        ],
+      },
+      status: "pending",
+      error: null,
+      createdAt: now - 180,
+      resolvedAt: null,
+    },
+    {
+      id: 2,
+      accountId: 1,
+      kind: "createRule",
+      summary: "Add rule “File Stripe receipts”",
+      spec: { type: "createRule", rule: {} },
+      preview: { detail: "When from contains \"stripe\" → move to Receipts" },
+      status: "pending",
+      error: null,
+      createdAt: now - 60,
+      resolvedAt: null,
+    },
+    {
+      id: 3,
+      accountId: 2,
+      kind: "sendMail",
+      summary: "Send “Coffee next week?” to Jordan Blake",
+      spec: { type: "sendMail", to: ["jordan@figment.studio"], subject: "Coffee next week?", sendAt: null },
+      preview: {},
+      status: "auto",
+      error: null,
+      createdAt: now - 1800,
+      resolvedAt: now - 1800,
+    },
+  ];
+  const agentStatus = () => {
+    const enabled = settings.mcp_enabled === "on";
+    return {
+      enabled,
+      running: enabled,
+      url: "http://127.0.0.1:47823/mcp",
+      token: enabled ? settings.mcp_token : null,
+      error: null,
+      mode: (settings.mcp_mode as "approval" | "auto") ?? "approval",
+      accountModes: { ...agentAccountModes },
+    };
+  };
+
   mockIPC(async (cmd, args: any) => {
     switch (cmd) {
       case "rules": return rules.map((r) => ({ ...r }));
@@ -450,8 +507,40 @@ export function installMock() {
       case "reset_agent_token": {
         if (cmd === "set_agent_access") settings.mcp_enabled = args.enabled ? "on" : "off";
         if (cmd !== "agent_access") settings.mcp_token = cmd === "reset_agent_token" || !settings.mcp_token ? `mv_${crypto.randomUUID().replaceAll("-", "")}` : settings.mcp_token;
-        const enabled = settings.mcp_enabled === "on";
-        return { enabled, running: enabled, url: "http://127.0.0.1:47823/mcp", token: enabled ? settings.mcp_token : null, error: null };
+        return agentStatus();
+      }
+      case "set_agent_mode":
+        settings.mcp_mode = args.mode;
+        return agentStatus();
+      case "set_agent_account_mode":
+        if (args.mode) agentAccountModes[args.accountId] = args.mode;
+        else delete agentAccountModes[args.accountId];
+        return agentStatus();
+      case "agent_actions":
+        return agentActions.map((a) => ({ ...a }));
+      case "pending_agent_actions_count":
+        return agentActions.filter((a) => a.status === "pending").length;
+      case "approve_agent_action": {
+        const a = agentActions.find((x) => x.id === args.id);
+        if (a) { a.status = "approved"; a.resolvedAt = Math.floor(Date.now() / 1000); }
+        return a;
+      }
+      case "reject_agent_action": {
+        const a = agentActions.find((x) => x.id === args.id);
+        if (a) { a.status = "rejected"; a.resolvedAt = Math.floor(Date.now() / 1000); }
+        return null;
+      }
+      case "approve_all_agent_actions": {
+        const t = Math.floor(Date.now() / 1000);
+        let succeeded = 0;
+        for (const a of agentActions) if (a.status === "pending") { a.status = "approved"; a.resolvedAt = t; succeeded++; }
+        return { succeeded, failed: 0, errors: [] };
+      }
+      case "reject_all_agent_actions": {
+        const t = Math.floor(Date.now() / 1000);
+        let n = 0;
+        for (const a of agentActions) if (a.status === "pending") { a.status = "rejected"; a.resolvedAt = t; n++; }
+        return n;
       }
       // Confirm dialogs are accepted: the answer is the label of the OK button.
       case "plugin:dialog|message": {

@@ -1,13 +1,17 @@
 //! Access for coding agents on this Mac (Claude Code, Codex, Opencode): runs the MCP server from
 //! `crates/mail-mcp` while the setting is on. Off by default.
 
+use mail_core::model::{AgentAction, AgentMode, BatchOutcome};
 use mail_core::Engine;
 use mail_mcp::{Server, DEFAULT_PORT};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::State;
 
 /// Settings key: "on" when agents may connect.
 pub(crate) const ENABLED: &str = "mcp_enabled";
+/// Settings key: global default MCP permission mode ("approval" | "auto").
+pub(crate) const MODE: &str = mail_core::AGENT_MODE_KEY;
 /// Legacy SQLite setting key for the token, migrated into macOS Keychain on first read.
 pub(crate) const LEGACY_TOKEN: &str = "mcp_token";
 /// macOS Keychain account name for the MCP bearer token.
@@ -28,6 +32,8 @@ pub struct AgentAccess {
     /// Shown in Settings so the setup command can be copied. Only while access is on.
     token: Option<String>,
     error: Option<String>,
+    mode: AgentMode,
+    account_modes: HashMap<i64, AgentMode>,
 }
 
 fn setting(engine: &Engine, key: &str) -> Option<String> {
@@ -85,13 +91,31 @@ impl Agents {
                 None => st.1 = Some("Missing access token in Keychain. Reset the token to generate a new one.".into()),
             }
         }
-        AgentAccess { enabled, running: st.0.is_some(), url: mail_mcp::url(DEFAULT_PORT), token: token.filter(|_| enabled), error: st.1.clone() }
+        let perms = engine.agent_permissions().unwrap_or_default();
+        AgentAccess {
+            enabled,
+            running: st.0.is_some(),
+            url: mail_mcp::url(DEFAULT_PORT),
+            token: token.filter(|_| enabled),
+            error: st.1.clone(),
+            mode: perms.default_mode,
+            account_modes: perms.account_modes,
+        }
     }
 
     async fn status(&self, engine: &Engine) -> AgentAccess {
         let st = self.state.lock().await;
         let enabled = setting(engine, ENABLED).as_deref() == Some("on");
-        AgentAccess { enabled, running: st.0.is_some(), url: mail_mcp::url(DEFAULT_PORT), token: load_token(engine).filter(|_| enabled), error: st.1.clone() }
+        let perms = engine.agent_permissions().unwrap_or_default();
+        AgentAccess {
+            enabled,
+            running: st.0.is_some(),
+            url: mail_mcp::url(DEFAULT_PORT),
+            token: load_token(engine).filter(|_| enabled),
+            error: st.1.clone(),
+            mode: perms.default_mode,
+            account_modes: perms.account_modes,
+        }
     }
 }
 
@@ -118,4 +142,51 @@ pub async fn reset_agent_token(engine: State<'_, Arc<Engine>>, agents: State<'_,
     let mut st = agents.state.lock().await;
     store_token(&engine, &mail_mcp::new_token())?;
     Ok(agents.apply_locked(&mut st, &engine).await)
+}
+
+#[tauri::command]
+pub async fn set_agent_mode(engine: State<'_, Arc<Engine>>, agents: State<'_, Agents>, mode: AgentMode) -> R {
+    engine.set_agent_default_mode(mode).map_err(|e| format!("{e:#}"))?;
+    Ok(agents.status(&engine).await)
+}
+
+#[tauri::command]
+pub async fn set_agent_account_mode(
+    engine: State<'_, Arc<Engine>>,
+    agents: State<'_, Agents>,
+    account_id: i64,
+    mode: Option<AgentMode>,
+) -> R {
+    engine.set_agent_account_mode(account_id, mode).map_err(|e| format!("{e:#}"))?;
+    Ok(agents.status(&engine).await)
+}
+
+#[tauri::command(async)]
+pub fn agent_actions(engine: State<'_, Arc<Engine>>, limit: Option<usize>) -> Result<Vec<AgentAction>, String> {
+    engine.agent_actions(limit.unwrap_or(30)).map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(async)]
+pub fn pending_agent_actions_count(engine: State<'_, Arc<Engine>>) -> Result<usize, String> {
+    engine.pending_agent_actions_count().map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(async)]
+pub fn approve_agent_action(engine: State<'_, Arc<Engine>>, id: i64) -> Result<AgentAction, String> {
+    engine.approve_agent_action(id).map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(async)]
+pub fn reject_agent_action(engine: State<'_, Arc<Engine>>, id: i64) -> Result<(), String> {
+    engine.reject_agent_action(id).map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(async)]
+pub fn approve_all_agent_actions(engine: State<'_, Arc<Engine>>) -> Result<BatchOutcome, String> {
+    engine.approve_all_agent_actions().map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(async)]
+pub fn reject_all_agent_actions(engine: State<'_, Arc<Engine>>) -> Result<usize, String> {
+    engine.reject_all_agent_actions().map_err(|e| format!("{e:#}"))
 }

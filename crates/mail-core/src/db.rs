@@ -66,7 +66,29 @@ CREATE TABLE IF NOT EXISTS sender_icons (
 /// Rules: never edit or reorder a shipped entry. To change the schema, append a new
 /// entry (e.g. `ALTER TABLE messages ADD COLUMN ...`). Each one runs once, in a
 /// transaction, and the database is backed up before any upgrade.
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7];
+
+/// v7: per-account MCP permission overrides and the pending/recent agent actions queue.
+const V7: &str = r#"
+CREATE TABLE IF NOT EXISTS agent_account_modes (
+  account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+  mode TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_actions (
+  id INTEGER PRIMARY KEY,
+  account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  preview TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  error TEXT,
+  created_at INTEGER NOT NULL,
+  resolved_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_agent_actions_status ON agent_actions(status, created_at DESC);
+"#;
 
 /// v6: track whether each folder has completed an initial sync, so an emptied Inbox
 /// (Inbox Zero) still runs rules and notifies when new mail arrives.
@@ -1803,6 +1825,161 @@ impl Db {
         Ok(())
     }
 
+    // ---------- agent permissions & actions ----------
+
+    pub fn agent_account_modes(&self) -> Result<std::collections::HashMap<i64, AgentMode>> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT account_id, mode FROM agent_account_modes")?;
+        let mut out = std::collections::HashMap::new();
+        let rows = s.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        for r in rows {
+            let (id, mode) = r?;
+            out.insert(id, AgentMode::parse(&mode));
+        }
+        Ok(out)
+    }
+
+    pub fn set_agent_account_mode(&self, account_id: i64, mode: Option<AgentMode>) -> Result<()> {
+        let c = self.c();
+        match mode {
+            Some(m) => {
+                c.execute(
+                    "INSERT INTO agent_account_modes (account_id, mode) VALUES (?, ?)
+                     ON CONFLICT(account_id) DO UPDATE SET mode = excluded.mode",
+                    params![account_id, m.as_str()],
+                )?;
+            }
+            None => {
+                c.execute("DELETE FROM agent_account_modes WHERE account_id = ?", [account_id])?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_agent_action(
+        &self,
+        account_id: Option<i64>,
+        kind: &str,
+        summary: &str,
+        payload: &str,
+        preview: &str,
+        status: &str,
+        created_at: i64,
+        resolved_at: Option<i64>,
+    ) -> Result<i64> {
+        let c = self.c();
+        c.execute(
+            "INSERT INTO agent_actions (account_id, kind, summary, payload, preview, status, created_at, resolved_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![account_id, kind, summary, payload, preview, status, created_at, resolved_at],
+        )?;
+        Ok(c.last_insert_rowid())
+    }
+
+    fn row_to_agent_action(r: &rusqlite::Row) -> rusqlite::Result<AgentAction> {
+        let payload: String = r.get(4)?;
+        let preview: String = r.get(5)?;
+        let spec: AgentActionSpec = serde_json::from_str(&payload)
+            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e)))?;
+        let preview: AgentActionPreview = serde_json::from_str(&preview).unwrap_or_default();
+        Ok(AgentAction {
+            id: r.get(0)?,
+            account_id: r.get(1)?,
+            kind: r.get(2)?,
+            summary: r.get(3)?,
+            spec,
+            preview,
+            status: r.get(6)?,
+            error: r.get(7)?,
+            created_at: r.get(8)?,
+            resolved_at: r.get(9)?,
+        })
+    }
+
+    pub fn agent_action(&self, id: i64) -> Result<Option<AgentAction>> {
+        let c = self.c();
+        Ok(c.query_row(
+            "SELECT id, account_id, kind, summary, payload, preview, status, error, created_at, resolved_at
+             FROM agent_actions WHERE id = ?",
+            [id],
+            Self::row_to_agent_action,
+        )
+        .optional()?)
+    }
+
+    /// Pending actions (oldest first for review/batching) followed by recent resolved actions (newest first).
+    pub fn agent_actions(&self, recent_limit: usize) -> Result<Vec<AgentAction>> {
+        let c = self.c();
+        let mut out = Vec::new();
+        {
+            let mut s = c.prepare(
+                "SELECT id, account_id, kind, summary, payload, preview, status, error, created_at, resolved_at
+                 FROM agent_actions WHERE status = 'pending' ORDER BY created_at ASC, id ASC",
+            )?;
+            let rows = s.query_map([], Self::row_to_agent_action)?;
+            for r in rows {
+                out.push(r?);
+            }
+        }
+        if recent_limit > 0 {
+            let mut s = c.prepare(
+                "SELECT id, account_id, kind, summary, payload, preview, status, error, created_at, resolved_at
+                 FROM agent_actions WHERE status != 'pending' ORDER BY COALESCE(resolved_at, created_at) DESC, id DESC LIMIT ?",
+            )?;
+            let rows = s.query_map([recent_limit as i64], Self::row_to_agent_action)?;
+            for r in rows {
+                out.push(r?);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn pending_agent_action_ids(&self) -> Result<Vec<i64>> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT id FROM agent_actions WHERE status = 'pending' ORDER BY created_at ASC, id ASC")?;
+        let rows = s.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn pending_agent_actions_count(&self) -> Result<usize> {
+        let c = self.c();
+        let n: i64 = c.query_row("SELECT COUNT(*) FROM agent_actions WHERE status = 'pending'", [], |r| r.get(0))?;
+        Ok(n.max(0) as usize)
+    }
+
+    /// Transitions a pending action to a final status. Returns false if it was not pending.
+    pub fn resolve_agent_action(&self, id: i64, status: &str, error: Option<&str>, resolved_at: i64) -> Result<bool> {
+        let c = self.c();
+        let n = c.execute(
+            "UPDATE agent_actions SET status = ?, error = ?, resolved_at = ? WHERE id = ? AND status = 'pending'",
+            params![status, error, resolved_at, id],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn reject_all_pending_agent_actions(&self, resolved_at: i64) -> Result<usize> {
+        let c = self.c();
+        let n = c.execute(
+            "UPDATE agent_actions SET status = 'rejected', resolved_at = ? WHERE status = 'pending'",
+            params![resolved_at],
+        )?;
+        Ok(n)
+    }
+
+    /// Keeps at most `keep` resolved rows so the activity table stays bounded.
+    pub fn prune_resolved_agent_actions(&self, keep: usize) -> Result<()> {
+        let c = self.c();
+        c.execute(
+            "DELETE FROM agent_actions WHERE status != 'pending' AND id NOT IN (
+                SELECT id FROM agent_actions WHERE status != 'pending'
+                ORDER BY COALESCE(resolved_at, created_at) DESC, id DESC LIMIT ?
+            )",
+            [keep as i64],
+        )?;
+        Ok(())
+    }
+
     // ---------- sender pictures ----------
 
     /// The cached picture for a domain (None inside when it has none) and when to look again.
@@ -2295,5 +2472,33 @@ mod tests {
         let hits = db.contacts("a_b").unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].email, "a_b@example.com");
+    }
+
+    #[test]
+    fn v6_database_gains_agent_tables_and_cascades_on_account_delete() {
+        let path = temp_db();
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            migrate_with(&mut conn, &path, &[V1, V2, V3, V4, V5, V6]).unwrap();
+            conn.execute(
+                "INSERT INTO accounts (name, email, imap_host, imap_port, smtp_host, smtp_port) VALUES ('Me', 'me@x.com', 'i', 993, 's', 465)",
+                [],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(version(&path), SCHEMA_VERSION);
+        db.set_agent_account_mode(1, Some(AgentMode::Auto)).unwrap();
+        assert_eq!(db.agent_account_modes().unwrap().get(&1), Some(&AgentMode::Auto));
+        let spec = serde_json::to_string(&AgentActionSpec::Archive { ids: vec![1] }).unwrap();
+        let preview = serde_json::to_string(&AgentActionPreview::default()).unwrap();
+        let id = db.insert_agent_action(Some(1), "archive", "Archive 1 message", &spec, &preview, "pending", 100, None).unwrap();
+        assert_eq!(db.pending_agent_actions_count().unwrap(), 1);
+        assert!(db.agent_action(id).unwrap().is_some());
+
+        // Deleting the account cascades to both tables.
+        db.delete_account(1).unwrap();
+        assert!(db.agent_account_modes().unwrap().is_empty());
+        assert_eq!(db.pending_agent_actions_count().unwrap(), 0);
     }
 }

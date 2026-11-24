@@ -132,8 +132,39 @@ export type OutboxItem = { id: number; accountId: number; message: Outgoing; sen
 
 export type Cancelled = { message: Outgoing; attachments: FileInfo[] };
 
-/** Whether coding agents on this Mac may connect (the MCP server), and how. */
-export type AgentAccess = { enabled: boolean; running: boolean; url: string; token: string | null; error: string | null };
+export type AgentMode = "approval" | "auto";
+
+/** Whether coding agents on this Mac may connect (the MCP server), how, and with what permissions. */
+export type AgentAccess = {
+  enabled: boolean;
+  running: boolean;
+  url: string;
+  token: string | null;
+  error: string | null;
+  mode: AgentMode;
+  accountModes: Record<number, AgentMode>;
+};
+
+export type AgentMessagePreview = { id: number; subject: string; fromName: string; fromAddr: string };
+export type AgentActionPreview = {
+  messages?: AgentMessagePreview[];
+  targetFolder?: string;
+  until?: number;
+  detail?: string;
+};
+export type AgentAction = {
+  id: number;
+  accountId: number | null;
+  kind: string;
+  summary: string;
+  spec: { type: string; [key: string]: unknown };
+  preview: AgentActionPreview;
+  status: "pending" | "approved" | "rejected" | "failed" | "auto";
+  error: string | null;
+  createdAt: number;
+  resolvedAt: number | null;
+};
+export type BatchOutcome = { succeeded: number; failed: number; errors: string[] };
 
 export type RuleField =
   | "from"
@@ -223,7 +254,9 @@ export type MailEvent =
   | { kind: "outbox" }
   | { kind: "sendFailed"; subject: string; message: string }
   | { kind: "rulesChanged"; pendingApproval: number }
-  | { kind: "rulePaused"; ruleId: number; name: string; reason: string };
+  | { kind: "rulePaused"; ruleId: number; name: string; reason: string }
+  | { kind: "agentActionsChanged"; pending: number }
+  | { kind: "agentSent"; outboxId: number; accountId: number; subject: string; to: string[] };
 
 export const api = {
   accounts: () => invoke<Account[]>("accounts"),
@@ -283,6 +316,14 @@ export const api = {
   agentAccess: () => invoke<AgentAccess>("agent_access"),
   setAgentAccess: (enabled: boolean) => invoke<AgentAccess>("set_agent_access", { enabled }),
   resetAgentToken: () => invoke<AgentAccess>("reset_agent_token"),
+  setAgentMode: (mode: AgentMode) => invoke<AgentAccess>("set_agent_mode", { mode }),
+  setAgentAccountMode: (accountId: number, mode: AgentMode | null) => invoke<AgentAccess>("set_agent_account_mode", { accountId, mode }),
+  agentActions: (limit = 30) => invoke<AgentAction[]>("agent_actions", { limit }),
+  pendingAgentActionsCount: () => invoke<number>("pending_agent_actions_count"),
+  approveAgentAction: (id: number) => invoke<AgentAction>("approve_agent_action", { id }),
+  rejectAgentAction: (id: number) => invoke<void>("reject_agent_action", { id }),
+  approveAllAgentActions: () => invoke<BatchOutcome>("approve_all_agent_actions"),
+  rejectAllAgentActions: () => invoke<number>("reject_all_agent_actions"),
   rules: () => invoke<Rule[]>("rules"),
   saveRule: (rule: Rule) => invoke<Rule>("save_rule", { rule }),
   deleteRule: (id: number) => invoke<void>("delete_rule", { id }),
