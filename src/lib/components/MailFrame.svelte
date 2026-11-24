@@ -5,21 +5,46 @@
   let frame: HTMLIFrameElement;
   let h = $state(40);
   let ro: ResizeObserver | undefined;
+  let watched: HTMLElement | null = null;
 
   const doc = $derived(frameDoc(html, allowRemote));
 
-  function onLoad() {
-    const d = frame.contentDocument;
-    if (!d) return;
-    // Measure the body, not the document: the document is at least as tall as the frame.
-    const fit = () => (h = Math.max(24, Math.ceil(d.body.getBoundingClientRect().height)));
-    fit();
+  // Starts sizing the frame to the current document's body once it has been parsed. Returns false
+  // while the frame still shows the previous document (or the initial blank one).
+  function track(): boolean {
+    const d = frame?.contentDocument;
+    const body = d && d.URL === "about:srcdoc" && d.readyState !== "loading" ? d.body : null;
+    if (!body || body === watched) return false;
+    watched = body;
     ro?.disconnect();
-    ro = new ResizeObserver(fit);
-    ro.observe(d.body);
+    // Measure the body, not the document: the document is at least as tall as the frame.
+    // A body detached by the next document reads as 0 tall, so it no longer counts.
+    ro = new ResizeObserver(() => {
+      if (!body.isConnected || frame?.contentDocument !== d) return;
+      const px = body.getBoundingClientRect().height;
+      // A body being torn down for the next document reads as 0 tall; keep the old height until then.
+      if (px > 0) h = Math.max(24, Math.ceil(px));
+    });
+    ro.observe(body);
     // No listeners go on `d`: WebKit runs none in a frame sandboxed without scripts. Links reach
     // the browser through the app's navigation hook, and the native menu is trimmed natively.
+    return true;
   }
+
+  // Each new document (on opening a message, or after allowing images) is measured as soon as it is
+  // parsed, so it never sits cut off while images load. The load event can't be relied on: it waits
+  // for every remote image, and one that stalls holds it forever. A timer, not requestAnimationFrame,
+  // so it still runs while the window is hidden.
+  $effect(() => {
+    void doc;
+    let timer = 0;
+    let tries = 0;
+    const tick = () => {
+      if (!track() && ++tries < 500) timer = window.setTimeout(tick, 10);
+    };
+    tick();
+    return () => clearTimeout(timer);
+  });
 
   $effect(() => () => ro?.disconnect());
 </script>
@@ -29,7 +54,7 @@
   title="Message"
   sandbox="allow-same-origin"
   srcdoc={doc}
-  onload={onLoad}
+  onload={track}
   style:height="{h}px"></iframe>
 
 <style>
