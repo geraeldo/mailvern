@@ -27,7 +27,7 @@ fn now() -> i64 {
 }
 
 fn worker_tx(workers: &Workers, account_id: i64) -> Option<mpsc::UnboundedSender<Cmd>> {
-    workers.lock().unwrap().get(&account_id).map(|h| h.tx.clone())
+    workers.lock().unwrap_or_else(|e| e.into_inner()).get(&account_id).map(|h| h.tx.clone())
 }
 
 struct Handle {
@@ -114,17 +114,17 @@ impl Engine {
             tokio::spawn(worker.run()),
             tokio::spawn(idle_loop(acc.clone(), self.db.clone(), tx.clone())),
         ];
-        self.workers.lock().unwrap().insert(acc.id, Handle { tx, tasks });
+        self.workers.lock().unwrap_or_else(|e| e.into_inner()).insert(acc.id, Handle { tx, tasks });
     }
 
     fn send_cmd(&self, account_id: i64, cmd: Cmd) -> Result<()> {
-        let w = self.workers.lock().unwrap();
+        let w = self.workers.lock().unwrap_or_else(|e| e.into_inner());
         let h = w.get(&account_id).ok_or_else(|| anyhow!("Account is not running"))?;
         h.tx.send(cmd).map_err(|_| anyhow!("Account worker stopped"))
     }
 
     pub fn sync_now(&self) {
-        for h in self.workers.lock().unwrap().values() {
+        for h in self.workers.lock().unwrap_or_else(|e| e.into_inner()).values() {
             let _ = h.tx.send(Cmd::SyncAll);
         }
     }
@@ -165,6 +165,11 @@ impl Engine {
         if is_new && password.is_none() {
             return Err(anyhow!("Password required"));
         }
+        // Reject duplicate addresses before touching the Keychain so a failed
+        // UNIQUE constraint can't overwrite another account's stored password.
+        if self.db.accounts()?.iter().any(|a| a.id != acc.id && a.email.eq_ignore_ascii_case(&acc.email)) {
+            return Err(anyhow!("An account for {} already exists", acc.email));
+        }
         let old = if is_new { None } else { Some(self.db.account(acc.id)?) };
         let old_email = old.as_ref().map(|o| o.email.clone()).filter(|e| *e != acc.email);
         let connection_changed = match &old {
@@ -195,7 +200,7 @@ impl Engine {
         }
         let saved = self.db.account(id)?;
         if password.is_some() || connection_changed {
-            self.workers.lock().unwrap().remove(&id);
+            self.workers.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
             self.start_account(saved.clone());
         }
         Ok(saved)
@@ -211,7 +216,7 @@ impl Engine {
 
     pub fn delete_account(&self, id: i64) -> Result<()> {
         let acc = self.db.account(id)?;
-        self.workers.lock().unwrap().remove(&id);
+        self.workers.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
         self.db.delete_account(id)?;
         secrets::delete(&acc.email);
         Ok(())
@@ -291,7 +296,7 @@ impl Engine {
         if terms.is_empty() {
             return Ok(vec![]);
         }
-        let accounts: Vec<i64> = self.workers.lock().unwrap().keys().copied().collect();
+        let accounts: Vec<i64> = self.workers.lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
         // Each account with the folders to search there (None: wherever the mail could be).
         let targets: Vec<(i64, Option<Vec<i64>>)> = match scope {
             SearchScope::All => accounts.into_iter().map(|a| (a, None)).collect(),
@@ -356,11 +361,11 @@ impl Engine {
         let mut q = q.clone();
         let mut server_error = None;
         if let Some(criteria) = imap::query_criteria(&q) {
-            let accounts: Vec<i64> = self.workers.lock().unwrap().keys().copied().collect();
+            let accounts: Vec<i64> = self.workers.lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
             let targets: Vec<(i64, Option<Vec<i64>>)> = if let Some(folder_id) = q.folder_id {
                 vec![(self.db.folder(folder_id)?.0, Some(vec![folder_id]))]
-            } else if let Some(role) = q.role.as_deref() {
-                self.role_targets(role)?.into_iter().filter(|(a, _)| q.account_id.map_or(true, |x| x == *a)).collect()
+            } else if let Some(role) = q.role.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_lowercase) {
+                self.role_targets(&role)?.into_iter().filter(|(a, _)| q.account_id.map_or(true, |x| x == *a)).collect()
             } else {
                 accounts.into_iter().filter(|a| q.account_id.map_or(true, |x| x == *a)).map(|a| (a, None)).collect()
             };
@@ -521,10 +526,12 @@ impl Engine {
     }
 
     fn move_role(&self, ids: &[i64], role: &'static str) -> Result<()> {
-        let g = self.group(ids)?;
-        let mut to_delete = Vec::new();
-        for ((acc, folder_id), uids) in g {
+        let g = self.group_ids(ids)?;
+        let mut moved = Vec::new();
+        let mut accounts = Vec::new();
+        for ((acc, folder_id), msgs) in g {
             let (_, _, from_role) = self.db.folder(folder_id)?;
+            let uids = msgs.iter().map(|m| m.1).collect();
             if from_role.as_deref() == Some(role) {
                 if role == "trash" {
                     self.send_cmd(acc, Cmd::Delete { folder_id, uids })?;
@@ -534,11 +541,14 @@ impl Engine {
             } else {
                 self.send_cmd(acc, Cmd::Move { folder_id, uids, to: Target::Role(role) })?;
             }
-            to_delete.push(acc);
+            moved.extend(msgs.iter().map(|m| m.0));
+            if !accounts.contains(&acc) {
+                accounts.push(acc);
+            }
         }
-        self.db.delete_messages(ids)?;
-        for acc in to_delete {
-            let _ = self.events.send(Event::Changed { account_id: acc });
+        self.db.delete_messages(&moved)?;
+        for account_id in accounts {
+            let _ = self.events.send(Event::Changed { account_id });
         }
         Ok(())
     }
@@ -604,7 +614,9 @@ impl Engine {
                 self.send_cmd(acc, Cmd::Move { folder_id, uids, to: Target::Role("snoozed") })?;
                 moved.extend(msgs.iter().map(|m| m.0));
             }
-            accounts.push(acc);
+            if !accounts.contains(&acc) {
+                accounts.push(acc);
+            }
         }
         self.db.delete_messages(&moved)?;
         self.wake.notify_one();
@@ -631,10 +643,16 @@ impl Engine {
     }
 
     fn notify_changed(&self, ids: &[i64]) {
-        if let Some(id) = ids.first() {
+        let mut accounts = Vec::new();
+        for id in ids {
             if let Ok((acc, ..)) = self.db.locate(*id) {
-                let _ = self.events.send(Event::Changed { account_id: acc });
+                if !accounts.contains(&acc) {
+                    accounts.push(acc);
+                }
             }
+        }
+        for account_id in accounts {
+            let _ = self.events.send(Event::Changed { account_id });
         }
     }
 
@@ -648,8 +666,9 @@ impl Engine {
             return Err(anyhow!("Add a recipient"));
         }
         let acc = self.db.account(out.account_id)?;
-        let was_draft = out.message_id.is_some();
-        let message_id = out.message_id.clone().unwrap_or_else(|| smtp::new_message_id(&acc));
+        let existing_mid = out.message_id.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+        let was_draft = existing_mid.is_some();
+        let message_id = existing_mid.unwrap_or_else(|| smtp::new_message_id(&acc));
         out.message_id = Some(message_id.clone());
         let built = smtp::build(&acc, &out, &message_id, false)?;
         let at = match send_at {
@@ -715,7 +734,13 @@ impl Engine {
     /// Returns the draft's Message-ID, to pass back on the next save.
     pub async fn save_draft(&self, mut out: Outgoing) -> Result<String> {
         let acc = self.db.account(out.account_id)?;
-        let message_id = out.message_id.clone().unwrap_or_else(|| smtp::new_message_id(&acc));
+        let message_id = out
+            .message_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| smtp::new_message_id(&acc));
         out.message_id = Some(message_id.clone());
         let built = smtp::build(&acc, &out, &message_id, true)?;
         let (tx, rx) = oneshot::channel();
@@ -731,11 +756,18 @@ impl Engine {
     /// may be left out): (message id, account id).
     pub fn find_draft(&self, message_id: &str) -> Result<Option<(i64, i64)>> {
         let id = message_id.trim();
+        if id.is_empty() {
+            return Ok(None);
+        }
         let id = if id.starts_with('<') { id.to_string() } else { format!("<{id}>") };
         self.db.find_draft(&id)
     }
 
     pub fn delete_draft(&self, account_id: i64, message_id: &str) -> Result<()> {
+        let message_id = message_id.trim();
+        if message_id.is_empty() {
+            return Ok(());
+        }
         if let Some((folder_id, _)) = self.db.folder_by_role(account_id, "drafts")? {
             if self.db.delete_by_message_id(folder_id, message_id)? > 0 {
                 let _ = self.events.send(Event::Changed { account_id });
@@ -820,13 +852,18 @@ async fn scheduler(db: Arc<Db>, events: broadcast::Sender<Event>, workers: Worke
         if let Ok(due) = db.due_snoozes(t) {
             for s in due {
                 // Hold it back while the move runs; if that fails it's retried then.
-                let _ = db.set_wake(s.account_id, &s.message_id, t + 120);
+                if let Err(e) = db.set_wake(s.account_id, &s.message_id, t.saturating_add(120)) {
+                    eprintln!("snooze: {e:#}");
+                    continue;
+                }
                 tokio::spawn(wake_snooze(db.clone(), events.clone(), workers.clone(), s));
             }
         }
-        let next_ms = db.next_due().ok().flatten().map(|n| n * 1000);
+        let next_ms = db.next_due().ok().flatten().map(|n| n.saturating_mul(1000));
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let wait = next_ms.map(|n| (n - now_ms).clamp(0, 60_000)).unwrap_or(60_000);
+        // Keep a small floor so a past-due row that failed to claim can't spin the loop;
+        // explicit schedules / send_now wake immediately via `wake.notify_one()`.
+        let wait = next_ms.map(|n| n.saturating_sub(now_ms).clamp(250, 60_000)).unwrap_or(60_000);
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(wait as u64)) => {}
             _ = wake.notified() => {}
@@ -860,8 +897,8 @@ async fn deliver(db: Arc<Db>, events: broadcast::Sender<Event>, workers: Workers
         }
         Err(e) => {
             let message = format!("{e:#}");
-            let backoff = 60 * (1i64 << row.attempts.min(5));
-            let _ = db.outbox_failed(row.id, &message, now() + backoff);
+            let backoff = 60 * (1i64 << row.attempts.min(10));
+            let _ = db.outbox_failed(row.id, &message, now().saturating_add(backoff));
             if row.attempts == 0 {
                 let subject = serde_json::from_str::<Outgoing>(&row.payload).map(|o| o.subject).unwrap_or_default();
                 let _ = events.send(Event::SendFailed { subject, message });

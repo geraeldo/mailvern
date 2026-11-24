@@ -289,31 +289,39 @@ export async function loadList(reset = true) {
   const view = ui.view;
   const q = ui.query.trim();
   let rows: Summary[];
-  if (ui.ai) {
-    if (!reset) return;
-    // The answer's sources, in citation order, each with the size of its conversation.
-    const ids = aiSourceTurn(ui.ai)?.sources ?? [];
-    rows = ids.length ? await api.summaries(ids) : [];
-    rows = await Promise.all(
-      rows.map(async (r) => {
-        const thread = await api.thread(r.id).catch(() => []);
-        return { ...r, count: Math.max(1, thread.length) };
-      }),
-    );
-    if (my !== listSeq) return;
-    ui.list = rows;
-    ui.hasMore = false;
-    ui.listReady = true;
+  try {
+    if (ui.ai) {
+      if (!reset) return;
+      // The answer's sources, in citation order, each with the size of its conversation.
+      const ids = aiSourceTurn(ui.ai)?.sources ?? [];
+      rows = ids.length ? await api.summaries(ids) : [];
+      rows = await Promise.all(
+        rows.map(async (r) => {
+          const thread = await api.thread(r.id).catch(() => []);
+          return { ...r, count: Math.max(1, thread.length) };
+        }),
+      );
+      if (my !== listSeq) return;
+      ui.list = rows;
+      ui.hasMore = false;
+      ui.listReady = true;
+      return;
+    } else if (q) {
+      if (!reset) return;
+      const scope = ui.searchScope;
+      rows = await api.search(q, scope);
+      if (remote?.q === q && remote.scope === scopeKey(scope)) rows = mergeRows(rows, remote.rows);
+    } else {
+      const limit = reset ? Math.max(PAGE, ui.list.length) : PAGE;
+      rows = await api.messages(view, null, reset ? 0 : ui.list.length, limit, ui.threaded);
+      if (my === listSeq) ui.hasMore = rows.length === limit;
+    }
+  } catch (e) {
+    if (my === listSeq) {
+      ui.listReady = true;
+      toast(String(e));
+    }
     return;
-  } else if (q) {
-    if (!reset) return;
-    const scope = ui.searchScope;
-    rows = await api.search(q, scope);
-    if (remote?.q === q && remote.scope === scopeKey(scope)) rows = mergeRows(rows, remote.rows);
-  } else {
-    const limit = reset ? Math.max(PAGE, ui.list.length) : PAGE;
-    rows = await api.messages(view, null, reset ? 0 : ui.list.length, limit, ui.threaded);
-    if (my === listSeq) ui.hasMore = rows.length === limit;
   }
   if (my !== listSeq) return;
   ui.list = reset ? rows : [...ui.list, ...rows];
@@ -479,7 +487,11 @@ export async function openMessage(id: number | null) {
     row.seen = true;
     if (ui.detail) ui.detail.seen = true;
     for (const t of ui.thread) if (row.ids.includes(t.id)) t.seen = true;
-    api.setSeen(row.ids, true).then(loadFolders);
+    api.setSeen(row.ids, true).then(loadFolders).catch((e) => {
+      toast(String(e));
+      loadList(true);
+      loadFolders();
+    });
   }
 }
 
@@ -612,14 +624,17 @@ export function undoToast() {
   undo?.();
 }
 
-async function run(p: Promise<unknown>) {
+async function run(p: Promise<unknown>): Promise<boolean> {
+  let ok = true;
   try {
     await p;
   } catch (e) {
+    ok = false;
     toast(String(e));
     loadList(true);
   }
   loadFolders();
+  return ok;
 }
 
 const counted = (verb: string, n: number) => (n > 1 ? `${verb} ${n} items` : verb);
@@ -629,7 +644,9 @@ function bulk(verb: string, call: (ids: number[]) => Promise<unknown>) {
   const rows = selectedRows();
   if (!rows.length) return;
   const ids = removeRows(rows);
-  run(call(ids)).then(() => toast(counted(verb, rows.length)));
+  run(call(ids)).then((ok) => {
+    if (ok) toast(counted(verb, rows.length));
+  });
 }
 
 /** Checks the server for new mail in just this folder (or unified folder). */
@@ -699,7 +716,9 @@ export function snoozeRows(rows: Summary[], until: Date) {
   const gone = new Set(rows.map((r) => r.id));
   const shown = ui.list.filter((m) => gone.has(m.id));
   const ids = shown.length ? removeRows(shown) : idsOf(rows);
-  run(api.snooze(ids, toUnix(until))).then(() => toast(`Snoozed until ${whenLabel(until)}`));
+  run(api.snooze(ids, toUnix(until))).then((ok) => {
+    if (ok) toast(`Snoozed until ${whenLabel(until)}`);
+  });
 }
 
 export function unsnoozeSelected() {
@@ -721,7 +740,9 @@ export function moveRows(rows: Summary[], folder: Folder) {
   const gone = new Set(rows.map((r) => r.id));
   const shown = ui.list.filter((m) => gone.has(m.id));
   const ids = shown.length ? removeRows(shown) : idsOf(rows);
-  run(api.moveTo(ids, folder.id)).then(() => toast(`Moved to ${folder.name}`));
+  run(api.moveTo(ids, folder.id)).then((ok) => {
+    if (ok) toast(`Moved to ${folder.name}`);
+  });
 }
 
 // ---------- writing ----------

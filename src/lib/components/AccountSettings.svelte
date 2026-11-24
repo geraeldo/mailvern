@@ -81,6 +81,7 @@
   }
 
   async function save() {
+    if (saving) return;
     error = null;
     if (!draft.email.includes("@")) {
       error = "Enter an email address";
@@ -120,7 +121,7 @@
   }
 
   async function remove() {
-    if (!draft.id) return;
+    if (saving || !draft.id) return;
     const ok = await ask(`Remove ${draft.email}? Mail on the server stays.`, {
       title: "Remove account",
       kind: "warning",
@@ -128,11 +129,19 @@
       cancelLabel: "Cancel",
     });
     if (!ok) return;
-    await api.deleteAccount(draft.id);
-    await loadAccounts();
-    await loadFolders();
-    setView({ kind: "unified", role: "inbox" });
-    choose(ui.accounts[0]?.id ?? 0);
+    saving = true;
+    error = null;
+    try {
+      await api.deleteAccount(draft.id);
+      await loadAccounts();
+      await loadFolders();
+      setView({ kind: "unified", role: "inbox" });
+      choose(ui.accounts[0]?.id ?? 0);
+    } catch (e) {
+      error = String(e);
+    } finally {
+      saving = false;
+    }
   }
 
   function close() {

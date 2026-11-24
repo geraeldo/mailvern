@@ -41,7 +41,7 @@ pub struct BodyInfo {
 }
 
 /// Per-connection settings. Not part of the schema; applied on every open.
-const PRAGMAS: &str = "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;";
+const PRAGMAS: &str = "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;";
 
 /// Caches that can be rebuilt from the network at any time, so they stay out of the
 /// versioned schema: created on open, and dropping one only costs a refetch.
@@ -63,7 +63,14 @@ CREATE TABLE IF NOT EXISTS sender_icons (
 /// Rules: never edit or reorder a shipped entry. To change the schema, append a new
 /// entry (e.g. `ALTER TABLE messages ADD COLUMN ...`). Each one runs once, in a
 /// transaction, and the database is backed up before any upgrade.
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6];
+
+/// v6: track whether each folder has completed an initial sync, so an emptied Inbox
+/// (Inbox Zero) still runs rules and notifies when new mail arrives.
+const V6: &str = r#"
+ALTER TABLE folders ADD COLUMN synced INTEGER NOT NULL DEFAULT 0;
+UPDATE folders SET synced = 1 WHERE uidvalidity != 0 OR EXISTS (SELECT 1 FROM messages m WHERE m.folder_id = folders.id);
+"#;
 
 /// v5: rules.
 ///
@@ -374,7 +381,7 @@ fn row_to_account(r: &rusqlite::Row) -> rusqlite::Result<Account> {
 fn fts_query(q: &str) -> Option<String> {
     let terms: Vec<String> = q
         .split_whitespace()
-        .map(|t| t.replace('"', ""))
+        .map(|t| t.replace(['"', '\0'], ""))
         .filter(|t| !t.is_empty())
         .map(|t| format!("\"{}\"*", t))
         .collect();
@@ -419,7 +426,10 @@ fn query_where(q: &MailQuery) -> Result<(String, Vec<rusqlite::types::Value>)> {
     }
     if let Some(t) = nonempty(&q.to) {
         let p = arg(Value::Text(like_any(&t)));
-        words.push(format!("(m.to_json LIKE {p} ESCAPE '\\' OR m.cc_json LIKE {p} ESCAPE '\\')"));
+        words.push(format!(
+            "(EXISTS (SELECT 1 FROM json_each(m.to_json) j WHERE json_extract(j.value, '$.email') LIKE {p} ESCAPE '\\' OR COALESCE(json_extract(j.value, '$.name'), '') LIKE {p} ESCAPE '\\') \
+              OR EXISTS (SELECT 1 FROM json_each(m.cc_json) j WHERE json_extract(j.value, '$.email') LIKE {p} ESCAPE '\\' OR COALESCE(json_extract(j.value, '$.name'), '') LIKE {p} ESCAPE '\\'))"
+        ));
     }
 
     let mut w = Vec::new();
@@ -581,20 +591,39 @@ impl Db {
     }
 
     pub fn reorder_accounts(&self, ids: &[i64]) -> Result<()> {
-        let c = self.c();
+        let mut c = self.c();
+        let tx = c.transaction()?;
         for (i, id) in ids.iter().enumerate() {
-            c.execute("UPDATE accounts SET position = ? WHERE id = ?", params![i as i64, id])?;
+            tx.execute("UPDATE accounts SET position = ? WHERE id = ?", params![i as i64, id])?;
         }
+        tx.commit()?;
         Ok(())
     }
 
     pub fn delete_account(&self, id: i64) -> Result<()> {
-        let c = self.c();
-        c.execute(
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        tx.execute(
             "DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE account_id = ?)",
             [id],
         )?;
-        c.execute("DELETE FROM accounts WHERE id = ?", [id])?;
+        tx.execute("DELETE FROM rule_seen WHERE account_id = ?", [id])?;
+        tx.execute("DELETE FROM rule_log WHERE account_id = ?", [id])?;
+        // Remove rules scoped solely to this account and their reply history.
+        let rule_ids: Vec<i64> = tx
+            .prepare("SELECT id, def FROM rules")?
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            .filter_map(|r| r.ok())
+            .filter_map(|(rid, def)| {
+                serde_json::from_str::<Rule>(&def).ok().filter(|r| r.account_id == Some(id)).map(|_| rid)
+            })
+            .collect();
+        for rid in rule_ids {
+            tx.execute("DELETE FROM rule_replies WHERE rule_id = ?", [rid])?;
+            tx.execute("DELETE FROM rules WHERE id = ?", [rid])?;
+        }
+        tx.execute("DELETE FROM accounts WHERE id = ?", [id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -615,15 +644,17 @@ impl Db {
     }
 
     pub fn remove_folders_except(&self, account_id: i64, keep: &[i64]) -> Result<()> {
-        let c = self.c();
-        let existing: Vec<i64> = c
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let existing: Vec<i64> = tx
             .prepare("SELECT id FROM folders WHERE account_id = ?")?
             .query_map([account_id], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         for id in existing.into_iter().filter(|id| !keep.contains(id)) {
-            c.execute("DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE folder_id = ?)", [id])?;
-            c.execute("DELETE FROM folders WHERE id = ?", [id])?;
+            tx.execute("DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE folder_id = ?)", [id])?;
+            tx.execute("DELETE FROM folders WHERE id = ?", [id])?;
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -716,11 +747,24 @@ impl Db {
         Ok(v as u32)
     }
 
-    pub fn reset_folder(&self, folder_id: i64, uidvalidity: u32) -> Result<()> {
+    pub fn folder_synced(&self, folder_id: i64) -> Result<bool> {
         let c = self.c();
-        c.execute("DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE folder_id = ?)", [folder_id])?;
-        c.execute("DELETE FROM messages WHERE folder_id = ?", [folder_id])?;
-        c.execute("UPDATE folders SET uidvalidity = ? WHERE id = ?", params![uidvalidity as i64, folder_id])?;
+        let v: bool = c.query_row("SELECT synced FROM folders WHERE id = ?", [folder_id], |r| r.get(0))?;
+        Ok(v)
+    }
+
+    pub fn mark_folder_synced(&self, folder_id: i64) -> Result<()> {
+        self.c().execute("UPDATE folders SET synced = 1 WHERE id = ?", [folder_id])?;
+        Ok(())
+    }
+
+    pub fn reset_folder(&self, folder_id: i64, uidvalidity: u32) -> Result<()> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        tx.execute("DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE folder_id = ?)", [folder_id])?;
+        tx.execute("DELETE FROM messages WHERE folder_id = ?", [folder_id])?;
+        tx.execute("UPDATE folders SET uidvalidity = ?, synced = 0 WHERE id = ?", params![uidvalidity as i64, folder_id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1172,10 +1216,12 @@ impl Db {
     }
 
     pub fn set_seen(&self, ids: &[i64], seen: bool) -> Result<()> {
-        let c = self.c();
+        let mut c = self.c();
+        let tx = c.transaction()?;
         for id in ids {
-            c.execute("UPDATE messages SET seen = ? WHERE id = ?", params![seen, id])?;
+            tx.execute("UPDATE messages SET seen = ? WHERE id = ?", params![seen, id])?;
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1186,19 +1232,23 @@ impl Db {
     }
 
     pub fn set_flagged(&self, ids: &[i64], flagged: bool) -> Result<()> {
-        let c = self.c();
+        let mut c = self.c();
+        let tx = c.transaction()?;
         for id in ids {
-            c.execute("UPDATE messages SET flagged = ? WHERE id = ?", params![flagged, id])?;
+            tx.execute("UPDATE messages SET flagged = ? WHERE id = ?", params![flagged, id])?;
         }
+        tx.commit()?;
         Ok(())
     }
 
     pub fn delete_messages(&self, ids: &[i64]) -> Result<()> {
-        let c = self.c();
+        let mut c = self.c();
+        let tx = c.transaction()?;
         for id in ids {
-            c.execute("DELETE FROM messages_fts WHERE rowid = ?", [id])?;
-            c.execute("DELETE FROM messages WHERE id = ?", [id])?;
+            tx.execute("DELETE FROM messages_fts WHERE rowid = ?", [id])?;
+            tx.execute("DELETE FROM messages WHERE id = ?", [id])?;
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1270,7 +1320,7 @@ impl Db {
     /// Address suggestions, ranked by how often you write to / hear from them.
     pub fn contacts(&self, q: &str) -> Result<Vec<Addr>> {
         let c = self.c();
-        let like = format!("%{}%", q.trim().replace('%', "").replace('_', ""));
+        let like = like_any(q);
         let mut st = c.prepare(
             "SELECT COALESCE(MAX(NULLIF(name, '')), ''), email, SUM(w) AS score FROM (
                SELECT from_name AS name, from_addr AS email, 1 AS w FROM messages
@@ -1279,7 +1329,7 @@ impl Db {
                FROM messages m, json_each(m.to_json) j
                WHERE m.folder_id IN (SELECT id FROM folders WHERE role = 'sent')
              )
-             WHERE email != '' AND (email LIKE ?1 OR name LIKE ?1)
+             WHERE email != '' AND (email LIKE ?1 ESCAPE '\\' OR name LIKE ?1 ESCAPE '\\')
              GROUP BY lower(email) ORDER BY score DESC LIMIT 8",
         )?;
         let rows = st
@@ -1477,8 +1527,12 @@ impl Db {
     }
 
     pub fn delete_rule(&self, id: i64) -> Result<bool> {
-        let c = self.c();
-        Ok(c.execute("DELETE FROM rules WHERE id = ?", [id])? > 0)
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        tx.execute("DELETE FROM rule_replies WHERE rule_id = ?", [id])?;
+        let deleted = tx.execute("DELETE FROM rules WHERE id = ?", [id])? > 0;
+        tx.commit()?;
+        Ok(deleted)
     }
 
     pub fn reorder_rules(&self, ids: &[i64]) -> Result<()> {
@@ -1974,6 +2028,7 @@ mod tests {
         assert_eq!(q(MailQuery { subject: Some("rapat".into()), ..Default::default() }).total, 2);
         assert_eq!(q(MailQuery { subject: Some("anggaran".into()), ..Default::default() }).total, 0, "subject only");
         assert_eq!(q(MailQuery { to: Some("budi".into()), ..Default::default() }).total, 1);
+        assert_eq!(q(MailQuery { to: Some("email".into()), ..Default::default() }).total, 0, "JSON keys don't match to:");
         assert_eq!(q(MailQuery { after: Some(150), before: Some(300), ..Default::default() }).total, 1);
         assert_eq!(q(MailQuery { has_attachments: Some(true), ..Default::default() }).total, 1);
         assert_eq!(q(MailQuery { unread: Some(true), role: Some("inbox".into()), ..Default::default() }).total, 2);
@@ -2107,17 +2162,19 @@ mod tests {
 
         let next = "ALTER TABLE accounts ADD COLUMN nickname TEXT NOT NULL DEFAULT 'none';";
         let mut conn = Connection::open(&path).unwrap();
-        migrate_with(&mut conn, &path, &[V1, V2, V3, V4, V5, next]).unwrap();
+        let mut all: Vec<&str> = MIGRATIONS.to_vec();
+        all.push(next);
+        migrate_with(&mut conn, &path, &all).unwrap();
 
-        assert_eq!(version(&path), 6);
+        assert_eq!(version(&path), SCHEMA_VERSION + 1);
         let nick: String = conn.query_row("SELECT nickname FROM accounts", [], |r| r.get(0)).unwrap();
         assert_eq!(nick, "none");
         let email: String = conn.query_row("SELECT email FROM accounts", [], |r| r.get(0)).unwrap();
         assert_eq!(email, "me@example.com");
         // The pre-upgrade backup holds the old schema and the data.
-        let bak = Connection::open(path.with_extension("v5.bak")).unwrap();
+        let bak = Connection::open(path.with_extension(format!("v{SCHEMA_VERSION}.bak"))).unwrap();
         let v: i64 = bak.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 5);
+        assert_eq!(v, SCHEMA_VERSION);
         let n: i64 = bak.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
     }
@@ -2198,8 +2255,10 @@ mod tests {
         Db::open(&path).unwrap().save_account(&account()).unwrap();
         let bad = "ALTER TABLE accounts ADD COLUMN x TEXT; THIS IS NOT SQL;";
         let mut conn = Connection::open(&path).unwrap();
-        assert!(migrate_with(&mut conn, &path, &[V1, V2, V3, V4, V5, bad]).is_err());
-        assert_eq!(version(&path), 5);
+        let mut all: Vec<&str> = MIGRATIONS.to_vec();
+        all.push(bad);
+        assert!(migrate_with(&mut conn, &path, &all).is_err());
+        assert_eq!(version(&path), SCHEMA_VERSION);
         let cols: i64 = conn.query_row("SELECT COUNT(*) FROM pragma_table_info('accounts') WHERE name = 'x'", [], |r| r.get(0)).unwrap();
         assert_eq!(cols, 0);
     }
@@ -2213,5 +2272,24 @@ mod tests {
         let err = Db::open(&path).err().expect("should refuse").to_string();
         assert!(err.contains("newer version"));
         assert_eq!(version(&path), SCHEMA_VERSION + 1);
+    }
+
+    #[test]
+    fn contacts_escapes_wildcards_and_folder_synced_tracks_empty_inbox() {
+        let db = Db::open(&temp_db()).unwrap();
+        let a = db.save_account(&account()).unwrap();
+        let f = db.upsert_folder(a, "INBOX", "Inbox", Some("inbox")).unwrap();
+        assert!(!db.folder_synced(f).unwrap());
+        db.mark_folder_synced(f).unwrap();
+        assert!(db.folder_synced(f).unwrap());
+        db.reset_folder(f, 42).unwrap();
+        assert!(!db.folder_synced(f).unwrap());
+
+        let m1 = NewMessage { from_name: "A_B".into(), from_addr: "a_b@example.com".into(), ..msg(1, false) };
+        let m2 = NewMessage { from_name: "AXB".into(), from_addr: "axb@example.com".into(), ..msg(2, false) };
+        db.insert_messages(a, f, &[m1, m2]).unwrap();
+        let hits = db.contacts("a_b").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].email, "a_b@example.com");
     }
 }

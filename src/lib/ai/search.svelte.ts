@@ -55,9 +55,18 @@ function grouped(rows: Summary[]): string {
 /** "2026-11-05" or an ISO date-time, in local time, to unix seconds. */
 function toUnix(s: string | undefined, label: string): number | undefined {
   if (!s) return undefined;
-  const m = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}))?/.exec(s.trim());
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}))?$/.exec(s.trim());
   if (!m) throw new Error(`${label} must look like 2026-11-05 or 2026-11-05T14:30`);
-  return Math.floor(new Date(+m[1], +m[2] - 1, +m[3], m[4] ? +m[4] : 0, m[5] ? +m[5] : 0).getTime() / 1000);
+  const y = +m[1];
+  const mo = +m[2];
+  const day = +m[3];
+  const hr = m[4] ? +m[4] : 0;
+  const min = m[5] ? +m[5] : 0;
+  const d = new Date(y, mo - 1, day, hr, min);
+  if (d.getFullYear() !== y || d.getMonth() !== mo - 1 || d.getDate() !== day || d.getHours() !== hr || d.getMinutes() !== min) {
+    throw new Error(`${label} isn't a valid date: ${s}`);
+  }
+  return Math.floor(d.getTime() / 1000);
 }
 
 // ---------- Tools ----------
@@ -198,14 +207,18 @@ async function fitImage(data: string, mime: string): Promise<{ data: string; mim
   try {
     const blob = await (await fetch(`data:${mime};base64,${data}`)).blob();
     const bmp = await createImageBitmap(blob);
-    const max = 1568;
-    if (bmp.width <= max && bmp.height <= max && data.length < 1_500_000) return { data, mime };
-    const scale = Math.min(1, max / Math.max(bmp.width, bmp.height));
-    const c = document.createElement("canvas");
-    c.width = Math.round(bmp.width * scale);
-    c.height = Math.round(bmp.height * scale);
-    c.getContext("2d")!.drawImage(bmp, 0, 0, c.width, c.height);
-    return { data: c.toDataURL("image/jpeg", 0.85).split(",")[1], mime: "image/jpeg" };
+    try {
+      const max = 1568;
+      if (bmp.width <= max && bmp.height <= max && data.length < 1_500_000) return { data, mime };
+      const scale = Math.min(1, max / Math.max(bmp.width, bmp.height));
+      const c = document.createElement("canvas");
+      c.width = Math.round(bmp.width * scale);
+      c.height = Math.round(bmp.height * scale);
+      c.getContext("2d")!.drawImage(bmp, 0, 0, c.width, c.height);
+      return { data: c.toDataURL("image/jpeg", 0.85).split(",")[1], mime: "image/jpeg" };
+    } finally {
+      bmp.close();
+    }
   } catch {
     return { data, mime };
   }
@@ -325,7 +338,8 @@ async function runTool(call: ToolCall, run: Run, step: (s: AiStep) => AiStep): P
         const img = await fitImage(c.data, c.mime);
         return { content: [{ type: "text", text: `Image ${c.filename}:` }, { type: "image", data: img.data, mimeType: img.mime }] };
       }
-      const end = c.offset + c.text.length;
+      // Rust offsets/totalChars count Unicode scalar values, not UTF-16 code units.
+      const end = c.offset + Array.from(c.text).length;
       const more = end < c.totalChars ? `\n\n[… ${c.totalChars - end} more characters. Continue with offset ${end}.]` : "";
       return text(`${c.filename} (${c.format}${c.parts ? `, ${c.parts} ${c.format === "pdf" ? "pages" : c.format === "pptx" ? "slides" : "sheets"}` : ""}, ${c.totalChars} characters${c.offset ? `, from ${c.offset}` : ""}):\n\n${c.text}${more}`);
     }
@@ -385,6 +399,7 @@ let session: { s: AiSearch; ctx: Context; scope: SearchScope; seen: Map<number, 
 let controller: AbortController | null = null;
 
 export function stopAiSearch() {
+  clearTimeout(refreshTimer);
   controller?.abort();
 }
 

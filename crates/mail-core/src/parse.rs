@@ -111,13 +111,65 @@ fn clean_text(t: &str) -> String {
         .join(" ")
 }
 
+/// Cap on display HTML after inlining `cid:` images as data URIs, so repeated references
+/// to a large attachment can't amplify memory usage unboundedly.
+const MAX_DISPLAY_HTML_BYTES: usize = 25 * 1024 * 1024;
+
+fn is_inline_raster_image(mime: &str) -> bool {
+    mime.starts_with("image/") && !mime.contains("svg")
+}
+
+fn is_cid_boundary(after: &str) -> bool {
+    match after.chars().next() {
+        None => true,
+        Some(c) => c.is_whitespace() || matches!(c, '"' | '\'' | ')' | '>' | '#' | '?'),
+    }
+}
+
+fn contains_cid(html: &str, cid: &str) -> bool {
+    if cid.is_empty() {
+        return false;
+    }
+    let needle = format!("cid:{cid}");
+    let mut rest = html;
+    while let Some(pos) = rest.find(&needle) {
+        let after = &rest[pos + needle.len()..];
+        if is_cid_boundary(after) {
+            return true;
+        }
+        rest = &rest[pos + needle.len()..];
+    }
+    false
+}
+
+fn replace_cid(html: &str, cid: &str, replacement: &str, max_len: usize) -> String {
+    let needle = format!("cid:{cid}");
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(pos) = rest.find(&needle) {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + needle.len()..];
+        if is_cid_boundary(after) && out.len().saturating_add(replacement.len()).saturating_add(after.len()) <= max_len {
+            out.push_str(replacement);
+        } else {
+            out.push_str(&needle);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 fn listed_attachments<'a>(m: &'a Message<'a>, html: Option<&str>) -> Vec<(usize, &'a mail_parser::MessagePart<'a>)> {
     m.attachments()
         .enumerate()
         .filter(|(_, p)| {
-            // Hide inline images that the HTML body already shows.
+            // Hide inline raster images that the HTML body already shows.
             match (p.content_id(), html) {
-                (Some(cid), Some(h)) => !h.contains(&format!("cid:{}", cid.trim_matches(|c| c == '<' || c == '>'))),
+                (Some(cid), Some(h)) => {
+                    let cid = cid.trim_matches(|c| c == '<' || c == '>').trim();
+                    !(is_inline_raster_image(&mime_of(p)) && contains_cid(h, cid))
+                }
                 _ => true,
             }
         })
@@ -179,21 +231,30 @@ pub fn display(raw: &[u8]) -> ParsedBody {
     let Some(m) = MessageParser::default().parse(raw) else {
         return ParsedBody { bcc: vec![], html: None, text: Some(String::from_utf8_lossy(raw).into()), attachments: vec![] };
     };
-    let mut html = html_body(&m);
+    let original_html = html_body(&m);
+    let mut html = original_html.clone();
     if let Some(h) = html.as_mut() {
         for p in m.attachments() {
-            if let Some(cid) = p.content_id() {
-                let cid = cid.trim_matches(|c| c == '<' || c == '>');
-                let needle = format!("cid:{}", cid);
-                if h.contains(&needle) {
-                    let data = base64::engine::general_purpose::STANDARD.encode(p.contents());
-                    *h = h.replace(&needle, &format!("data:{};base64,{}", mime_of(p), data));
-                }
+            let Some(cid) = p.content_id() else { continue };
+            let cid = cid.trim_matches(|c| c == '<' || c == '>').trim();
+            if cid.is_empty() {
+                continue;
             }
+            let mime = mime_of(p);
+            if !is_inline_raster_image(&mime) || !contains_cid(h, cid) {
+                continue;
+            }
+            // Skip encoding if even one copy would exceed our cap.
+            let encoded_len = p.contents().len().div_ceil(3).saturating_mul(4);
+            if h.len().saturating_add(encoded_len) > MAX_DISPLAY_HTML_BYTES {
+                continue;
+            }
+            let data = base64::engine::general_purpose::STANDARD.encode(p.contents());
+            let uri = format!("data:{mime};base64,{data}");
+            *h = replace_cid(h, cid, &uri, MAX_DISPLAY_HTML_BYTES);
         }
     }
     let text = if html.is_none() { m.body_text(0).map(|t| t.to_string()) } else { None };
-    let original_html = html_body(&m);
     let attachments = listed_attachments(&m, original_html.as_deref())
         .into_iter()
         .map(|(i, p)| AttachmentInfo {
@@ -230,10 +291,19 @@ pub fn attachment_part(raw: &[u8], index: usize) -> Option<(String, String, Vec<
 
 /// Every listed attachment as (filename, bytes), for forwarding.
 pub fn all_attachments(raw: &[u8]) -> Vec<(String, Vec<u8>)> {
-    display(raw)
-        .attachments
-        .iter()
-        .filter_map(|a| attachment(raw, a.index))
+    let Some(m) = MessageParser::default().parse(raw) else {
+        return vec![];
+    };
+    let html = html_body(&m);
+    listed_attachments(&m, html.as_deref())
+        .into_iter()
+        .map(|(i, p)| {
+            let bytes = match &p.body {
+                PartType::Message(inner) => inner.raw_message().to_vec(),
+                _ => p.contents().to_vec(),
+            };
+            (attachment_name(p, i), bytes)
+        })
         .collect()
 }
 
@@ -252,5 +322,51 @@ mod tests {
         assert_eq!((m.list_id, m.auto), (None, None));
         let raw = b"From: a@x.com\r\nAuto-Submitted: Auto-Replied\r\nSubject: x\r\n\r\nbody";
         assert_eq!(parse_header(1, raw, false, false, 0, 0).auto.as_deref(), Some("auto-replied"));
+    }
+
+    #[test]
+    fn cid_inlining_respects_boundaries_and_raster_types() {
+        let raw = concat!(
+            "From: a@x.com\r\n",
+            "Subject: cid\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/related; boundary=\"b\"\r\n\r\n",
+            "--b\r\n",
+            "Content-Type: text/html; charset=utf-8\r\n\r\n",
+            "<img src=\"cid:img1\"><img src=\"cid:img10\"><img src=\"cid:vec\">\r\n",
+            "--b\r\n",
+            "Content-Type: image/png\r\n",
+            "Content-ID: <img1>\r\n",
+            "Content-Transfer-Encoding: base64\r\n\r\n",
+            "AQID\r\n",
+            "--b\r\n",
+            "Content-Type: image/png\r\n",
+            "Content-ID: <img10>\r\n",
+            "Content-Transfer-Encoding: base64\r\n\r\n",
+            "BAUG\r\n",
+            "--b\r\n",
+            "Content-Type: image/svg+xml; name=\"x.svg\"\r\n",
+            "Content-ID: <vec>\r\n",
+            "Content-Disposition: inline; filename=\"x.svg\"\r\n\r\n",
+            "<svg></svg>\r\n",
+            "--b\r\n",
+            "Content-Type: application/pdf; name=\"doc.pdf\"\r\n",
+            "Content-Disposition: attachment; filename=\"doc.pdf\"\r\n\r\n",
+            "%PDF\r\n",
+            "--b--\r\n",
+        )
+        .as_bytes();
+        let d = display(raw);
+        let html = d.html.expect("html");
+        assert!(html.contains("src=\"data:image/png;base64,AQID\""));
+        assert!(html.contains("src=\"data:image/png;base64,BAUG\""));
+        // SVG cid is NOT inlined as a data URI, and remains listed as an attachment.
+        assert!(html.contains("src=\"cid:vec\""));
+        let names: Vec<&str> = d.attachments.iter().map(|a| a.filename.as_str()).collect();
+        assert_eq!(names, vec!["x.svg", "doc.pdf"]);
+        let all = all_attachments(raw);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[1].0, "doc.pdf");
+        assert_eq!(all[1].1, b"%PDF");
     }
 }

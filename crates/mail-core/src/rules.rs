@@ -251,6 +251,23 @@ fn local_part(addr: &str) -> String {
     addr.split('@').next().unwrap_or("").to_lowercase()
 }
 
+fn check_reply_target(addr: &str, mine: &[String]) -> Result<(), &'static str> {
+    let addr = addr.trim();
+    if addr.is_empty() {
+        return Err("it has no sender");
+    }
+    let local = local_part(addr);
+    let machine = ["noreply", "no-reply", "donotreply", "do-not-reply", "do_not_reply"].iter().any(|n| local.contains(n))
+        || ["mailer-daemon", "postmaster", "bounce", "bounces"].contains(&local.as_str());
+    if machine {
+        return Err("the sender doesn't take replies");
+    }
+    if mine.iter().any(|m| m.eq_ignore_ascii_case(addr)) {
+        return Err("it's from you");
+    }
+    Ok(())
+}
+
 /// Whether a rule may auto-reply to this message (RFC 3834): never to machines, lists, or yourself.
 pub fn may_reply(f: &Facts, mine: &[String]) -> Result<(), &'static str> {
     if f.auto.is_some() {
@@ -259,17 +276,9 @@ pub fn may_reply(f: &Facts, mine: &[String]) -> Result<(), &'static str> {
     if f.list_id.is_some() {
         return Err("it came from a mailing list");
     }
-    if f.from_addr.trim().is_empty() {
-        return Err("it has no sender");
-    }
-    let local = local_part(&f.from_addr);
-    let machine = ["noreply", "no-reply", "donotreply", "do-not-reply", "do_not_reply"].iter().any(|n| local.contains(n))
-        || ["mailer-daemon", "postmaster", "bounce", "bounces"].contains(&local.as_str());
-    if machine {
-        return Err("the sender doesn't take replies");
-    }
-    if mine.iter().any(|m| m.eq_ignore_ascii_case(&f.from_addr)) {
-        return Err("it's from you");
+    check_reply_target(&f.from_addr, mine)?;
+    if let Some(reply_to) = f.reply_to.first() {
+        check_reply_target(&reply_to.email, mine)?;
     }
     Ok(())
 }
@@ -309,9 +318,22 @@ fn prefixed(prefix: &str, subject: &str) -> String {
     }
 }
 
+fn quote_display_name(name: &str) -> String {
+    let clean: String = name.chars().filter(|c| !matches!(c, '\r' | '\n' | '\0')).collect();
+    let needs_quotes = clean
+        .chars()
+        .any(|c| matches!(c, '"' | '\\' | ',' | '.' | '(' | ')' | '<' | '>' | '@' | ';' | ':' | '[' | ']'));
+    if needs_quotes {
+        let escaped = clean.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{escaped}\"")
+    } else {
+        clean
+    }
+}
+
 fn who(a: &Addr) -> String {
-    match a.name.as_deref().filter(|n| !n.is_empty()) {
-        Some(n) => format!("{n} <{}>", a.email),
+    match a.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        Some(n) => format!("{} <{}>", quote_display_name(n), a.email),
         None => a.email.clone(),
     }
 }
@@ -521,6 +543,9 @@ mod tests {
         assert!(may_reply(&Facts { from_addr: "no-reply@shop.com".into(), ..person.clone() }, &mine()).is_err());
         assert!(may_reply(&Facts { from_addr: "MAILER-DAEMON@mx.example.org".into(), ..person.clone() }, &mine()).is_err());
         assert!(may_reply(&Facts { from_addr: "Me@Example.com".into(), ..person.clone() }, &mine()).is_err());
+        // Reply-To pointing at a noreply/machine/self address is also skipped.
+        assert!(may_reply(&Facts { reply_to: vec![addr("noreply@shop.com")], ..person.clone() }, &mine()).is_err());
+        assert!(may_reply(&Facts { reply_to: vec![addr("me@example.com")], ..person.clone() }, &mine()).is_err());
         assert!(may_forward(&person).is_ok());
         assert!(may_forward(&Facts { auto: Some(AUTO_FORWARDED.into()), ..person }).is_err());
     }
@@ -529,14 +554,15 @@ mod tests {
     fn auto_reply_threads_and_goes_to_reply_to() {
         let f = Facts {
             from_addr: "pat@example.org".into(),
-            reply_to: vec![addr("help@example.org")],
+            reply_to: vec![Addr { name: Some("Doe, John".into()), email: "help@example.org".into() }],
             subject: "Question".into(),
             message_id: Some("<b@x>".into()),
             refs: Some("<a@x>".into()),
             ..Default::default()
         };
         let out = reply_outgoing(&f, 1, None, "Away until Monday.\n<Pat>");
-        assert_eq!(out.to, vec!["help@example.org"]);
+        assert_eq!(out.to, vec!["\"Doe, John\" <help@example.org>"]);
+        assert!(out.to[0].parse::<lettre::message::Mailbox>().is_ok());
         assert_eq!(out.subject, "Re: Question");
         assert_eq!(out.in_reply_to.as_deref(), Some("<b@x>"));
         assert_eq!(out.references.as_deref(), Some("<a@x> <b@x>"));

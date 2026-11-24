@@ -9,19 +9,22 @@ use tokio::net::TcpStream;
 
 pub type Session = async_imap::Session<TlsStream<TcpStream>>;
 
+pub const CMD_TIMEOUT: Duration = Duration::from_secs(60);
+pub const FETCH_TIMEOUT: Duration = Duration::from_secs(120);
+
 pub async fn connect(host: &str, port: u16, user: &str, password: &str) -> Result<Session> {
     let tcp = tokio::time::timeout(Duration::from_secs(20), TcpStream::connect((host, port)))
         .await
         .map_err(|_| anyhow!("Timed out connecting to {host}"))?
         .with_context(|| format!("Can't reach {host}:{port}"))?;
-    let tls = async_native_tls::TlsConnector::new()
-        .connect(host, tcp)
+    let tls = tokio::time::timeout(Duration::from_secs(20), async_native_tls::TlsConnector::new().connect(host, tcp))
         .await
+        .map_err(|_| anyhow!("Timed out during TLS handshake with {host}"))?
         .context("TLS handshake failed")?;
     let client = async_imap::Client::new(tls);
-    let session = client
-        .login(user, password)
+    let session = tokio::time::timeout(Duration::from_secs(30), client.login(user, password))
         .await
+        .map_err(|_| anyhow!("Timed out signing in to {host}"))?
         .map_err(|(e, _)| anyhow!("Sign-in failed: {e}"))?;
     Ok(session)
 }
@@ -71,19 +74,27 @@ const INCOMPLETE: &str = "The mail server's answer was cut off";
 /// was deleted". Anything that deletes local mail based on what an answer leaves out must
 /// check it first: this catches the drop, and the callers below also reject answers that
 /// can't be complete.
-async fn confirm_alive<T: Wire>(session: &mut async_imap::Session<T>) -> Result<()> {
-    session.noop().await.map(|_| ()).context(INCOMPLETE)
+pub(crate) async fn confirm_alive<T: Wire>(session: &mut async_imap::Session<T>) -> Result<()> {
+    tokio::time::timeout(CMD_TIMEOUT, session.noop())
+        .await
+        .map_err(|_| anyhow!("Timed out waiting for mail server"))?
+        .map(|_| ())
+        .context(INCOMPLETE)
 }
 
 /// The account's folders. Never a partial list: the caller removes local folders that
 /// are missing from it, and their mail with them.
 pub async fn list_folders<T: Wire>(session: &mut async_imap::Session<T>) -> Result<Vec<RemoteFolder>> {
-    let names: Vec<_> = session.list(Some(""), Some("*")).await?.try_collect().await?;
+    let names: Vec<_> = tokio::time::timeout(CMD_TIMEOUT, async {
+        session.list(Some(""), Some("*")).await?.try_collect().await
+    })
+    .await
+    .map_err(|_| anyhow!("Timed out listing folders"))??;
     confirm_alive(session).await?;
     let mut out = Vec::new();
     for n in names {
         let attrs = format!("{:?}", n.attributes());
-        if attrs.contains("NoSelect") {
+        if attrs.contains("NoSelect") || attrs.contains("NonExistent") {
             continue;
         }
         let path = n.name().to_string();
@@ -104,7 +115,9 @@ pub async fn list_folders<T: Wire>(session: &mut async_imap::Session<T>) -> Resu
 /// is empty or was rebuilt (new UIDVALIDITY), so a cut-off answer is an error. A real answer
 /// always carries UIDVALIDITY.
 pub async fn select<T: Wire>(session: &mut async_imap::Session<T>, path: &str) -> Result<async_imap::types::Mailbox> {
-    let mb = session.select(path).await?;
+    let mb = tokio::time::timeout(CMD_TIMEOUT, session.select(path))
+        .await
+        .map_err(|_| anyhow!("Timed out opening {path}"))??;
     confirm_alive(session).await?;
     if mb.uid_validity.is_none() {
         return Err(anyhow!("{INCOMPLETE} (opening {path})"));
@@ -118,7 +131,11 @@ pub async fn select<T: Wire>(session: &mut async_imap::Session<T>, path: &str) -
 /// With `never_empty`, an empty answer is one too: "n:*" always includes the folder's newest
 /// message, so for a folder that has mail it can't come back empty.
 pub async fn fetch_flags<T: Wire>(session: &mut async_imap::Session<T>, set: String, never_empty: bool) -> Result<Vec<(u32, bool, bool)>> {
-    let fetches: Vec<Fetch> = session.uid_fetch(set, "(UID FLAGS)").await?.try_collect().await?;
+    let fetches: Vec<Fetch> = tokio::time::timeout(FETCH_TIMEOUT, async {
+        session.uid_fetch(set, "(UID FLAGS)").await?.try_collect().await
+    })
+    .await
+    .map_err(|_| anyhow!("Timed out fetching flags"))??;
     confirm_alive(session).await?;
     let flags: Vec<(u32, bool, bool)> = fetches
         .iter()
@@ -148,7 +165,7 @@ pub fn flags_of(f: &Fetch) -> (bool, bool) {
 
 /// An IMAP quoted string. Non-ASCII text needs CHARSET UTF-8 on the command (see `search_criteria`).
 pub fn quote(s: &str) -> String {
-    let clean: String = s.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+    let clean: String = s.chars().filter(|c| !matches!(*c, '\r' | '\n' | '\0')).collect();
     format!("\"{}\"", clean.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
@@ -192,10 +209,10 @@ pub fn query_criteria(q: &crate::model::MailQuery) -> Option<String> {
         }
     }
     let narrows = !parts.is_empty();
-    if let Some(d) = q.after.and_then(|t| imap_date(t - 86_400)) {
+    if let Some(d) = q.after.and_then(|t| imap_date(t.saturating_sub(86_400))) {
         parts.push(format!("SINCE {d}"));
     }
-    if let Some(d) = q.before.and_then(|t| imap_date(t + 86_400)) {
+    if let Some(d) = q.before.and_then(|t| imap_date(t.saturating_add(86_400))) {
         parts.push(format!("BEFORE {d}"));
     }
     match q.unread {

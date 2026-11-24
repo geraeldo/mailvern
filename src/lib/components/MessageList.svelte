@@ -35,8 +35,11 @@
     scrollTop = scroller.scrollTop;
     if (!loadingMore && scrollTop + height > ui.list.length * ROW - ROW * 20) {
       loadingMore = true;
-      await loadMore();
-      loadingMore = false;
+      try {
+        await loadMore();
+      } finally {
+        loadingMore = false;
+      }
     }
   }
 
@@ -71,15 +74,34 @@
   $effect(() => {
     ui.view;
     ui.query;
+    scrollTop = 0;
     if (scroller) scroller.scrollTop = 0;
   });
 
   let timer: ReturnType<typeof setTimeout>;
+  let lastQuery = ui.query;
+
+  // Pick up queries set from outside the search box (e.g. "Search for This Address").
+  $effect(() => {
+    const q = ui.query;
+    if (q && q !== lastQuery) {
+      lastQuery = q;
+      clearTimeout(timer);
+      searchOpen = true;
+      draft = q;
+    } else if (!q) {
+      lastQuery = "";
+    }
+  });
+
   function onInput() {
     stopAiSearch();
     clearTimeout(timer);
     // Search once typing pauses, not on every key.
-    timer = setTimeout(() => setQuery(draft), 250);
+    timer = setTimeout(() => {
+      lastQuery = draft;
+      setQuery(draft);
+    }, 250);
   }
 
   export function focusSearch() {
@@ -99,6 +121,7 @@
     }
     clearTimeout(timer);
     // The words stay as the query, so closing the answer goes back to their results.
+    lastQuery = draft;
     if (ui.query !== draft) setQuery(draft);
     searchEl?.blur();
     runAiSearch(q);
@@ -110,7 +133,9 @@
   const running = $derived(aiRunning(ui.ai));
 
   function closeSearch() {
+    clearTimeout(timer);
     stopAiSearch();
+    lastQuery = "";
     draft = "";
     searchOpen = false;
     if (ui.query) setQuery("");

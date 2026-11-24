@@ -221,14 +221,28 @@ impl Engine {
             self.move_to(&ids, inbox.0)
         };
         let role_folder = |role: &str| -> Result<Option<i64>> { Ok(self.db.folder_by_role(acc, role)?.map(|f| f.0)) };
+        let in_account = || -> Result<Vec<i64>> {
+            let ids = self.db.ids_in_account(acc, &msgid)?;
+            if ids.is_empty() {
+                return Err(anyhow!("Couldn't find that message yet. Try again in a moment."));
+            }
+            Ok(ids)
+        };
         match &a.action {
             RuleAction::Move { folder_id } => back_to_inbox(Some(*folder_id), "that folder")?,
-            RuleAction::Archive => back_to_inbox(role_folder("archive")?, "Archive")?,
+            RuleAction::Archive => {
+                // Gmail archives into All Mail rather than a separate Archive folder.
+                let folder = match role_folder("archive")? {
+                    Some(f) => Some(f),
+                    None => role_folder("all")?,
+                };
+                back_to_inbox(folder, "Archive")?;
+            }
             RuleAction::Trash => back_to_inbox(role_folder("trash")?, "Trash")?,
             RuleAction::Junk => back_to_inbox(role_folder("junk")?, "Junk")?,
-            RuleAction::Snooze { .. } => self.unsnooze(&self.db.ids_in_account(acc, &msgid)?)?,
-            RuleAction::MarkRead => self.set_seen(&self.db.ids_in_account(acc, &msgid)?, false)?,
-            RuleAction::Flag => self.set_flagged(&self.db.ids_in_account(acc, &msgid)?, false)?,
+            RuleAction::Snooze { .. } => self.unsnooze(&in_account()?)?,
+            RuleAction::MarkRead => self.set_seen(&in_account()?, false)?,
+            RuleAction::Flag => self.set_flagged(&in_account()?, false)?,
             _ => return Err(anyhow!("This can't be undone")),
         }
         self.db.mark_rule_undone(id)
@@ -677,5 +691,23 @@ mod tests {
         s.engine.undo_rule_activity(entry.id).unwrap();
         assert!(matches!(s.rx.try_recv().unwrap(), Cmd::Move { to: Target::Folder(_), .. }));
         assert!(!s.engine.rule_activity(1).unwrap()[0].can_undo);
+    }
+
+    #[tokio::test]
+    async fn archive_in_archive_keeps_local_messages_and_undo_checks_presence() {
+        let mut s = setup(vec![]);
+        let archive = s.engine.db.folder_by_role(s.account, "archive").unwrap().unwrap().0;
+        let raw = mail("Shop <shop@example.org>", "Already archived", "arch@x", "");
+        let ids = s.engine.db.insert_messages(s.account, archive, &[crate::parse::parse_header(1, &raw, false, false, 10, now())]).unwrap();
+        // Archiving a message that is already in Archive must not delete it locally.
+        s.engine.archive(&ids).unwrap();
+        assert!(s.rx.try_recv().is_err());
+        assert_eq!(s.engine.db.rule_candidates(None, Some(archive), 10).unwrap().len(), 1);
+
+        // Undoing a MarkRead when the message isn't cached yet returns an error and leaves can_undo = true.
+        let r = s.engine.save_rule(rule("Read", vec![from("shop")], vec![RuleAction::MarkRead]), false).unwrap();
+        let log_id = s.engine.db.log_rule(&r, s.account, Some("<missing@x>"), "Gone", "shop@example.org", &RuleAction::MarkRead, now()).unwrap();
+        assert!(s.engine.undo_rule_activity(log_id).is_err());
+        assert!(s.engine.rule_activity(1).unwrap()[0].can_undo);
     }
 }

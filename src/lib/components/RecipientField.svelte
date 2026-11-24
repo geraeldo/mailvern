@@ -15,11 +15,19 @@
     if (autofocus) inputEl?.focus();
   });
 
-  function commit(raw: string) {
-    const parts = raw.split(/[,;\n]+/).map((s) => s.trim()).filter(Boolean);
-    if (parts.length) value = [...value, ...parts.filter((p) => !value.includes(p))];
+  function commit(raw: string): boolean {
+    const seen = new Set(value);
+    const added: string[] = [];
+    for (const p of raw.split(/[,;\n]+/).map((s) => s.trim()).filter(Boolean)) {
+      if (!seen.has(p)) {
+        seen.add(p);
+        added.push(p);
+      }
+    }
+    if (added.length) value = [...value, ...added];
     input = "";
     suggestions = [];
+    return added.length > 0;
   }
 
   let seq = 0;
@@ -62,8 +70,8 @@
 
   const short = (v: string) => v.match(/^\s*"?([^"<]+?)"?\s*</)?.[1] ?? v;
 
-  export function flush() {
-    if (input.trim()) commit(input);
+  export function flush(): boolean {
+    return input.trim() ? commit(input) : false;
   }
 </script>
 

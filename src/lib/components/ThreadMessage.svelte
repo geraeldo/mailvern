@@ -27,10 +27,19 @@
   $effect(() => {
     if (open && !ui.details[m.id]) {
       const id = m.id;
+      let cancelled = false;
+      error = null;
       api.message(id).then(
-        (x) => (ui.details[id] = x),
-        (e) => (error = String(e)),
+        (x) => {
+          if (!cancelled && ui.thread.some((t) => t.id === id)) ui.details[id] = x;
+        },
+        (e) => {
+          if (!cancelled) error = String(e);
+        },
       );
+      return () => {
+        cancelled = true;
+      };
     }
   });
 

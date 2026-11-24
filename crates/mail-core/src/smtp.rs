@@ -54,7 +54,13 @@ pub fn extract_inline_images(html: &str, domain: &str) -> (String, Vec<InlineIma
             Some(q @ ('"' | '\'')) => tail.find(q),
             _ => tail.find(|c: char| c.is_whitespace() || c == '>' || c == ')'),
         };
-        let Some(end) = end else { break };
+        let Some(end) = end else {
+            let skip = "data:image/".len();
+            out.push_str(before);
+            out.push_str(&tail[..skip]);
+            rest = &tail[skip..];
+            continue;
+        };
         let uri = &tail[..end];
         let decoded = uri.split_once(";base64,").and_then(|(head, data)| {
             let mime = head.trim_start_matches("data:").to_string();
@@ -307,5 +313,14 @@ mod tests {
         let (out, imgs) = extract_inline_images("<b>plain</b> text about data:image/ in prose", "e.com");
         assert!(imgs.is_empty());
         assert_eq!(out, "<b>plain</b> text about data:image/ in prose");
+    }
+
+    #[test]
+    fn unclosed_quote_does_not_skip_later_inline_images() {
+        let png = base64::engine::general_purpose::STANDARD.encode(b"\x89PNGok");
+        let html = format!(r#"<p>note 'data:image/ broken</p><img src="data:image/png;base64,{png}">"#);
+        let (out, imgs) = extract_inline_images(&html, "example.com");
+        assert_eq!(imgs.len(), 1);
+        assert!(out.contains(&format!("src=\"cid:{}\"", imgs[0].cid)));
     }
 }

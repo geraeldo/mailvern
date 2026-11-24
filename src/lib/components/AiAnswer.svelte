@@ -113,7 +113,7 @@
         {/if}
         {#if t.facts.length}
           <dl class="facts">
-            {#each t.facts as f (f.label)}
+            {#each t.facts as f, j (j)}
               <dt>{f.label}</dt>
               <dd>{@html render(f.value, t)}</dd>
             {/each}

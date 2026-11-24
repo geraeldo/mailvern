@@ -46,8 +46,17 @@
       initSubject = prefixed("Re", src.subject);
       if (init.mode === "replyAll") {
         const seen = new Set(sender.map((a) => a.email.toLowerCase()));
-        initTo = [...initTo, ...src.to.filter((a) => notMe(a.email) && !seen.has(a.email.toLowerCase())).map(formatAddr)];
-        initCc = src.cc.filter((a) => notMe(a.email)).map(formatAddr);
+        const addUnique = (list: typeof src.to) =>
+          list
+            .filter((a) => {
+              const key = a.email.toLowerCase();
+              if (!notMe(a.email) || seen.has(key)) return false;
+              seen.add(key);
+              return true;
+            })
+            .map(formatAddr);
+        initTo = [...initTo, ...addUnique(src.to)];
+        initCc = addUnique(src.cc);
       }
     } else if (init.mode === "forward") {
       initSubject = prefixed("Fwd", src.subject);
@@ -93,6 +102,7 @@
   let saveError = "";
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
   let savePromise: Promise<boolean> | null = null;
+  let attachmentsLoading: Promise<void> | null = null;
   /** Sent or discarded: no more saves. */
   let finished = false;
   let editorEl = $state<HTMLDivElement>();
@@ -114,7 +124,17 @@
 
   onMount(() => {
     if (src && init.mode === "forward" && src.attachments.length) {
-      api.attachmentFiles(src.id).then((f) => (files = [...f, ...files])).catch((e) => toast(String(e)));
+      attachmentsLoading = api
+        .attachmentFiles(src.id)
+        .then((f) => {
+          if (finished) return;
+          const have = new Set(files.map((x) => x.path));
+          files = [...f.filter((x) => !have.has(x.path)), ...files];
+        })
+        .catch((e) => toast(String(e)))
+        .finally(() => {
+          attachmentsLoading = null;
+        });
     }
     // Put the caret at the top of the body for replies (and drafts that have recipients); focus "To" otherwise.
     if (!focusTo) {
@@ -138,6 +158,8 @@
       }
     });
     return () => {
+      finished = true;
+      clearTimeout(saveTimer);
       un.then((f) => f());
     };
   });
@@ -192,7 +214,7 @@
   async function saveDraft(): Promise<boolean> {
     if (finished) return true;
     clearTimeout(saveTimer);
-    if (savePromise) {
+    while (savePromise) {
       await savePromise;
       if (!unsaved || finished) return true;
     }
@@ -237,6 +259,7 @@
   /** Closing keeps your work: unsaved changes go to Drafts first. */
   async function close() {
     if (sending) return;
+    if (toField?.flush() || ccField?.flush() || bccField?.flush()) changed();
     if (dirty && unsaved) {
       const ok = await saveDraft();
       if (!ok && !(await ask(`Couldn't save the draft: ${saveError}\n\nClose and lose your changes?`, { title: "Mailvern", kind: "warning", okLabel: "Close", cancelLabel: "Keep editing" }))) return;
@@ -251,10 +274,10 @@
 
   async function discard() {
     if (sending) return;
-    if (dirty && !(await ask("Delete this draft?", { title: "Mailvern", kind: "warning", okLabel: "Delete", cancelLabel: "Keep editing" }))) return;
+    if ((dirty || draftAccount != null) && !(await ask("Delete this draft?", { title: "Mailvern", kind: "warning", okLabel: "Delete", cancelLabel: "Keep editing" }))) return;
     finished = true;
     clearTimeout(saveTimer);
-    if (savePromise) await savePromise;
+    while (savePromise) await savePromise;
     if (messageId && draftAccount != null) api.deleteDraft(draftAccount, messageId).catch((e) => toast(String(e)));
     ui.compose = null;
   }
@@ -269,18 +292,19 @@
       toast("Add a recipient");
       return;
     }
-    if (!subject.trim() && !(await ask("Send without a subject?", { title: "Mailvern", okLabel: "Send", cancelLabel: "Cancel" }))) return;
-    const total = files.reduce((n, f) => n + f.size, 0);
-    if (total > 24 * 1024 * 1024) {
-      toast("Attachments are over 24 MB");
-      return;
-    }
     sending = true;
-    clearTimeout(saveTimer);
-    // Let a save in progress finish, so it can't put the draft back after sending removes it.
-    if (savePromise) await savePromise;
-    finished = true;
     try {
+      if (!subject.trim() && !(await ask("Send without a subject?", { title: "Mailvern", okLabel: "Send", cancelLabel: "Cancel" }))) return;
+      if (attachmentsLoading) await attachmentsLoading;
+      const total = files.reduce((n, f) => n + f.size, 0);
+      if (total > 24 * 1024 * 1024) {
+        toast("Attachments are over 24 MB");
+        return;
+      }
+      clearTimeout(saveTimer);
+      // Let a save in progress finish, so it can't put the draft back after sending removes it.
+      while (savePromise) await savePromise;
+      finished = true;
       const out = outgoing();
       if (draftAccount != null && draftAccount !== accountId && messageId) api.deleteDraft(draftAccount, messageId).catch(() => {});
       const id = await api.send(out, at ? toUnix(at) : null);

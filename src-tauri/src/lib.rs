@@ -579,8 +579,8 @@ pub fn run() {
                         .message(format!("{e:#}"))
                         .title("Mailvern can't open its data")
                         .kind(MessageDialogKind::Error)
-                        .show(|_| std::process::exit(1));
-                    return Ok(());
+                        .blocking_show();
+                    std::process::exit(1);
                 }
             };
             app.manage(engine.clone());
