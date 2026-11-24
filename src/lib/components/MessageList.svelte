@@ -4,7 +4,7 @@
   import Avatar from "./Avatar.svelte";
   import {
     ui, openMessage, loadMore, viewTitle, setQuery, openAccountSettings, openSettings, clickRow, isSelected, roleOf,
-    editDraft, accountById, accountLabel, beginSearch, searchScopes, scopeKey, scopeLabel, setSearchScope, setView,
+    editDraft, accountById, beginSearch, searchScopes, scopeKey, scopeLabel, setSearchScope, setView,
     archiveRows, trashRows, toggleSeenRows, snoozeTargetRows, unsnoozeRows, compose, toggleSidebar,
     aiSourceTurn, aiRunning,
   } from "../state.svelte";
@@ -32,10 +32,6 @@
   const start = $derived(Math.max(0, Math.floor(scrollTop / ROW) - OVERSCAN));
   const end = $derived(Math.min(ui.list.length, Math.ceil((scrollTop + height) / ROW) + OVERSCAN));
   const visible = $derived(ui.list.slice(start, end));
-  /** Show quiet account tags on rows when viewing multiple accounts together. */
-  const showAccountTag = $derived(
-    ui.accounts.length > 1 && (ui.view.kind === "unified" || (!!ui.query.trim() && ui.searchScope.kind !== "account" && ui.searchScope.kind !== "folder") || !!ui.ai),
-  );
   const autoAskAi = $derived(ai.hasKey && draft.trim().endsWith("?"));
 
   async function onScroll() {
@@ -281,7 +277,6 @@
         {/if}
         {#each visible as m, i (m.id)}
           {@const rowRole = roleOf(m)}
-          {@const acc = showAccountTag ? accountById(m.accountId) : undefined}
           <div
             role="button"
             tabindex="0"
@@ -347,12 +342,6 @@
               <span class="subject">{m.subject || "(no subject)"}</span>
               <span class="snippet">
                 <span class="snip">{m.snippet}</span>
-                {#if acc}
-                  <span class="acc-tag" title={acc.email}>
-                    <span class="acc-bar" style:background={acc.color || "var(--muted)"}></span>
-                    <span class="acc-name">{accountLabel(acc)}</span>
-                  </span>
-                {/if}
               </span>
             </span>
           </div>
@@ -566,21 +555,8 @@
   .subject, .snippet { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .subject { font-size: 13px; color: var(--text-2); }
   .unread .subject { color: var(--text); font-weight: 500; }
-  .snippet { font-size: 12.5px; color: var(--muted); display: flex; align-items: center; gap: 8px; }
+  .snippet { font-size: 12.5px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
   .snip { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  /* Quiet right-side account indicator using a vertical bar + label — never looks like a round unread dot. */
-  .acc-tag {
-    flex: none;
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    max-width: 82px;
-    font-size: 11px;
-    font-weight: 500;
-    color: var(--muted);
-  }
-  .acc-bar { width: 3px; height: 9px; border-radius: 2px; flex: none; }
-  .acc-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   .older { position: absolute; left: 0; right: 0; height: 56px; display: flex; align-items: center; justify-content: center; }
   .spinner {
