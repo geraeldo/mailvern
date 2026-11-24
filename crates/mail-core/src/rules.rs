@@ -231,15 +231,13 @@ pub fn validate(rule: &Rule, folders: &[Folder], mine: &[String]) -> Result<(), 
                 }
                 for t in to.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
                     let mb: lettre::message::Mailbox = t.parse().map_err(|_| format!("“{t}” isn't an email address"))?;
-                    if mine.iter().any(|m| m.eq_ignore_ascii_case(&mb.email.to_string())) {
+                    if mine.iter().any(|m| m.eq_ignore_ascii_case(mb.email.as_ref())) {
                         return Err(format!("Forwarding to your own address {t} could loop: pick another address"));
                     }
                 }
             }
-            RuleAction::Reply { text, .. } => {
-                if text.trim().is_empty() {
-                    return Err("Write the auto-reply".into());
-                }
+            RuleAction::Reply { text, .. } if text.trim().is_empty() => {
+                return Err("Write the auto-reply".into());
             }
             _ => {}
         }

@@ -21,6 +21,9 @@ const UNDO_SEND_DEFAULT: i64 = 10;
 const SENDER_ICONS: &str = "sender_icons";
 
 type Workers = Arc<Mutex<HashMap<i64, Handle>>>;
+type GroupedIds = HashMap<(i64, i64), Vec<(i64, u32)>>;
+pub type SeedFolder<'a> = (&'a str, Option<&'a str>, Vec<&'a [u8]>);
+pub type CancelledSend = (Outgoing, Vec<(String, Vec<u8>)>);
 
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
@@ -78,7 +81,7 @@ impl Engine {
     /// Adds an account with folders (path, role, raw messages) as a sync would have stored
     /// them, without a mail server. For tests and demos of code built on the engine.
     #[doc(hidden)]
-    pub fn seed(&self, account: &Account, folders: &[(&str, Option<&str>, Vec<&[u8]>)]) -> Result<i64> {
+    pub fn seed(&self, account: &Account, folders: &[SeedFolder<'_>]) -> Result<i64> {
         let id = self.db.save_account(account)?;
         for (path, role, messages) in folders {
             let folder_id = self.db.upsert_folder(id, path, path, *role)?;
@@ -365,9 +368,9 @@ impl Engine {
             let targets: Vec<(i64, Option<Vec<i64>>)> = if let Some(folder_id) = q.folder_id {
                 vec![(self.db.folder(folder_id)?.0, Some(vec![folder_id]))]
             } else if let Some(role) = q.role.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_lowercase) {
-                self.role_targets(&role)?.into_iter().filter(|(a, _)| q.account_id.map_or(true, |x| x == *a)).collect()
+                self.role_targets(&role)?.into_iter().filter(|(a, _)| q.account_id.is_none_or(|x| x == *a)).collect()
             } else {
-                accounts.into_iter().filter(|a| q.account_id.map_or(true, |x| x == *a)).map(|a| (a, None)).collect()
+                accounts.into_iter().filter(|a| q.account_id.is_none_or(|x| x == *a)).map(|a| (a, None)).collect()
             };
             match self.ask_servers(&criteria, targets).await {
                 Ok(ids) => q.server_hits = ids,
@@ -480,7 +483,7 @@ impl Engine {
     }
 
     /// Messages by (account, folder), as (id, uid).
-    fn group_ids(&self, ids: &[i64]) -> Result<HashMap<(i64, i64), Vec<(i64, u32)>>> {
+    fn group_ids(&self, ids: &[i64]) -> Result<GroupedIds> {
         let mut g: HashMap<(i64, i64), Vec<(i64, u32)>> = HashMap::new();
         for id in ids {
             let (acc, folder, _, uid) = self.db.locate(*id)?;
@@ -704,7 +707,7 @@ impl Engine {
 
     /// Takes a message back out of the outbox (undo send, or editing a scheduled one).
     /// Returns it with its attachments, to reopen in the composer.
-    pub fn cancel_send(&self, id: i64) -> Result<(Outgoing, Vec<(String, Vec<u8>)>)> {
+    pub fn cancel_send(&self, id: i64) -> Result<CancelledSend> {
         let row = self.db.take_outbox(id)?.ok_or_else(|| anyhow!("Too late, it's on its way"))?;
         let out: Outgoing = serde_json::from_str(&row.payload)?;
         let files = parse::all_attachments(&row.raw);

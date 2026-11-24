@@ -76,13 +76,14 @@ impl Server {
         let task = tokio::spawn(async move {
             // Connections live in this set, so they end when the server is dropped.
             let mut conns = JoinSet::new();
+            let slots = Arc::new(tokio::sync::Semaphore::new(32));
             let watcher = ctx.clone();
             conns.spawn(async move {
                 let mut events = watcher.engine.subscribe();
                 loop {
                     match events.recv().await {
                         Ok(Event::Status { account_id, state, message }) => {
-                            watcher.sync.lock().unwrap().insert(account_id, (state, message));
+                            watcher.sync.lock().unwrap_or_else(|e| e.into_inner()).insert(account_id, (state, message));
                         }
                         Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                         Err(_) => break,
@@ -96,10 +97,19 @@ impl Server {
                             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                             continue;
                         };
+                        let Ok(permit) = slots.clone().try_acquire_owned() else {
+                            drop(stream);
+                            continue;
+                        };
                         let ctx = ctx.clone();
                         conns.spawn(async move {
+                            let _permit = permit;
                             let service = service_fn(move |req| handle(req, ctx.clone()));
-                            let _ = http1::Builder::new().timer(TokioTimer::new()).serve_connection(TokioIo::new(stream), service).await;
+                            let _ = http1::Builder::new()
+                                .timer(TokioTimer::new())
+                                .header_read_timeout(std::time::Duration::from_secs(15))
+                                .serve_connection(TokioIo::new(stream), service)
+                                .await;
                         });
                     }
                     Some(_) = conns.join_next() => {}
@@ -234,9 +244,10 @@ async fn respond(req: Request<Incoming>, ctx: &Ctx) -> Reply {
         r.headers_mut().insert(ALLOW, HeaderValue::from_static("POST"));
         return r;
     }
-    let body = match Limited::new(req.into_body(), MAX_BODY).collect().await {
-        Ok(b) => b.to_bytes(),
-        Err(_) => return plain(StatusCode::PAYLOAD_TOO_LARGE, "Request too large"),
+    let body = match tokio::time::timeout(std::time::Duration::from_secs(30), Limited::new(req.into_body(), MAX_BODY).collect()).await {
+        Ok(Ok(b)) => b.to_bytes(),
+        Ok(Err(_)) => return plain(StatusCode::PAYLOAD_TOO_LARGE, "Request too large"),
+        Err(_) => return plain(StatusCode::REQUEST_TIMEOUT, "Timed out reading request"),
     };
     let msg: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -276,7 +287,7 @@ async fn dispatch(ctx: &Ctx, msg: Value) -> Option<Value> {
     let result = match method {
         "initialize" => {
             let asked = params.get("protocolVersion").and_then(Value::as_str).unwrap_or("");
-            let version = if VERSIONS.contains(&asked) { asked } else { VERSIONS[1] };
+            let version = if VERSIONS.contains(&asked) { asked } else { VERSIONS[0] };
             json!({
                 "protocolVersion": version,
                 "capabilities": { "tools": { "listChanged": false } },

@@ -18,9 +18,9 @@ mod context_menu;
 type E<'a> = State<'a, Arc<Engine>>;
 type R<T> = Result<T, String>;
 
-// Plain commands run on the main thread, which also delivers keystrokes to the window. Reads
-// marked `(async)` run elsewhere: waiting on the database (held by sync while it stores bodies)
-// must never stall typing.
+// Plain commands run on the main thread, which also delivers keystrokes to the window.
+// Commands marked `(async)` run on Tauri's worker pool so SQLite, Keychain, or file I/O
+// never stalls typing or window responsiveness.
 
 fn err(e: anyhow::Error) -> String {
     format!("{e:#}")
@@ -36,17 +36,17 @@ async fn save_account(engine: E<'_>, account: Account, password: Option<String>)
     engine.save_account(account, password).await.map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn delete_account(engine: E, id: i64) -> R<()> {
     engine.delete_account(id).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn reorder_accounts(engine: E, ids: Vec<i64>) -> R<()> {
     engine.reorder_accounts(&ids).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn reorder_folders(engine: E, account_id: i64, ids: Vec<i64>) -> R<()> {
     engine.reorder_folders(account_id, &ids).map_err(err)
 }
@@ -71,17 +71,17 @@ async fn search_server(engine: E<'_>, query: String, scope: Option<SearchScope>)
     engine.search_server(&query, &scope.unwrap_or_default()).await.map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn move_to(engine: E, ids: Vec<i64>, folder_id: i64) -> R<()> {
     engine.move_to(&ids, folder_id).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn snooze(engine: E, ids: Vec<i64>, until: i64) -> R<()> {
     engine.snooze(&ids, until).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn unsnooze(engine: E, ids: Vec<i64>) -> R<()> {
     engine.unsnooze(&ids).map_err(err)
 }
@@ -142,13 +142,13 @@ async fn attachment_content(engine: E<'_>, id: i64, index: usize, offset: Option
 /// The OpenRouter API key lives in the Keychain, like account passwords.
 const AI_KEY: &str = "openrouter-api-key";
 
-#[tauri::command]
+#[tauri::command(async)]
 fn ai_key() -> Option<String> {
     mail_core::secrets::get(AI_KEY).ok().filter(|k| !k.is_empty())
 }
 
 /// Stores the key, or removes it when `key` is empty.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_ai_key(key: String) -> R<()> {
     let key = key.trim();
     if key.is_empty() {
@@ -164,7 +164,7 @@ fn badge_count(engine: E) -> R<i64> {
     engine.badge_count().map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn mark_badge_seen(engine: E) -> R<()> {
     engine.mark_badge_seen().map_err(err)
 }
@@ -174,43 +174,43 @@ async fn message(engine: E<'_>, id: i64) -> R<MessageDetail> {
     engine.message(id).await.map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_seen(engine: E, ids: Vec<i64>, seen: bool) -> R<()> {
     engine.set_seen(&ids, seen).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn mark_read(engine: E, view: View) -> R<()> {
     engine.mark_read(&view).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_flagged(engine: E, ids: Vec<i64>, flagged: bool) -> R<()> {
     engine.set_flagged(&ids, flagged).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn archive(engine: E, ids: Vec<i64>) -> R<()> {
     engine.archive(&ids).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn trash(engine: E, ids: Vec<i64>) -> R<()> {
     engine.trash(&ids).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn junk(engine: E, ids: Vec<i64>) -> R<()> {
     engine.junk(&ids).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn not_junk(engine: E, ids: Vec<i64>) -> R<()> {
     engine.not_junk(&ids).map_err(err)
 }
 
 /// Queues a message: after the undo window, or at `send_at` (unix seconds). Returns its outbox id.
-#[tauri::command]
+#[tauri::command(async)]
 fn send(engine: E, message: Outgoing, send_at: Option<i64>) -> R<i64> {
     engine.send(message, send_at).map_err(err)
 }
@@ -223,7 +223,7 @@ struct Cancelled {
 
 /// Takes a message back out of the outbox to edit it. Its attachments are written to a
 /// temp folder so the composer can attach them again.
-#[tauri::command]
+#[tauri::command(async)]
 fn cancel_send(engine: E, id: i64) -> R<Cancelled> {
     let (message, files) = engine.cancel_send(id).map_err(err)?;
     let dir = std::env::temp_dir().join("Mailvern").join(format!("outbox-{id}"));
@@ -237,7 +237,7 @@ fn cancel_send(engine: E, id: i64) -> R<Cancelled> {
     Ok(Cancelled { message, attachments })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn send_now(engine: E, id: i64) -> R<()> {
     engine.send_now(id).map_err(err)
 }
@@ -252,22 +252,22 @@ async fn save_draft(engine: E<'_>, message: Outgoing) -> R<String> {
     engine.save_draft(message).await.map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn delete_draft(engine: E, account_id: i64, message_id: String) -> R<()> {
     engine.delete_draft(account_id, &message_id).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn sync_now(engine: E) {
     engine.sync_now();
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn sync_account(engine: E, account_id: i64) -> R<()> {
     engine.sync_account(account_id).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn sync_view(engine: E, view: View) -> R<()> {
     engine.sync_view(&view).map_err(err)
 }
@@ -284,7 +284,7 @@ fn get_setting(engine: E, key: String) -> R<Option<String>> {
     engine.setting(&key).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_setting(engine: E, key: String, value: String) -> R<()> {
     if is_restricted_setting(&key) {
         return Err("That setting can only be managed from Agent Settings".into());
@@ -300,27 +300,27 @@ fn rules(engine: E) -> R<Vec<Rule>> {
 }
 
 /// Saves a rule from the Rules settings: the user's own, so it's live at once.
-#[tauri::command]
+#[tauri::command(async)]
 fn save_rule(engine: E, rule: Rule) -> R<Rule> {
     engine.save_rule(rule, false).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn delete_rule(engine: E, id: i64) -> R<()> {
     engine.delete_rule(id).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn reorder_rules(engine: E, ids: Vec<i64>) -> R<()> {
     engine.reorder_rules(&ids).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_rule_enabled(engine: E, id: i64, enabled: bool) -> R<()> {
     engine.set_rule_enabled(id, enabled).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn check_rule(engine: E, rule: Rule) -> R<()> {
     engine.check_rule(&rule).map_err(err)
 }
@@ -345,7 +345,7 @@ fn rule_activity(engine: E, limit: usize) -> R<Vec<RuleActivity>> {
     engine.rule_activity(limit).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn undo_rule_activity(engine: E, id: i64) -> R<()> {
     engine.undo_rule_activity(id).map_err(err)
 }
@@ -432,7 +432,7 @@ struct FileInfo {
     size: u64,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn file_info(paths: Vec<String>) -> Vec<FileInfo> {
     paths
         .into_iter()
@@ -560,6 +560,30 @@ fn external_links() -> tauri::plugin::TauriPlugin<tauri::Wry> {
         .build()
 }
 
+/// Removes stale extracted attachments and forward temp directories older than 24 hours.
+fn cleanup_temp_dir() {
+    let root = std::env::temp_dir().join("Mailvern");
+    let Ok(entries) = std::fs::read_dir(&root) else { return };
+    let max_age = std::time::Duration::from_secs(24 * 3600);
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age > max_age);
+        if stale {
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(&path);
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -594,6 +618,7 @@ pub fn run() {
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                let _ = tokio::task::spawn_blocking(cleanup_temp_dir).await;
                 if let Err(e) = engine.start() {
                     eprintln!("start failed: {e:#}");
                 }
@@ -604,7 +629,11 @@ pub fn run() {
                         Ok(ev) => {
                             let _ = handle.emit("mail-event", ev);
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            // Catch up folders, list, thread, badge, and outbox after dropped events.
+                            let _ = handle.emit("mail-event", mail_core::model::Event::Changed { account_id: 0 });
+                            let _ = handle.emit("mail-event", mail_core::model::Event::Outbox);
+                        }
                         Err(_) => break,
                     }
                 }

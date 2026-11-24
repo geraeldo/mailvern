@@ -344,7 +344,7 @@ fn icon_links(html: &str, base: &Url) -> Vec<Url> {
         };
         found.push((score, url));
     }
-    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.sort_by_key(|a| std::cmp::Reverse(a.0));
     found.into_iter().map(|(_, u)| u).take(4).collect()
 }
 

@@ -67,7 +67,7 @@ const SAFE_IMG_SRC = /^data:image\/(?:png|jpeg|jpg|gif|webp);base64,[a-z0-9+/=\s
 const DROP_TAGS = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE", "SVG", "MATH", "IFRAME", "OBJECT", "EMBED", "FORM", "META", "BASE", "LINK", "TITLE", "HEAD"]);
 
 /** Prepares the text: only simple markup, safe inline images swapped for placeholders. */
-function prepare(html: string): { html: string; images: SafeImage[] } {
+export function prepare(html: string): { html: string; images: SafeImage[] } {
   const doc = new DOMParser().parseFromString(html, "text/html");
   const images: SafeImage[] = [];
   doc.querySelectorAll("img").forEach((img) => {

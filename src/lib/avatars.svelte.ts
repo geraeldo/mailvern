@@ -1,10 +1,25 @@
 import { api, type SenderIcon } from "./api";
 import { ui } from "./state.svelte";
 
+const MAX_CACHE = 250;
 /** Pictures by sender domain: missing while unknown, null when the domain has none. */
 const icons = $state<Record<string, SenderIcon | null>>({});
-/** Domains already asked about this session. */
+/** Insertion order for bounded eviction. */
+const order: string[] = [];
+/** Domains with an in-flight or resolved lookup. */
 const asked = new Set<string>();
+
+function remember(domain: string, icon: SenderIcon | null) {
+  if (!(domain in icons)) {
+    order.push(domain);
+    while (order.length > MAX_CACHE) {
+      const oldest = order.shift()!;
+      delete icons[oldest];
+      asked.delete(oldest);
+    }
+  }
+  icons[domain] = icon;
+}
 
 const domainOf = (email: string) => email.split("@").pop()!.trim().toLowerCase();
 
@@ -20,8 +35,11 @@ export function senderIcon(email: string): SenderIcon | null {
   if (!asked.has(domain)) {
     asked.add(domain);
     api.senderIcon(email).then(
-      (icon) => (icons[domain] = icon),
-      () => (icons[domain] = null),
+      (icon) => remember(domain, icon),
+      () => {
+        // Don't permanently cache transient fetch failures.
+        asked.delete(domain);
+      },
     );
   }
   return null;

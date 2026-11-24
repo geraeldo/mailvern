@@ -54,8 +54,12 @@ unsafe fn trim(menu: &AnyObject) {
     }
 }
 
-unsafe extern "C-unwind" fn will_open_menu(this: &AnyObject, _cmd: Sel, menu: &AnyObject, event: *mut AnyObject) {
-    trim(menu);
+type WillOpenMenuFn = unsafe extern "C-unwind" fn(&AnyObject, Sel, *mut AnyObject, *mut AnyObject);
+
+unsafe extern "C-unwind" fn will_open_menu(this: &AnyObject, _cmd: Sel, menu: *mut AnyObject, event: *mut AnyObject) {
+    if !menu.is_null() {
+        trim(&*menu);
+    }
     if let Some(sup) = SUPER.get() {
         let _: () = msg_send![super(this, sup), willOpenMenu: menu, withEvent: event];
     }
@@ -73,13 +77,16 @@ pub fn install(webview: *mut c_void) {
         if SUPER.set(sup).is_err() {
             return;
         }
-        let imp: unsafe extern "C-unwind" fn(&AnyObject, Sel, &AnyObject, *mut AnyObject) = will_open_menu;
-        objc2::ffi::class_addMethod(
+        let imp: WillOpenMenuFn = will_open_menu;
+        let added = objc2::ffi::class_addMethod(
             cls as *const AnyClass as *mut AnyClass,
             sel!(willOpenMenu:withEvent:),
-            std::mem::transmute::<_, Imp>(imp),
+            std::mem::transmute::<WillOpenMenuFn, Imp>(imp),
             c"v@:@@".as_ptr(),
         );
+        if !added.as_bool() {
+            eprintln!("context_menu: willOpenMenu:withEvent: already defined on webview class");
+        }
     }
 }
 

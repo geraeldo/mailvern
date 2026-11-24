@@ -126,9 +126,20 @@ function toRule(a: any, folders: Map<string, { id: number; accountId: number }>,
       case "snooze":
         return { type: "snooze", until: x.until ?? "tomorrow" };
       case "forward": {
-        const to: string[] = (x.to ?? []).map(String);
-        const said = request.toLowerCase();
-        const unasked = to.filter((t) => !said.includes((t.match(/<([^>]+)>/)?.[1] ?? t).trim().toLowerCase()));
+        const to: string[] = (x.to ?? []).map(String).map((s: string) => s.trim()).filter(Boolean);
+        const EMAIL_RE = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
+        const asked = new Set((request.match(EMAIL_RE) ?? []).map((e) => e.toLowerCase()));
+        const extractEmail = (raw: string): string | null => {
+          const emails = raw.match(EMAIL_RE);
+          if (!emails || emails.length !== 1) return null;
+          const bracket = raw.match(/<([^>]+)>/);
+          if (bracket && bracket[1].trim().toLowerCase() !== emails[0].toLowerCase()) return null;
+          return emails[0].toLowerCase();
+        };
+        const unasked = to.filter((t) => {
+          const email = extractEmail(t);
+          return !email || !asked.has(email);
+        });
         if (!to.length || unasked.length) {
           throw new Error(
             `Forward only to addresses the user wrote in their request${unasked.length ? `; ${unasked.join(", ")} isn't one` : ""}. If they didn't give one, call cannot_do and ask for it.`,

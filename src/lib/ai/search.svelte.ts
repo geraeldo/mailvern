@@ -273,8 +273,15 @@ async function runTool(call: ToolCall, run: Run, step: (s: AiStep) => AiStep): P
     }
     case "read_message": {
       const known = run.seen.get(a.id);
+      if (run.scope.kind === "account" && known && known.accountId !== run.scope.accountId) {
+        return text("That message belongs to another account outside this search scope.", true);
+      }
       const st = step({ kind: "read", text: `Reading ${known ? `“${known.subject || "(no subject)"}”` : `message ${a.id}`}`, done: false });
       const d = await api.message(a.id);
+      if (run.scope.kind === "account" && d.accountId !== run.scope.accountId) {
+        st.error = true;
+        return text("That message belongs to another account outside this search scope.", true);
+      }
       run.seen.set(d.id, d);
       consider(run, d);
       st.text = `Read “${d.subject || "(no subject)"}”`;
@@ -306,7 +313,13 @@ async function runTool(call: ToolCall, run: Run, step: (s: AiStep) => AiStep): P
     }
     case "read_conversation": {
       const st = step({ kind: "thread", text: "Reading the conversation", done: false });
-      const thread = await api.thread(a.id);
+      const rawThread = await api.thread(a.id);
+      const scopedAcc = run.scope.kind === "account" ? run.scope.accountId : null;
+      const thread = scopedAcc != null ? rawThread.filter((m) => m.accountId === scopedAcc) : rawThread;
+      if (scopedAcc != null && !thread.length) {
+        st.error = true;
+        return text("That conversation belongs to another account outside this search scope.", true);
+      }
       thread.forEach((m) => run.seen.set(m.id, m));
       if (thread.length) consider(run, thread[thread.length - 1]);
       const recent = thread.slice(-15);
@@ -327,6 +340,13 @@ async function runTool(call: ToolCall, run: Run, step: (s: AiStep) => AiStep): P
     }
     case "read_attachment": {
       const st = step({ kind: "attachment", text: "Opening an attachment", done: false });
+      if (run.scope.kind === "account") {
+        const meta = run.seen.get(a.messageId) ?? (await api.summaries([a.messageId]))[0];
+        if (!meta || meta.accountId !== run.scope.accountId) {
+          st.error = true;
+          return text("That attachment belongs to another account outside this search scope.", true);
+        }
+      }
       const c = await api.attachmentContent(a.messageId, a.index, a.offset ?? 0, 30000);
       st.text = `Opened ${c.filename}`;
       if (c.kind === "unsupported") {
@@ -345,8 +365,10 @@ async function runTool(call: ToolCall, run: Run, step: (s: AiStep) => AiStep): P
     }
     case "list_folders": {
       step({ kind: "folders", text: "Looked at your folders", done: true });
+      const scopedAcc = run.scope.kind === "account" ? run.scope.accountId : null;
+      const visibleAccounts = scopedAcc != null ? ui.accounts.filter((acc) => acc.id === scopedAcc) : ui.accounts;
       return text(
-        ui.accounts
+        visibleAccounts
           .map((acc) => {
             const fs = ui.folders.filter((f) => f.accountId === acc.id);
             return `Account ${acc.id}: ${accountLabel(acc)} <${acc.email}>\n${fs.map((f) => `  folder ${f.id}: ${f.name}${f.role ? ` [${f.role}]` : ""}${f.unread ? ` · ${f.unread} unread` : ""}`).join("\n")}`;

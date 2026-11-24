@@ -35,7 +35,7 @@ fn id_list(v: &HeaderValue) -> Option<String> {
 fn is_multipart_mixed(m: &Message) -> bool {
     m.root_part()
         .content_type()
-        .map(|ct| ct.c_type.eq_ignore_ascii_case("multipart") && ct.subtype().map_or(false, |s| s.eq_ignore_ascii_case("mixed")))
+        .map(|ct| ct.c_type.eq_ignore_ascii_case("multipart") && ct.subtype().is_some_and(|s| s.eq_ignore_ascii_case("mixed")))
         .unwrap_or(false)
 }
 

@@ -66,7 +66,7 @@ pub struct Names {
 
 impl Names {
     pub fn load(ctx: &crate::Ctx) -> Result<Names> {
-        Ok(Names { accounts: ctx.engine.accounts()?, folders: ctx.engine.folders()?, sync: ctx.sync.lock().unwrap().clone() })
+        Ok(Names { accounts: ctx.engine.accounts()?, folders: ctx.engine.folders()?, sync: ctx.sync.lock().unwrap_or_else(|e| e.into_inner()).clone() })
     }
 
     /// Why an account's local mail can't be relied on, if so: it can't sync, or nothing has

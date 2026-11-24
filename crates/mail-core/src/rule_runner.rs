@@ -163,10 +163,7 @@ impl Engine {
         Ok(match c.check(f, None) {
             Verdict::Yes => Some(true),
             Verdict::No => Some(false),
-            Verdict::NeedBody => match self.db.body_text(f.id)? {
-                Some(b) => Some(c.check(f, Some(&b)) == Verdict::Yes),
-                None => None,
-            },
+            Verdict::NeedBody => self.db.body_text(f.id)?.map(|b| c.check(f, Some(&b)) == Verdict::Yes),
         })
     }
 

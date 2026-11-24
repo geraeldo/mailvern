@@ -5,6 +5,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
 
+pub type SummaryDetailRow = (MessageSummary, Vec<Addr>, Vec<Addr>, Vec<Addr>, Option<String>, Option<String>, Option<String>);
+pub type OutboxSummaryRow = (i64, i64, String, i64, Option<String>);
+
 pub struct Db {
     conn: Mutex<Connection>,
 }
@@ -530,10 +533,11 @@ impl Db {
 
     /// Gives every message without a conversation one, oldest first (needed once after v4).
     fn assign_threads(&self) -> Result<()> {
+        type ThreadSeedRow = (i64, i64, Option<String>, Option<String>, Option<String>);
         let mut c = self.c();
         let tx = c.transaction()?;
         {
-            let rows: Vec<(i64, i64, Option<String>, Option<String>, Option<String>)> = tx
+            let rows: Vec<ThreadSeedRow> = tx
                 .prepare("SELECT id, account_id, message_id, in_reply_to, refs FROM messages WHERE thread_id IS NULL ORDER BY date, id")?
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
                 .collect::<rusqlite::Result<_>>()?;
@@ -1192,7 +1196,7 @@ impl Db {
         Ok((total, groups))
     }
 
-    pub fn summary(&self, id: i64) -> Result<(MessageSummary, Vec<Addr>, Vec<Addr>, Vec<Addr>, Option<String>, Option<String>, Option<String>)> {
+    pub fn summary(&self, id: i64) -> Result<SummaryDetailRow> {
         let c = self.c();
         let sql = format!(
             "SELECT {SUMMARY_COLS}, m.to_json, m.cc_json, m.reply_to_json, m.message_id, m.refs, m.in_reply_to FROM messages m WHERE m.id = ?"
@@ -1353,7 +1357,7 @@ impl Db {
     }
 
     /// (id, account_id, payload, send_at, error) for everything in the outbox, soonest first.
-    pub fn outbox(&self) -> Result<Vec<(i64, i64, String, i64, Option<String>)>> {
+    pub fn outbox(&self) -> Result<Vec<OutboxSummaryRow>> {
         let c = self.c();
         let rows = c
             .prepare("SELECT id, account_id, payload, send_at, error FROM outbox ORDER BY send_at, id")?
