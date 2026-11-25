@@ -5,7 +5,7 @@ import { formatAddr } from "./format";
 import { openRuleEditor, ruleFromAddress, ruleFromMessage, describeFromMessage, type FromMessage } from "./rules.svelte";
 import {
   ui, openAccountSettings, openMessage, compose, archiveSelected, trashSelected, toggleJunk, selectedIsJunk, toggleSeen, toggleFlag, markAllRead,
-  toast, setQuery, trustSender, checkForMail, checkAccountForMail, copyThread, selectedRows, snoozeSelected, unsnoozeSelected, moveRows, moveSelected, roleOf, editDraft,
+  toast, setQuery, isSenderTrusted, trustSender, trustDomain, checkForMail, checkAccountForMail, copyThread, selectedRows, snoozeSelected, unsnoozeSelected, moveRows, moveSelected, roleOf, editDraft,
 } from "./state.svelte";
 
 type Item = { text: string; action: () => void; enabled?: boolean } | { text: string; items: Item[] } | "-";
@@ -136,7 +136,7 @@ export function addressMenu(e: MouseEvent, a: Addr, d?: Detail, sender = false) 
   const mine = ui.accounts.some((x) => x.email.toLowerCase() === email);
   const domain = email.split("@")[1] ?? "";
   const accountId = d?.accountId ?? null;
-  const trusted = ui.trustedSenders.includes(email);
+  const trusted = isSenderTrusted(email);
   return popup([
     { text: "Send Email", action: () => compose("new", { to: [formatAddr(a)] }) },
     ...(d && !mine ? [{ text: `Reply to ${name || a.email} Only`, action: () => compose("reply", { source: d, to: [formatAddr(a)] }) }] : []),
@@ -154,7 +154,11 @@ export function addressMenu(e: MouseEvent, a: Addr, d?: Detail, sender = false) 
         { text: `From Anyone at ${domain}…`, action: () => openRuleEditor(ruleFromAddress(a.email, name ?? null, accountId, "domain")), enabled: !!domain },
       ] },
     ]),
-    ...(sender && !mine && !trusted ? ["-" as const, { text: "Always Load Images from This Sender", action: () => trustSender(a.email) }] : []),
+    ...(sender && !mine && !trusted ? [
+      "-" as const,
+      { text: "Always Load Images from This Sender", action: () => trustSender(a.email) },
+      ...(domain ? [{ text: `Always Load Images from @${domain}`, action: () => trustDomain(domain) }] : []),
+    ] : []),
   ]);
 }
 

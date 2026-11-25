@@ -310,6 +310,7 @@ export const api = {
   fileInfo: (paths: string[]) => invoke<FileInfo[]>("file_info", { paths }),
   attachmentFiles: (id: number) => invoke<FileInfo[]>("attachment_files", { id }),
   contacts: (query: string) => invoke<Addr[]>("contacts", { query }),
+  sentRecipients: () => invoke<string[]>("sent_recipients"),
   /** The sender's domain logo or website icon, null to show initials. */
   senderIcon: (email: string) => invoke<SenderIcon | null>("sender_icon", { email }),
   openUrl: (url: string) => invoke<void>("open_url", { url }),

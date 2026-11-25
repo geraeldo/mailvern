@@ -1881,6 +1881,24 @@ impl Db {
         Ok(rows)
     }
 
+    /// Distinct lowercased email addresses you've sent mail to (To or Cc in Sent folders).
+    pub fn sent_recipients(&self) -> Result<Vec<String>> {
+        let c = self.r();
+        let mut st = c.prepare(
+            "SELECT DISTINCT lower(json_extract(j.value, '$.email')) AS email
+             FROM messages m, json_each(m.to_json) j
+             WHERE m.folder_id IN (SELECT id FROM folders WHERE role = 'sent')
+               AND email IS NOT NULL AND email != ''
+             UNION
+             SELECT DISTINCT lower(json_extract(j.value, '$.email')) AS email
+             FROM messages m, json_each(m.cc_json) j
+             WHERE m.folder_id IN (SELECT id FROM folders WHERE role = 'sent')
+               AND email IS NOT NULL AND email != ''",
+        )?;
+        let rows = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     // ---------- outbox ----------
 
     pub fn add_outbox(&self, account_id: i64, message_id: &str, payload: &str, raw: &[u8], envelope: &str, send_at: i64) -> Result<i64> {
@@ -2986,6 +3004,39 @@ mod tests {
         let hits = db.contacts("a_b").unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].email, "a_b@example.com");
+    }
+
+    #[test]
+    fn sent_recipients_collects_unique_lowercased_to_and_cc_from_sent_only() {
+        let db = Db::open(&temp_db()).unwrap();
+        let a = db.save_account(&account()).unwrap();
+        let inbox = db.upsert_folder(a, "INBOX", "Inbox", Some("inbox")).unwrap();
+        let sent = db.upsert_folder(a, "Sent", "Sent", Some("sent")).unwrap();
+
+        let inbox_msg = NewMessage {
+            to: vec![Addr { name: None, email: "ignored@example.com".into() }],
+            cc: vec![Addr { name: None, email: "ignored-cc@example.com".into() }],
+            ..msg(1, false)
+        };
+        let sent_msg1 = NewMessage {
+            to: vec![
+                Addr { name: Some("Alice".into()), email: "Alice@Example.com".into() },
+                Addr { name: None, email: "".into() },
+            ],
+            cc: vec![Addr { name: None, email: "Bob@Work.org".into() }],
+            ..msg(2, true)
+        };
+        let sent_msg2 = NewMessage {
+            to: vec![Addr { name: None, email: "alice@example.com".into() }],
+            cc: vec![],
+            ..msg(3, true)
+        };
+        db.insert_messages(a, inbox, &[inbox_msg]).unwrap();
+        db.insert_messages(a, sent, &[sent_msg1, sent_msg2]).unwrap();
+
+        let mut got = db.sent_recipients().unwrap();
+        got.sort();
+        assert_eq!(got, vec!["alice@example.com".to_string(), "bob@work.org".to_string()]);
     }
 
     #[test]

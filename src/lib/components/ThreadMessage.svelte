@@ -2,12 +2,13 @@
   import { onMount, untrack } from "svelte";
   import Icon from "./Icon.svelte";
   import MailFrame from "./MailFrame.svelte";
-  import { ui, compose, accountById, accountLabel, trustSender, toast, roleOf, editDraft } from "../state.svelte";
+  import { ui, compose, accountById, accountLabel, isSenderTrusted, trustSender, trustDomain, toast, roleOf, editDraft } from "../state.svelte";
   import { api, type Addr, type Summary } from "../api";
   import { longDate, shortDate, displayName, fileSize } from "../format";
   import Avatar from "./Avatar.svelte";
   import { addressMenu } from "../menus";
   import { hasRemoteContent, textToHtml } from "../html";
+  import { emailDomain } from "../trust";
   import { getCachedDetail, hasShownImages, markShownImages, putDetail } from "../mail-cache.svelte";
 
   let {
@@ -26,7 +27,8 @@
   const isPlain = $derived(!!d && !d.html);
   const body = $derived(d ? (d.html ?? textToHtml(d.text ?? "")) : "");
   const remote = $derived(!!d?.html && hasRemoteContent(d.html));
-  const trusted = $derived(ui.trustedSenders.includes(m.fromAddr.toLowerCase()));
+  const domain = $derived(emailDomain(m.fromAddr));
+  const trusted = $derived(isSenderTrusted(m.fromAddr));
   const allowRemote = $derived(trusted || hasShownImages(m.id));
   const isDraft = $derived(roleOf(m) === "drafts");
   const acc = $derived(accountById(m.accountId));
@@ -161,6 +163,9 @@
           <span>Images hidden</span>
           <button type="button" class="link" onclick={() => markShownImages(m.id)}>Show once</button>
           <button type="button" class="link" title={`Always load remote images from ${m.fromAddr}`} onclick={() => trustSender(m.fromAddr)}>Always from {displayName(m.fromName, m.fromAddr)}</button>
+          {#if domain}
+            <button type="button" class="link" title={`Always load remote images from anyone at ${domain}`} onclick={() => trustDomain(domain)}>Always from @{domain}</button>
+          {/if}
         </div>
       {/if}
 

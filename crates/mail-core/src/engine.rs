@@ -503,6 +503,10 @@ impl Engine {
         self.db.contacts(q)
     }
 
+    pub fn sent_recipients(&self) -> Result<Vec<String>> {
+        self.db.sent_recipients()
+    }
+
     // ---------- changes (local first, server in background) ----------
 
     fn group(&self, ids: &[i64]) -> Result<HashMap<(i64, i64), Vec<u32>>> {

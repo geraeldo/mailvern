@@ -519,6 +519,11 @@ fn contacts(engine: E, query: String) -> R<Vec<mail_core::model::Addr>> {
     engine.contacts(&query).map_err(err)
 }
 
+#[tauri::command(async)]
+fn sent_recipients(engine: E) -> R<Vec<String>> {
+    engine.sent_recipients().map_err(err)
+}
+
 #[tauri::command]
 fn open_url(app: tauri::AppHandle, url: String) -> R<()> {
     let parsed = tauri::Url::parse(url.trim()).map_err(|_| "Unsupported link".to_string())?;
@@ -701,6 +706,7 @@ pub fn run() {
             file_info,
             attachment_files,
             contacts,
+            sent_recipients,
             sender_icon,
             read_image,
             open_url,

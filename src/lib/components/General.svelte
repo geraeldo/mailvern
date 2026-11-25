@@ -1,12 +1,31 @@
 <script lang="ts">
   import { BADGE_MODES, badge, setBadgeMode } from "../badge.svelte";
-  import { ui, setUndoSend, setThreaded, setSenderIcons, untrustSender } from "../state.svelte";
+  import { ui, setUndoSend, setThreaded, setSenderIcons, setRemoteImages, setAutoTrustSent, trustSender, untrustSender, type RemoteImagesMode } from "../state.svelte";
   import { THEME_MODES, theme, setThemeMode } from "../theme.svelte";
   import Select from "./Select.svelte";
   import Switch from "./Switch.svelte";
   import Icon from "./Icon.svelte";
 
   const UNDO = [0, 5, 10, 20, 30];
+  const REMOTE_MODES: { value: RemoteImagesMode; label: string }[] = [
+    { value: "ask", label: "Ask before loading" },
+    { value: "always", label: "Always load" },
+  ];
+
+  let newTrust = $state("");
+  let trustError = $state("");
+
+  async function addTrusted(e: SubmitEvent) {
+    e.preventDefault();
+    const raw = newTrust.trim();
+    if (!raw) return;
+    if (await trustSender(raw)) {
+      newTrust = "";
+      trustError = "";
+    } else {
+      trustError = "Enter a valid email address or domain (e.g. alice@example.com or @github.com).";
+    }
+  }
 </script>
 
 <div class="group">
@@ -68,22 +87,58 @@
   </div>
 </div>
 
-{#if ui.trustedSenders.length}
-  <div class="group">
-    <div class="gname">Remote images · Trusted senders</div>
-    <div class="card">
-      {#each ui.trustedSenders as email (email)}
-        <div class="row trusted">
-          <span class="label addr">{email}</span>
-          <button type="button" class="icon-btn sm" title={`Stop always loading images from ${email}`} aria-label={`Remove ${email}`} onclick={() => untrustSender(email)}>
-            <Icon name="x" size={14} />
-          </button>
-        </div>
-      {/each}
+<div class="group">
+  <div class="gname">Remote images</div>
+  <div class="card">
+    <div class="row">
+      <span class="text">
+        <span class="label">Load remote images</span>
+        <span class="detail">External images can notify senders when you open a message</span>
+      </span>
+      <Select label="Load remote images" value={ui.remoteImages} options={REMOTE_MODES} onchange={setRemoteImages} />
     </div>
-    <p class="hint">Images from these senders load automatically without asking.</p>
+    <label class="row interactive" class:disabled={ui.remoteImages === "always"}>
+      <span class="text">
+        <span class="label">Auto-trust people you've emailed</span>
+        <span class="detail">Load images automatically from Sent recipients and your own accounts</span>
+      </span>
+      <Switch
+        checked={ui.autoTrustSent}
+        disabled={ui.remoteImages === "always"}
+        label="Auto-trust people you've emailed"
+        onchange={(v) => setAutoTrustSent(v)} />
+    </label>
   </div>
-{/if}
+</div>
+
+<div class="group">
+  <div class="gname">Trusted senders & domains</div>
+  <div class="card">
+    <form class="row add-trusted" onsubmit={addTrusted}>
+      <input
+        type="text"
+        class="trust-input"
+        placeholder="Email or domain (e.g. @github.com)"
+        aria-label="Add trusted email or domain"
+        bind:value={newTrust}
+        oninput={() => { trustError = ""; }} />
+      <button type="submit" class="btn-add" disabled={!newTrust.trim()}>Add</button>
+    </form>
+    {#each ui.trustedSenders as entry (entry)}
+      <div class="row trusted">
+        <span class="label addr">{entry}</span>
+        <button type="button" class="icon-btn sm" title={`Stop always loading images from ${entry}`} aria-label={`Remove ${entry}`} onclick={() => untrustSender(entry)}>
+          <Icon name="x" size={14} />
+        </button>
+      </div>
+    {/each}
+  </div>
+  {#if trustError}
+    <p class="hint err">{trustError}</p>
+  {:else}
+    <p class="hint">Images from these senders and domains (including subdomains) load automatically without asking.</p>
+  {/if}
+</div>
 
 <style>
   .gname { font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 8px; }
@@ -103,12 +158,39 @@
   }
   .row + .row { border-top: 1px solid var(--line); }
   .row.interactive:hover { background: var(--hover); }
+  .row.disabled { opacity: 0.55; }
+  .row.disabled:hover { background: transparent; }
   .row.trusted { padding: 7px 8px 7px 14px; }
+  .row.add-trusted { padding: 8px 8px 8px 14px; gap: 8px; }
+  .trust-input {
+    flex: 1;
+    min-width: 0;
+    border: 0;
+    background: transparent;
+    color: var(--text);
+    font-size: 13.5px;
+    outline: none;
+  }
+  .trust-input::placeholder { color: var(--muted); }
+  .btn-add {
+    flex: none;
+    height: 28px;
+    padding: 0 12px;
+    border: 1px solid var(--line-strong);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 12.5px;
+    font-weight: 500;
+  }
+  .btn-add:hover:not(:disabled) { background: var(--hover); }
+  .btn-add:disabled { opacity: 0.45; }
   input[type="radio"] { margin: 0; accent-color: var(--accent); flex: none; }
   .text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
   .label { font-size: 13.5px; color: var(--text); }
   .addr { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .detail { font-size: 12.5px; color: var(--muted); }
   .hint { margin: 8px 0 0; font-size: 12px; color: var(--muted); }
+  .hint.err { color: var(--danger); }
   .icon-btn.sm { width: 26px; height: 26px; flex: none; }
 </style>

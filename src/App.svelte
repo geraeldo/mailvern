@@ -17,7 +17,7 @@
   import { loadTheme } from "./lib/theme.svelte";
   import { loadAi } from "./lib/ai/config.svelte";
   import {
-    ui, loadAccounts, loadFolders, loadList, loadTrusted, loadPrefs, loadOutbox, loadPendingAgentActions, refreshThread, move, compose,
+    ui, loadAccounts, loadFolders, loadList, loadTrusted, loadSentRecipients, loadPrefs, loadOutbox, loadPendingAgentActions, refreshThread, move, compose,
     archiveSelected, trashSelected, toggleJunk, toggleSeen, toggleFlag, accountById, openSettings, openAccountSettings,
     moveSelected, snoozeSelected, unsnoozeSelected, selectAll, extendSelection, clearSelection, snoozeRows, moveRows,
     selectedRows, roleOf, toast, undoToast, runToastAction, copyThread, openMessage, commitPending, setPaneWidths, toggleSidebar,
@@ -78,6 +78,8 @@
     pending = setTimeout(async () => {
       const reloadList = viewAffected();
       const reloadThread = reloadList || threadAffected();
+      const sentAffected = pendingRefreshAll || pendingAccounts.size > 0
+        || [...pendingFolders].some((fid) => ui.folders.find((f) => f.id === fid)?.role === "sent");
       pendingRefreshAll = false;
       pendingFolders.clear();
       pendingAccounts.clear();
@@ -87,6 +89,7 @@
         await loadFolders();
       }
       if (reloadThread) refreshThread();
+      if (sentAffected && ui.autoTrustSent) loadSentRecipients();
       refreshBadge();
     }, 150);
   }

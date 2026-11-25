@@ -9,7 +9,7 @@
   import WhenPicker from "./WhenPicker.svelte";
   import Rephrase from "./Rephrase.svelte";
   import type { RephraseContext } from "../ai/rephrase";
-  import { ui, toast, folderById, editQueued, loadOutbox, type ComposeInit } from "../state.svelte";
+  import { ui, toast, folderById, editQueued, loadOutbox, noteSentRecipients, type ComposeInit } from "../state.svelte";
   import { api, type FileInfo, type Outgoing } from "../api";
   import { sendPresets, toUnix, whenLabel } from "../when";
   import { formatAddr, fileSize } from "../format";
@@ -317,6 +317,7 @@
       const out = outgoing();
       if (draftAccount != null && draftAccount !== accountId && messageId) api.deleteDraft(draftAccount, messageId).catch(() => {});
       const id = await api.send(out, at ? toUnix(at) : null);
+      noteSentRecipients([...out.to, ...out.cc, ...out.bcc]);
       ui.compose = null;
       loadOutbox();
       if (at) toast(`Scheduled for ${whenLabel(at)}`);

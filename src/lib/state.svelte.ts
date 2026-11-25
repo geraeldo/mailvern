@@ -4,6 +4,7 @@ import {
 import { formatAddr } from "./format";
 import { threadText } from "./copy";
 import { textToHtml, unwrapEmail } from "./html";
+import { extractEmailAddress, isRemoteImageAllowed, normalizeTrustEntry } from "./trust";
 import { toUnix, whenLabel } from "./when";
 import {
   cachedDetailsFor, cachedFrameDoc, clearMailCache, evictMessages, getCachedDetail, getCachedThread, hasShownImages,
@@ -16,6 +17,7 @@ export type ComposeMode = "new" | "reply" | "replyAll" | "forward" | "draft";
 export type Restore = { message: Outgoing; attachments: FileInfo[]; unsaved?: boolean };
 export type ComposeInit = { mode: ComposeMode; source?: Detail; accountId?: number; to?: string[]; restore?: Restore; key: number };
 export type SettingsSection = "general" | "accounts" | "rules" | "ai" | "agents" | "shortcuts";
+export type RemoteImagesMode = "ask" | "always";
 export type SyncStatus = { state: "syncing" | "idle" | "error"; message: string | null };
 /** One thing AI search did, shown while it works. */
 export type AiStep = { kind: "search" | "read" | "attachment" | "count" | "thread" | "folders" | "note"; text: string; done: boolean; error?: boolean };
@@ -93,6 +95,12 @@ export const ui = $state({
   status: {} as Record<number, SyncStatus>,
   toast: null as { text: string; undo?: () => void; action?: { label: string; fn: () => void } } | null,
   trustedSenders: [] as string[],
+  /** Whether remote images load automatically ("always") or only for trusted senders ("ask"). */
+  remoteImages: "ask" as RemoteImagesMode,
+  /** Automatically trust remote images from addresses you've emailed and your own accounts. */
+  autoTrustSent: true,
+  /** Lowercased recipient emails from Sent folders (and freshly sent mail). */
+  sentRecipients: new Set<string>(),
   outbox: [] as OutboxItem[],
   outboxSelected: null as number | null,
   /** Pending MCP agent actions waiting for user approval. */
@@ -219,13 +227,15 @@ export async function loadAccounts() {
 }
 
 export async function loadPrefs() {
-  const [undo, threads, icons, sideW, listW, sideCol] = await Promise.all([
+  const [undo, threads, icons, sideW, listW, sideCol, remoteImg, autoTrust] = await Promise.all([
     api.getSetting("undo_send"),
     api.getSetting("threads"),
     api.getSetting("sender_icons"),
     api.getSetting("side_width"),
     api.getSetting("list_width"),
     api.getSetting("sidebar_collapsed"),
+    api.getSetting("remote_images"),
+    api.getSetting("auto_trust_sent"),
   ]);
   const n = Number(undo);
   if (undo != null && Number.isFinite(n)) ui.undoSend = n;
@@ -236,6 +246,8 @@ export async function loadPrefs() {
   const lw = Number(listW);
   if (listW != null && Number.isFinite(lw) && lw >= 260 && lw <= 480) ui.listWidth = lw;
   ui.sidebarCollapsed = sideCol === "on";
+  ui.remoteImages = remoteImg === "always" ? "always" : "ask";
+  ui.autoTrustSent = autoTrust !== "off";
 }
 
 export function setPaneWidths(side: number, list: number) {
@@ -514,7 +526,7 @@ export async function prewarmMessage(id: number): Promise<void> {
     // Pre-run DOMParser inertly (no network/image loads) so opening skips main-thread parsing.
     const isPlain = !d.html;
     const body = d.html ?? textToHtml(d.text ?? "");
-    const allowRemote = ui.trustedSenders.includes(d.fromAddr.toLowerCase()) || hasShownImages(id);
+    const allowRemote = isSenderTrusted(d.fromAddr) || hasShownImages(id);
     cachedFrameDoc(id, body, allowRemote, isPlain);
   } finally {
     prewarmInFlight.delete(id);
@@ -1120,24 +1132,74 @@ export async function sendQueuedNow(id: number) {
   loadOutbox();
 }
 
+export async function setRemoteImages(mode: RemoteImagesMode) {
+  ui.remoteImages = mode;
+  await api.setSetting("remote_images", mode);
+}
+
+export async function setAutoTrustSent(on: boolean) {
+  ui.autoTrustSent = on;
+  await api.setSetting("auto_trust_sent", on ? "on" : "off");
+  if (on && ui.sentRecipients.size === 0) loadSentRecipients();
+}
+
+export async function loadSentRecipients() {
+  try {
+    const list = await api.sentRecipients();
+    ui.sentRecipients = new Set(list);
+  } catch {
+    // keep existing set
+  }
+}
+
+export function noteSentRecipients(addrs: string[]) {
+  let next: Set<string> | null = null;
+  for (const raw of addrs) {
+    const e = extractEmailAddress(raw);
+    if (e && !ui.sentRecipients.has(e)) {
+      if (!next) next = new Set(ui.sentRecipients);
+      next.add(e);
+    }
+  }
+  if (next) ui.sentRecipients = next;
+}
+
+export function isSenderTrusted(email: string): boolean {
+  const ownEmails = new Set(ui.accounts.map((a) => a.email.toLowerCase()));
+  return isRemoteImageAllowed(email, {
+    always: ui.remoteImages === "always",
+    entries: ui.trustedSenders,
+    autoTrustSent: ui.autoTrustSent,
+    sentRecipients: ui.sentRecipients,
+    ownEmails,
+  });
+}
+
 export async function loadTrusted() {
   try {
     ui.trustedSenders = JSON.parse((await api.getSetting("trusted_senders")) || "[]");
   } catch {
     ui.trustedSenders = [];
   }
+  if (ui.autoTrustSent) await loadSentRecipients();
 }
 
-export async function trustSender(email: string) {
-  const e = email.toLowerCase();
-  if (!ui.trustedSenders.includes(e)) {
-    ui.trustedSenders = [...ui.trustedSenders, e];
+export async function trustSender(entry: string): Promise<boolean> {
+  const normalized = normalizeTrustEntry(entry);
+  if (!normalized) return false;
+  if (!ui.trustedSenders.includes(normalized)) {
+    ui.trustedSenders = [...ui.trustedSenders, normalized];
     await api.setSetting("trusted_senders", JSON.stringify(ui.trustedSenders));
   }
+  return true;
 }
 
-export async function untrustSender(email: string) {
-  const e = email.toLowerCase();
-  ui.trustedSenders = ui.trustedSenders.filter((x) => x !== e);
+export async function trustDomain(domain: string): Promise<boolean> {
+  return trustSender(`@${domain.trim().replace(/^@+/, "")}`);
+}
+
+export async function untrustSender(entry: string) {
+  const e = entry.trim().toLowerCase();
+  ui.trustedSenders = ui.trustedSenders.filter((x) => x.toLowerCase() !== e);
   await api.setSetting("trusted_senders", JSON.stringify(ui.trustedSenders));
 }
