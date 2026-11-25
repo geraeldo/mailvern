@@ -8,30 +8,37 @@
   import Avatar from "./Avatar.svelte";
   import { addressMenu } from "../menus";
   import { hasRemoteContent, textToHtml } from "../html";
+  import { getCachedDetail, hasShownImages, markShownImages, putDetail } from "../mail-cache.svelte";
 
-  let { m, expanded, focus = false }: { m: Summary; expanded: boolean; focus?: boolean } = $props();
+  let {
+    m,
+    expanded,
+    focus = false,
+    collapsible = false,
+    active = true,
+  }: { m: Summary; expanded: boolean; focus?: boolean; collapsible?: boolean; active?: boolean } = $props();
 
   let open = $state(untrack(() => expanded));
-  let showImages = $state(false);
   let error = $state<string | null>(null);
   let el: HTMLDivElement;
 
-  const d = $derived(ui.details[m.id]);
+  const d = $derived(getCachedDetail(m.id));
   const isPlain = $derived(!!d && !d.html);
   const body = $derived(d ? (d.html ?? textToHtml(d.text ?? "")) : "");
   const remote = $derived(!!d?.html && hasRemoteContent(d.html));
   const trusted = $derived(ui.trustedSenders.includes(m.fromAddr.toLowerCase()));
-  const allowRemote = $derived(trusted || showImages);
+  const allowRemote = $derived(trusted || hasShownImages(m.id));
   const isDraft = $derived(roleOf(m) === "drafts");
   const acc = $derived(accountById(m.accountId));
 
   $effect(() => {
-    if (open && !ui.details[m.id]) {
+    if (active && open && !getCachedDetail(m.id)) {
       const id = m.id;
       let cancelled = false;
       error = null;
       api.message(id).then(
         (x) => {
+          putDetail(x);
           if (!cancelled && ui.thread.some((t) => t.id === id)) ui.details[id] = x;
         },
         (e) => {
@@ -50,7 +57,6 @@
 
   const me = $derived(new Set(ui.accounts.map((a) => a.email.toLowerCase())));
   const sender = $derived<Addr>({ name: m.fromName, email: m.fromAddr });
-  const collapsible = $derived(ui.thread.length > 1);
 
   // Clicking non-text header areas folds the message back up; clicking selectable sender/recipient
   // text or action buttons won't accidentally collapse while trying to copy an address.
@@ -122,7 +128,7 @@
       <div class="own">
         {#if isDraft}
           <button type="button" class="btn sm" disabled={!d} onclick={() => d && editDraft(d)}><Icon name="pencil" size={13} /> Edit</button>
-        {:else if ui.thread.length > 1}
+        {:else if collapsible}
           <button type="button" class="icon-btn small" title="Reply" aria-label="Reply" disabled={!d} onclick={() => compose("reply", { source: d })}><Icon name="reply" size={15} /></button>
           <button type="button" class="icon-btn small" title="Reply all" aria-label="Reply all" disabled={!d} onclick={() => compose("replyAll", { source: d })}><Icon name="replyAll" size={15} /></button>
           <button type="button" class="icon-btn small" title="Forward" aria-label="Forward" disabled={!d} onclick={() => compose("forward", { source: d })}><Icon name="forward" size={15} /></button>
@@ -153,13 +159,13 @@
         <div class="images">
           <Icon name="image" size={15} />
           <span>Images hidden</span>
-          <button type="button" class="link" onclick={() => (showImages = true)}>Show once</button>
+          <button type="button" class="link" onclick={() => markShownImages(m.id)}>Show once</button>
           <button type="button" class="link" title={`Always load remote images from ${m.fromAddr}`} onclick={() => trustSender(m.fromAddr)}>Always from {displayName(m.fromName, m.fromAddr)}</button>
         </div>
       {/if}
 
       <div class="paper" class:plain={isPlain}>
-        <MailFrame html={body} {allowRemote} plain={isPlain} />
+        <MailFrame html={body} {allowRemote} plain={isPlain} cacheKey={m.id} />
       </div>
     {:else if error}
       <div class="err">{error}</div>

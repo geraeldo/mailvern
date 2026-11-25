@@ -456,10 +456,9 @@ impl Engine {
         self.db.body(id)?.ok_or_else(|| anyhow!("Message unavailable"))
     }
 
-    pub async fn message(&self, id: i64) -> Result<MessageDetail> {
-        let raw = self.raw(id).await?;
+    fn build_detail(&self, id: i64, raw: &[u8]) -> Result<MessageDetail> {
         let (summary, to, cc, reply_to, message_id, references, in_reply_to) = self.db.summary(id)?;
-        let p = parse::display(&raw);
+        let p = parse::display(raw);
         Ok(MessageDetail {
             summary,
             to,
@@ -474,6 +473,20 @@ impl Engine {
             attachments: p.attachments,
             list_id: self.db.list_id(id)?,
         })
+    }
+
+    /// Returns a parsed message detail ONLY if its body is already downloaded locally.
+    /// Never hits IMAP and never marks the message read — safe for background UI prewarming.
+    pub fn cached_message(&self, id: i64) -> Result<Option<MessageDetail>> {
+        let Some(raw) = self.db.body(id)? else {
+            return Ok(None);
+        };
+        self.build_detail(id, &raw).map(Some)
+    }
+
+    pub async fn message(&self, id: i64) -> Result<MessageDetail> {
+        let raw = self.raw(id).await?;
+        self.build_detail(id, &raw)
     }
 
     pub async fn attachment(&self, id: i64, index: usize) -> Result<(String, Vec<u8>)> {

@@ -10,6 +10,7 @@
   } from "../state.svelte";
   import { hint, keymap, display } from "../shortcuts.svelte";
   import { whenLabel } from "../when";
+  import { readerPool, type ReaderPane } from "../mail-cache.svelte";
 
   const multi = $derived(ui.selectedIds.length > 1);
   const d = $derived(ui.detail);
@@ -22,15 +23,39 @@
   const flagged = $derived(rows.length > 0 && rows.every((r) => r.flagged));
   const oneAccount = $derived(new Set(rows.map((r) => r.accountId)).size === 1);
   const showTools = $derived(ui.view.kind !== "outbox" && (multi || !!d));
-  const isDraft = $derived(!!d && roleOf(d) === "drafts");
   /** AI search: its answer fills the reader until a source is opened. */
   const answer = $derived(ui.ai && ui.view.kind !== "outbox" && ui.selectedId == null && !multi);
-  const focusId = $derived(ui.thread.length > 3 ? (ui.thread.find((m) => ui.expandIds.includes(m.id) && !m.seen)?.id ?? null) : null);
+  const showEmail = $derived(!outboxItem && !(answer && ui.ai) && !multi && !!d);
 
   const keyFor = (action: keyof typeof keymap.bindings) => {
     const first = keymap.bindings[action][0];
     return first ? display(first) : "";
   };
+
+  function focusIdOf(pane: ReaderPane): number | null {
+    return pane.thread.length > 3 ? (pane.thread.find((m) => pane.expandIds.includes(m.id) && !m.seen)?.id ?? null) : null;
+  }
+
+  /** Preserves scroll position across display:none hide/show transitions in the keep-alive pool. */
+  function keepScroll(node: HTMLElement, params: { pane: ReaderPane; active: boolean }) {
+    let current = params;
+    const onScroll = () => {
+      if (current.active) current.pane.scrollTop = node.scrollTop;
+    };
+    node.addEventListener("scroll", onScroll, { passive: true });
+    return {
+      update(next: { pane: ReaderPane; active: boolean }) {
+        const becameActive = next.active && !current.active;
+        current = next;
+        if (becameActive && node.scrollTop !== next.pane.scrollTop) {
+          node.scrollTop = next.pane.scrollTop;
+        }
+      },
+      destroy() {
+        node.removeEventListener("scroll", onScroll);
+      },
+    };
+  }
 </script>
 
 <section class="reader">
@@ -136,16 +161,40 @@
       </div>
       <button type="button" class="link" onclick={clearSelection}>Clear selection</button>
     </div>
-  {:else if d}
-    <div class="scroll content">
-      <article>
-        <h2>{d.subject || "(no subject)"}</h2>
-        {#key ui.selectedId}
-          {#each ui.thread as m, i (m.id)}
-            <ThreadMessage {m} expanded={ui.expandIds.includes(m.id) || i === ui.thread.length - 1} focus={m.id === focusId} />
-          {/each}
-        {/key}
-        {#if !isDraft}
+  {:else if !showEmail && ui.detailLoading}
+    <div class="center"><span class="spinner"></span></div>
+  {:else if !showEmail && ui.detailError}
+    <div class="center error">{ui.detailError}</div>
+  {:else if !showEmail}
+    <div class="center blank" data-tauri-drag-region>
+      <div class="blank-inner">
+        <svg width="46" height="46" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="16" x="2" y="4" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg>
+        <p class="blank-title">Select a message to read</p>
+        <div class="blank-hints">
+          <span><kbd>{keyFor("compose") || "C"}</kbd> Compose</span>
+          <span><kbd>{keyFor("search") || "/"}</kbd> Search</span>
+          <span><kbd>?</kbd> Shortcuts</span>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#each readerPool.panes as pane (pane.id)}
+    {@const active = showEmail && d?.id === pane.id}
+    {@const paneIsDraft = roleOf(pane.detail) === "drafts"}
+    {@const paneFocus = focusIdOf(pane)}
+    <div class="scroll content" class:hidden={!active} use:keepScroll={{ pane, active }}>
+      <article class="pane-article">
+        <h2>{pane.detail.subject || "(no subject)"}</h2>
+        {#each pane.thread as m, i (m.id)}
+          <ThreadMessage
+            {m}
+            expanded={pane.expandIds.includes(m.id) || i === pane.thread.length - 1}
+            focus={m.id === paneFocus}
+            collapsible={pane.thread.length > 1}
+            {active} />
+        {/each}
+        {#if !paneIsDraft}
           <div class="reply-bar">
             <button type="button" class="btn" onclick={() => compose("reply")}>
               <Icon name="reply" size={15} />
@@ -166,23 +215,7 @@
         {/if}
       </article>
     </div>
-  {:else if ui.detailLoading}
-    <div class="center"><span class="spinner"></span></div>
-  {:else if ui.detailError}
-    <div class="center error">{ui.detailError}</div>
-  {:else}
-    <div class="center blank" data-tauri-drag-region>
-      <div class="blank-inner">
-        <svg width="46" height="46" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="16" x="2" y="4" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg>
-        <p class="blank-title">Select a message to read</p>
-        <div class="blank-hints">
-          <span><kbd>{keyFor("compose") || "C"}</kbd> Compose</span>
-          <span><kbd>{keyFor("search") || "/"}</kbd> Search</span>
-          <span><kbd>?</kbd> Shortcuts</span>
-        </div>
-      </div>
-    </div>
-  {/if}
+  {/each}
 </section>
 
 <style>
@@ -222,7 +255,9 @@
   .sep { width: 1px; height: 18px; background: var(--line); margin: 0 6px; }
   .icon-btn.flagged { color: var(--flag); }
   .content { flex: 1; }
+  .content.hidden { display: none; }
   article { max-width: 860px; margin: 0 auto; padding: 14px 36px 48px; animation: fade 0.12s ease-out; }
+  article.pane-article { animation: none; }
   h2 {
     margin: 0 0 14px;
     font-size: 22px;

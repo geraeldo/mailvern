@@ -1321,9 +1321,11 @@ impl Worker {
     /// parses MIME off the async runtime, and commits each chunk in one transaction.
     async fn prefetch(&mut self, folder_id: i64, path: &str, role: Option<&str>, limit_override: Option<usize>) -> Result<()> {
         let (default_limit, max_size) = match role {
-            Some("inbox") => (300, 8_000_000),
-            Some("sent") | Some("archive") | None => (60, 2_000_000),
-            _ => (0, 0),
+            Some("inbox") => (500, 12_000_000),
+            Some("sent") | Some("drafts") | Some("snoozed") | Some("archive") | None => (200, 8_000_000),
+            Some("all") => (200, 4_000_000),
+            Some("trash") | Some("junk") => (50, 2_000_000),
+            _ => (100, 4_000_000),
         };
         let limit = limit_override.map(|l| l.min(default_limit)).unwrap_or(default_limit);
         if limit == 0 {

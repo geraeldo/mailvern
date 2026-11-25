@@ -5,6 +5,11 @@ import { formatAddr } from "./format";
 import { threadText } from "./copy";
 import { textToHtml, unwrapEmail } from "./html";
 import { toUnix, whenLabel } from "./when";
+import {
+  cachedDetailsFor, cachedFrameDoc, clearMailCache, evictMessages, getCachedDetail, getCachedThread, hasShownImages,
+  markCachedFolderRead, peekCachedDetail, putDetail, putThread, updateCachedFlagged, updateCachedSeen, updatePaneThread,
+  upsertReaderPane,
+} from "./mail-cache.svelte";
 
 export type ComposeMode = "new" | "reply" | "replyAll" | "forward" | "draft";
 /** A message to reopen in the composer: a saved draft, or one taken back out of the outbox. */
@@ -207,7 +212,10 @@ export function roleOf(row: { folderId: number } | null | undefined): string | n
 }
 
 export async function loadAccounts() {
-  ui.accounts = await api.accounts();
+  const prev = ui.accounts;
+  const next = await api.accounts();
+  if (prev.some((a) => !next.some((b) => b.id === a.id))) clearMailCache();
+  ui.accounts = next;
 }
 
 export async function loadPrefs() {
@@ -367,6 +375,7 @@ export async function loadList(reset = true) {
     if (holder) ui.selectedId = holder.id;
   }
   ui.selectedIds = ui.selectedIds.filter((id) => ui.list.some((m) => m.id === id));
+  prewarmAround(ui.selectedId);
 }
 
 /** Views whose folders have no older mail left on the server. */
@@ -478,6 +487,96 @@ async function searchServer(q: string) {
 }
 
 let detailSeq = 0;
+
+// ---------- background prewarming (local bodies only, never touches IMAP or remote images) ----------
+
+const prewarmInFlight = new Set<number>();
+let prewarmQueue: number[] = [];
+let prewarmRunning = false;
+let prewarmTimer: ReturnType<typeof setTimeout> | undefined;
+
+/**
+ * Prewarms a single message into the JS cache + inert prepared srcdoc string if its body is
+ * already downloaded in SQLite. Never hits IMAP, never marks read, never fetches remote images.
+ */
+export async function prewarmMessage(id: number): Promise<void> {
+  if (getCachedDetail(id) || prewarmInFlight.has(id)) return;
+  prewarmInFlight.add(id);
+  try {
+    const [d, thread] = await Promise.all([
+      api.cachedMessage(id).catch(() => null),
+      getCachedThread(id) ? Promise.resolve(getCachedThread(id)!) : api.thread(id).catch(() => [] as Summary[]),
+    ]);
+    if (!d) return;
+    putDetail(d);
+    const t = thread.length ? thread : [d];
+    putThread(id, t);
+    // Pre-run DOMParser inertly (no network/image loads) so opening skips main-thread parsing.
+    const isPlain = !d.html;
+    const body = d.html ?? textToHtml(d.text ?? "");
+    const allowRemote = ui.trustedSenders.includes(d.fromAddr.toLowerCase()) || hasShownImages(id);
+    cachedFrameDoc(id, body, allowRemote, isPlain);
+  } finally {
+    prewarmInFlight.delete(id);
+  }
+}
+
+async function drainPrewarm() {
+  if (prewarmRunning) return;
+  prewarmRunning = true;
+  try {
+    while (prewarmQueue.length) {
+      const id = prewarmQueue.shift()!;
+      if (!getCachedDetail(id)) {
+        await prewarmMessage(id);
+        await new Promise((r) => setTimeout(r, 15));
+      }
+    }
+  } finally {
+    prewarmRunning = false;
+  }
+}
+
+/** Schedules low-priority prewarming for the rows around `selectedId` (or the top of the list). */
+function prewarmAround(selectedId: number | null) {
+  clearTimeout(prewarmTimer);
+  prewarmTimer = setTimeout(() => {
+    const list = ui.list;
+    if (!list.length) return;
+    const ids: number[] = [];
+    const idx = selectedId != null ? list.findIndex((m) => m.id === selectedId) : -1;
+    if (idx >= 0) {
+      for (const offset of [1, -1, 2, 3, -2]) {
+        const row = list[idx + offset];
+        if (row && !getCachedDetail(row.id)) ids.push(row.id);
+      }
+    } else {
+      for (let i = 0; i < Math.min(8, list.length); i++) {
+        const row = list[i];
+        if (row && !getCachedDetail(row.id)) ids.push(row.id);
+      }
+    }
+    if (!ids.length) return;
+    prewarmQueue = ids;
+    drainPrewarm();
+  }, 40);
+}
+
+function markRowReadIfNeeded(id: number, my: number) {
+  const row = ui.list.find((m) => m.id === id);
+  if (row && !row.seen && my === detailSeq) {
+    row.seen = true;
+    if (ui.detail) ui.detail.seen = true;
+    for (const t of ui.thread) if (row.ids.includes(t.id)) t.seen = true;
+    updateCachedSeen(row.ids, true);
+    api.setSeen(row.ids, true).then(loadFolders).catch((e) => {
+      toast(String(e));
+      loadList(true);
+      loadFolders();
+    });
+  }
+}
+
 /** Opens a row: its message, and the conversation around it. */
 export async function openMessage(id: number | null) {
   ui.selectedId = id;
@@ -492,6 +591,52 @@ export async function openMessage(id: number | null) {
     ui.detailLoading = false;
     return;
   }
+
+  const cached = peekCachedDetail(id);
+  if (cached) {
+    const cachedThread = getCachedThread(id);
+    const t = cachedThread?.length ? cachedThread : [cached];
+    const expandIds = [id, ...t.filter((m) => !m.seen).map((m) => m.id)];
+    ui.detail = cached;
+    ui.thread = t;
+    ui.expandIds = expandIds;
+    ui.details = cachedDetailsFor(t.map((m) => m.id));
+    ui.detailLoading = false;
+    upsertReaderPane(id, cached, t, expandIds);
+    markRowReadIfNeeded(id, my);
+    prewarmAround(id);
+
+    // Silently revalidate thread if it wasn't cached yet or its count changed.
+    const row = ui.list.find((m) => m.id === id);
+    if (!cachedThread || (row && row.count > cachedThread.length)) {
+      api.thread(id).then((fresh) => {
+        if (!fresh.length) return;
+        putThread(id, fresh);
+        updatePaneThread(id, fresh);
+        if (my === detailSeq && ui.selectedId === id) {
+          ui.thread = fresh;
+          ui.details = cachedDetailsFor(fresh.map((m) => m.id));
+        }
+      }).catch(() => {});
+    }
+
+    // Drafts can be edited; silently revalidate in the background without flashing a spinner.
+    if (roleOf(cached) === "drafts") {
+      api.message(id).then((fresh) => {
+        if (fresh.html !== cached.html || fresh.text !== cached.text || fresh.subject !== cached.subject) {
+          putDetail(fresh);
+          const curThread = getCachedThread(id) ?? [fresh];
+          upsertReaderPane(id, fresh, curThread, [id]);
+          if (my === detailSeq && ui.selectedId === id) {
+            ui.detail = fresh;
+            ui.details = { ...ui.details, [id]: fresh };
+          }
+        }
+      }).catch(() => {});
+    }
+    return;
+  }
+
   // Only show a spinner if the body isn't already local.
   const spinner = setTimeout(() => {
     if (my === detailSeq) {
@@ -502,11 +647,15 @@ export async function openMessage(id: number | null) {
   try {
     const [d, thread] = await Promise.all([api.message(id), api.thread(id).catch(() => [] as Summary[])]);
     if (my !== detailSeq) return;
-    ui.details = { [id]: d };
-    ui.detail = d;
+    putDetail(d);
     const t = thread.length ? thread : [d];
-    ui.expandIds = [id, ...t.filter((m) => !m.seen).map((m) => m.id)];
+    putThread(id, t);
+    const expandIds = [id, ...t.filter((m) => !m.seen).map((m) => m.id)];
+    ui.details = cachedDetailsFor(t.map((m) => m.id));
+    ui.detail = d;
+    ui.expandIds = expandIds;
     ui.thread = t;
+    upsertReaderPane(id, d, t, expandIds);
   } catch (e) {
     if (my === detailSeq) {
       ui.detail = null;
@@ -517,17 +666,8 @@ export async function openMessage(id: number | null) {
     clearTimeout(spinner);
     if (my === detailSeq) ui.detailLoading = false;
   }
-  const row = ui.list.find((m) => m.id === id);
-  if (row && !row.seen && my === detailSeq) {
-    row.seen = true;
-    if (ui.detail) ui.detail.seen = true;
-    for (const t of ui.thread) if (row.ids.includes(t.id)) t.seen = true;
-    api.setSeen(row.ids, true).then(loadFolders).catch((e) => {
-      toast(String(e));
-      loadList(true);
-      loadFolders();
-    });
-  }
+  markRowReadIfNeeded(id, my);
+  prewarmAround(id);
 }
 
 /** Picks up new or changed messages in the open conversation. */
@@ -537,7 +677,18 @@ export async function refreshThread() {
   const anchor = ui.detail?.id ?? id;
   try {
     const t = await api.thread(anchor);
-    if (ui.selectedId === id && t.length) ui.thread = t;
+    if (t.length) {
+      putThread(anchor, t);
+      updatePaneThread(anchor, t);
+      if (id !== anchor) {
+        putThread(id, t);
+        updatePaneThread(id, t);
+      }
+      if (ui.selectedId === id) {
+        ui.thread = t;
+        ui.details = cachedDetailsFor(t.map((m) => m.id));
+      }
+    }
   } catch {}
 }
 
@@ -706,7 +857,8 @@ export async function copyThread() {
   if (!d || ui.selectedIds.length > 1) return;
   const thread = ui.thread.length ? ui.thread : [d];
   try {
-    await api.copyText(await threadText(d.subject, thread, ui.details));
+    const known = { ...ui.details, ...cachedDetailsFor(thread.map((m) => m.id)) };
+    await api.copyText(await threadText(d.subject, thread, known));
     toast(thread.length > 1 ? `Copied ${thread.length} messages` : "Copied message");
   } catch (e) {
     toast(`Couldn't copy: ${e}`);
@@ -769,6 +921,7 @@ function deferBulk(label: string, rows: Summary[], call: (ids: number[]) => Prom
 
   const commit = () => {
     for (const id of rowIds) committingIds.add(id);
+    evictMessages(ids);
     run(call(ids)).finally(() => {
       for (const id of rowIds) committingIds.delete(id);
     });
@@ -825,6 +978,7 @@ export function toggleSeenRows(rows: Summary[]) {
   const ids = seen ? idsOf(rows) : rows.map((r) => r.id);
   for (const t of ui.thread) if (ids.includes(t.id)) t.seen = seen;
   if (ui.detail && ids.includes(ui.detail.id)) ui.detail.seen = seen;
+  updateCachedSeen(ids, seen);
   run(api.setSeen(ids, seen));
 }
 
@@ -839,6 +993,7 @@ export function toggleFlag() {
   const ids = flagged ? rows.map((r) => r.id) : idsOf(rows);
   for (const t of ui.thread) if (ids.includes(t.id)) t.flagged = flagged;
   if (ui.detail && ids.includes(ui.detail.id)) ui.detail.flagged = flagged;
+  updateCachedFlagged(ids, flagged);
   run(api.setFlagged(ids, flagged));
 }
 
@@ -848,6 +1003,7 @@ export async function markAllRead(view: MailView) {
     view.kind === "folder" ? fid === view.folderId : view.kind === "unified" && folderById(fid)?.role === view.role;
   for (const m of ui.list) if (inView(m.folderId)) m.seen = true;
   if (ui.detail && inView(ui.detail.folderId)) ui.detail.seen = true;
+  markCachedFolderRead(inView);
   for (const f of ui.folders) if (inView(f.id)) f.unread = 0;
   await run(api.markRead(view));
 }

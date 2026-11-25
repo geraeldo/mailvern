@@ -456,8 +456,10 @@ export function installMock() {
       case "set_ai_key": if (args.key) settings.__ai_key = args.key; else delete settings.__ai_key; return null;
       case "badge_count": return messages.filter((m) => !m.seen).length;
       case "mark_badge_seen": return null;
-      case "message": {
-        const m = messages.find((x) => x.id === args.id)!;
+      case "message":
+      case "cached_message": {
+        const m = messages.find((x) => x.id === args.id);
+        if (!m) return null;
         return {
           ...m,
           to: [{ name: "Alex Rivera", email: accounts[m.accountId - 1].email }],

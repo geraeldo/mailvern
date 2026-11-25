@@ -5,15 +5,14 @@
   import {
     ui, openMessage, loadMore, viewTitle, setQuery, openAccountSettings, openSettings, clickRow, isSelected, roleOf,
     editDraft, accountById, beginSearch, searchScopes, scopeKey, scopeLabel, setSearchScope, setView,
-    archiveRows, trashRows, toggleSeenRows, snoozeTargetRows, unsnoozeRows, compose, toggleSidebar,
-    aiSourceTurn, aiRunning,
+    compose, toggleSidebar, aiSourceTurn, aiRunning, prewarmMessage,
   } from "../state.svelte";
   import { hint } from "../shortcuts.svelte";
   import { messageMenu } from "../menus";
   import { shortDate, displayName } from "../format";
   import { whenLabel } from "../when";
   import { addrOf } from "../avatars.svelte";
-  import { api, type Summary } from "../api";
+  import { api } from "../api";
   import { ai, searchReady } from "../ai/config.svelte";
   import { runAiSearch, stopAiSearch } from "../ai/search.svelte";
 
@@ -144,14 +143,6 @@
     searchOpen = false;
     if (ui.query) setQuery("");
   }
-
-  function rowKey(m: Summary, e: KeyboardEvent) {
-    if (e.target !== e.currentTarget) return;
-    if (e.key === "Enter" || e.key === " ") {
-      e.preventDefault();
-      openMessage(m.id);
-    }
-  }
 </script>
 
 <section class="list">
@@ -277,16 +268,15 @@
         {/if}
         {#each visible as m, i (m.id)}
           {@const rowRole = roleOf(m)}
-          <div
-            role="button"
-            tabindex="0"
+          <button
+            type="button"
             class="row"
             class:unread={!m.seen}
             class:selected={isSelected(m.id)}
             class:multi={ui.selectedIds.length > 1}
             style:transform="translateY({(start + i) * ROW}px)"
+            onpointerenter={() => prewarmMessage(m.id)}
             onclick={(e) => clickRow(m, e)}
-            onkeydown={(e) => rowKey(m, e)}
             ondblclick={() => onDouble(m.id)}
             oncontextmenu={(e) => { e.preventDefault(); messageMenu(m); }}>
             <span class="mark">
@@ -300,51 +290,20 @@
                   {displayName(m.fromName, m.fromAddr) || "(no sender)"}
                 </span>
                 {#if m.count > 1}<span class="count">{m.count}</span>{/if}
-                <span class="meta-right">
-                  {#if m.flagged}<span class="flag"><Icon name="flag" size={12} stroke={2} /></span>{/if}
-                  {#if m.hasAttachments}<span class="clip"><Icon name="clip" size={12} stroke={2} /></span>{/if}
-                  {#if m.snoozedUntil}
-                    <span class="date snoozed" title="Comes back {whenLabel(new Date(m.snoozedUntil * 1000))}"><Icon name="clock" size={11} stroke={2} /> {whenLabel(new Date(m.snoozedUntil * 1000))}</span>
-                  {:else}
-                    <span class="date">{shortDate(m.date)}</span>
-                  {/if}
-                </span>
-                <span class="quick" role="group" aria-label="Quick actions">
-                  {#if rowRole !== "archive"}
-                    <button type="button" class="qbtn" title={hint("Archive", "archive")} aria-label="Archive" onclick={(e) => { e.stopPropagation(); archiveRows([m]); }}>
-                      <Icon name="archive" size={13} />
-                    </button>
-                  {/if}
-                  {#if rowRole !== "trash"}
-                    <button type="button" class="qbtn" title={hint("Delete", "delete")} aria-label="Delete" onclick={(e) => { e.stopPropagation(); trashRows([m]); }}>
-                      <Icon name="trash" size={13} />
-                    </button>
-                  {/if}
-                  <button
-                    type="button"
-                    class="qbtn"
-                    title={m.seen ? "Mark as unread" : "Mark as read"}
-                    aria-label={m.seen ? "Mark as unread" : "Mark as read"}
-                    onclick={(e) => { e.stopPropagation(); toggleSeenRows([m]); }}>
-                    <Icon name={m.seen ? "unread" : "mailOpen"} size={13} />
-                  </button>
-                  {#if rowRole !== "snoozed"}
-                    <button type="button" class="qbtn" title={hint("Snooze", "snooze")} aria-label="Snooze" onclick={(e) => { e.stopPropagation(); snoozeTargetRows([m]); }}>
-                      <Icon name="clock" size={13} />
-                    </button>
-                  {:else}
-                    <button type="button" class="qbtn" title="Unsnooze" aria-label="Unsnooze" onclick={(e) => { e.stopPropagation(); unsnoozeRows([m]); }}>
-                      <Icon name="clock" size={13} />
-                    </button>
-                  {/if}
-                </span>
+                {#if m.flagged}<span class="flag"><Icon name="flag" size={12} stroke={2} /></span>{/if}
+                {#if m.hasAttachments}<span class="clip"><Icon name="clip" size={12} stroke={2} /></span>{/if}
+                {#if m.snoozedUntil}
+                  <span class="date snoozed" title="Comes back {whenLabel(new Date(m.snoozedUntil * 1000))}"><Icon name="clock" size={11} stroke={2} /> {whenLabel(new Date(m.snoozedUntil * 1000))}</span>
+                {:else}
+                  <span class="date">{shortDate(m.date)}</span>
+                {/if}
               </span>
               <span class="subject">{m.subject || "(no subject)"}</span>
               <span class="snippet">
                 <span class="snip">{m.snippet}</span>
               </span>
             </span>
-          </div>
+          </button>
         {/each}
       </div>
     </div>
@@ -532,23 +491,6 @@
     color: var(--text-2);
   }
   .unread .from { font-weight: 650; color: var(--text); }
-  .meta-right { display: inline-flex; align-items: center; gap: 6px; flex: none; }
-  .quick { display: none; align-items: center; gap: 1px; flex: none; margin: -2px -4px -2px 0; }
-  .row:hover .meta-right, .row:focus-within .meta-right { display: none; }
-  .row:hover .quick, .row:focus-within .quick { display: inline-flex; }
-  .qbtn {
-    display: inline-grid;
-    place-items: center;
-    width: 24px;
-    height: 24px;
-    border: 0;
-    border-radius: 6px;
-    background: transparent;
-    color: var(--muted);
-    transition: background 0.1s, color 0.1s;
-  }
-  .qbtn:hover { background: var(--active); color: var(--text); }
-
   .date { flex: none; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
   .flag { color: var(--flag); display: grid; }
   .clip { color: var(--muted); display: grid; }

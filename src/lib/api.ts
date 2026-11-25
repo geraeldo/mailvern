@@ -281,6 +281,7 @@ export const api = {
   badgeCount: () => invoke<number>("badge_count"),
   markBadgeSeen: () => invoke<void>("mark_badge_seen"),
   message: (id: number) => invoke<Detail>("message", { id }),
+  cachedMessage: (id: number) => invoke<Detail | null>("cached_message", { id }),
   setSeen: (ids: number[], seen: boolean) => invoke<void>("set_seen", { ids, seen }),
   markRead: (view: MailView) => invoke<void>("mark_read", { view }),
   setFlagged: (ids: number[], flagged: boolean) => invoke<void>("set_flagged", { ids, flagged }),

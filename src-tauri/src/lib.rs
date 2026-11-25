@@ -175,6 +175,11 @@ async fn message(engine: E<'_>, id: i64) -> R<MessageDetail> {
 }
 
 #[tauri::command(async)]
+fn cached_message(engine: E, id: i64) -> R<Option<MessageDetail>> {
+    engine.cached_message(id).map_err(err)
+}
+
+#[tauri::command(async)]
 fn set_seen(engine: E, ids: Vec<i64>, seen: bool) -> R<()> {
     engine.set_seen(&ids, seen).map_err(err)
 }
@@ -676,6 +681,7 @@ pub fn run() {
             badge_count,
             mark_badge_seen,
             message,
+            cached_message,
             set_seen,
             mark_read,
             set_flagged,
