@@ -28,6 +28,8 @@ const UID_CHUNK: usize = 200;
 /// Prefetch chunk limits: cap both message count and cumulative size to avoid timeout loops.
 const PREFETCH_MAX_COUNT: usize = 15;
 const PREFETCH_MAX_BYTES: u32 = 4_000_000;
+/// Maximum size of any single email that will be predownloaded in the background (4 MiB).
+const PREFETCH_MAX_EMAIL_BYTES: u32 = 4 * 1024 * 1024;
 /// Maximum cached raw bodies per account before evicting oldest non-Inbox bodies.
 const MAX_BODY_CACHE_BYTES: i64 = 500 * 1024 * 1024;
 /// Liveness check threshold before reusing an idle worker IMAP session.
@@ -1320,13 +1322,7 @@ impl Worker {
     /// Deduplicates locally across folders/stashes first, packs chunks by byte budget,
     /// parses MIME off the async runtime, and commits each chunk in one transaction.
     async fn prefetch(&mut self, folder_id: i64, path: &str, role: Option<&str>, limit_override: Option<usize>) -> Result<()> {
-        let (default_limit, max_size) = match role {
-            Some("inbox") => (500, 12_000_000),
-            Some("sent") | Some("drafts") | Some("snoozed") | Some("archive") | None => (200, 8_000_000),
-            Some("all") => (200, 4_000_000),
-            Some("trash") | Some("junk") => (50, 2_000_000),
-            _ => (100, 4_000_000),
-        };
+        let (default_limit, max_size) = prefetch_policy(role);
         let limit = limit_override.map(|l| l.min(default_limit)).unwrap_or(default_limit);
         if limit == 0 {
             return Ok(());
@@ -1364,6 +1360,17 @@ impl Worker {
             self.drain_urgent().await;
         }
         Ok(())
+    }
+}
+
+/// Per-folder background body prefetch policy: `(max_messages, max_email_bytes)`.
+/// Never predownloads Trash or Junk; caps every email at 4 MiB.
+fn prefetch_policy(role: Option<&str>) -> (usize, u32) {
+    match role {
+        Some("trash") | Some("junk") => (0, 0),
+        Some("inbox") => (500, PREFETCH_MAX_EMAIL_BYTES),
+        Some("sent") | Some("drafts") | Some("snoozed") | Some("archive") | Some("all") | None => (200, PREFETCH_MAX_EMAIL_BYTES),
+        _ => (100, PREFETCH_MAX_EMAIL_BYTES),
     }
 }
 
@@ -1515,6 +1522,17 @@ async fn idle_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefetch_policy_skips_trash_and_junk_and_caps_at_4mb() {
+        assert_eq!(prefetch_policy(Some("trash")), (0, 0));
+        assert_eq!(prefetch_policy(Some("junk")), (0, 0));
+        for role in [Some("inbox"), Some("sent"), Some("drafts"), Some("snoozed"), Some("archive"), Some("all"), None] {
+            let (limit, max_bytes) = prefetch_policy(role);
+            assert!(limit > 0, "expected prefetch enabled for {role:?}");
+            assert_eq!(max_bytes, 4 * 1024 * 1024);
+        }
+    }
 
     #[test]
     fn prefetch_batches_respect_both_count_and_byte_budget() {

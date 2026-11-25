@@ -1297,10 +1297,11 @@ impl Db {
     }
 
     /// Recent messages missing bodies in `folder_id`, as `(uid, size)` pairs.
+    /// Skips messages whose headers indicate attachments or that exceed `max_size`.
     pub fn missing_bodies_with_size(&self, folder_id: i64, limit: usize, max_size: u32) -> Result<Vec<(u32, u32)>> {
         let c = self.r();
         let mut st = c.prepare(
-            "SELECT uid, size FROM messages WHERE folder_id = ? AND has_body = 0 AND size <= ? ORDER BY date DESC LIMIT ?",
+            "SELECT uid, size FROM messages WHERE folder_id = ? AND has_body = 0 AND has_attachments = 0 AND size <= ? ORDER BY date DESC LIMIT ?",
         )?;
         let rows = st
             .query_map(params![folder_id, max_size, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -1327,6 +1328,8 @@ impl Db {
     }
 
     /// Stores a whole batch of prefetched bodies in a single SQLite transaction.
+    /// Messages that turn out to have attachments are NOT stored in `bodies` (only flagged
+    /// `has_attachments = 1` so future prefetch passes skip them).
     pub fn store_bodies_batch(&self, folder_id: i64, items: &[(u32, Vec<u8>, BodyInfo)]) -> Result<usize> {
         if items.is_empty() {
             return Ok(0);
@@ -1337,13 +1340,18 @@ impl Db {
         {
             let mut find_id = tx.prepare("SELECT id FROM messages WHERE folder_id = ? AND uid = ?")?;
             let mut ins_body = tx.prepare("INSERT OR REPLACE INTO bodies (message_id, raw) VALUES (?, ?)")?;
-            let mut upd_msg = tx.prepare("UPDATE messages SET has_body = 1, snippet = ?, has_attachments = ? WHERE id = ?")?;
+            let mut upd_msg = tx.prepare("UPDATE messages SET has_body = 1, snippet = ?, has_attachments = 0 WHERE id = ?")?;
+            let mut mark_att = tx.prepare("UPDATE messages SET has_attachments = 1 WHERE id = ?")?;
             let mut upd_fts = tx.prepare("UPDATE messages_fts SET body = ? WHERE rowid = ?")?;
             for (uid, raw, info) in items {
                 let id: Option<i64> = find_id.query_row(params![folder_id, uid], |r| r.get(0)).optional()?;
                 if let Some(id) = id {
+                    if info.has_attachments {
+                        mark_att.execute(params![id])?;
+                        continue;
+                    }
                     ins_body.execute(params![id, raw.as_slice()])?;
-                    upd_msg.execute(params![info.snippet, info.has_attachments, id])?;
+                    upd_msg.execute(params![info.snippet, id])?;
                     upd_fts.execute(params![info.search_text, id])?;
                     stored += 1;
                 }
@@ -3124,6 +3132,44 @@ mod tests {
 
         // Prune evicts oldest bodies when account exceeds max_bytes (keeping snippet/FTS).
         assert!(db.prune_old_bodies(acc, 500).unwrap() >= 1);
+    }
+
+    #[test]
+    fn prefetch_skips_attachments_and_oversized_messages() {
+        let db = Db::open(&temp_db()).unwrap();
+        let acc = db.save_account(&account()).unwrap();
+        let inbox = db.upsert_folder(acc, "INBOX", "Inbox", Some("inbox")).unwrap();
+
+        let mut plain = mail(1, "<p1>", None, None, 100);
+        plain.size = 50_000;
+        let mut with_att_hdr = mail(2, "<a2>", None, None, 200);
+        with_att_hdr.has_attachments = true;
+        with_att_hdr.size = 50_000;
+        let mut oversized = mail(3, "<big3>", None, None, 300);
+        oversized.size = 4 * 1024 * 1024 + 1;
+        let mut hidden_att = mail(4, "<ha4>", None, None, 400);
+        hidden_att.size = 100_000;
+
+        let ids = db.insert_messages(acc, inbox, &[plain, with_att_hdr, oversized, hidden_att]).unwrap();
+        let missing = db.missing_bodies_with_size(inbox, 100, 4 * 1024 * 1024).unwrap();
+        // UID 2 (has_attachments=1) and UID 3 (>4MB) are excluded; UID 1 and UID 4 are eligible.
+        assert_eq!(missing.iter().map(|(u, _)| *u).collect::<Vec<_>>(), vec![4, 1]);
+
+        // If UID 4 turns out to have attachments on parse, store_bodies_batch does NOT store its body.
+        let stored = db
+            .store_bodies_batch(
+                inbox,
+                &[
+                    (1, b"plain body".to_vec(), BodyInfo { snippet: "plain".into(), search_text: "plain".into(), has_attachments: false }),
+                    (4, b"has pdf".to_vec(), BodyInfo { snippet: "pdf".into(), search_text: "pdf".into(), has_attachments: true }),
+                ],
+            )
+            .unwrap();
+        assert_eq!(stored, 1);
+        assert!(db.body(ids[0]).unwrap().is_some());
+        assert!(db.body(ids[3]).unwrap().is_none());
+        // And future prefetch queries now skip UID 4 too.
+        assert!(db.missing_bodies_with_size(inbox, 100, 4 * 1024 * 1024).unwrap().is_empty());
     }
 
     #[test]
