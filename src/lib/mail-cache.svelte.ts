@@ -14,6 +14,10 @@ const MAX_PANES = 8;
 const MAX_DOCS = 40;
 /** Max remembered iframe heights. */
 const MAX_HEIGHTS = 120;
+/** Max remote image URLs tracked as preloaded (trusted senders only). */
+const MAX_PRELOADED_URLS = 400;
+/** Rolling buffer of preloaded Image elements to keep decoded bitmaps warm in WebKit MemoryCache. */
+const MAX_WARM_IMAGES = 60;
 
 export type ReaderPane = {
   id: number;
@@ -42,6 +46,10 @@ const docs = new Map<string, string>();
 
 /** Last measured iframe height per message id. */
 const heights = new Map<number, number>();
+
+/** Remote image URLs already preloaded into WebKit cache (trusted senders only). */
+const preloadedUrls = new Set<string>();
+const warmImages: HTMLImageElement[] = [];
 
 /** Keep-alive pool of recently opened reader panes (oldest first, most recent last). */
 export const readerPool = $state<{ panes: ReaderPane[] }>({ panes: [] });
@@ -217,6 +225,29 @@ export function setCachedFrameHeight(cacheKey: number | undefined, px: number) {
   }
 }
 
+/**
+ * Preloads remote image URLs into the webview's HTTP/memory cache.
+ * Caller MUST ensure the sender is explicitly trusted (never call for untrusted senders).
+ */
+export function preloadRemoteImages(urls: string[]) {
+  if (typeof Image === "undefined" || !urls.length) return;
+  for (const url of urls) {
+    if (preloadedUrls.has(url)) continue;
+    preloadedUrls.add(url);
+    while (preloadedUrls.size > MAX_PRELOADED_URLS) {
+      const oldest = preloadedUrls.values().next().value;
+      if (oldest === undefined) break;
+      preloadedUrls.delete(oldest);
+    }
+    const img = new Image();
+    img.referrerPolicy = "no-referrer";
+    img.decoding = "async";
+    img.src = url;
+    warmImages.push(img);
+    while (warmImages.length > MAX_WARM_IMAGES) warmImages.shift();
+  }
+}
+
 // ---------- cache coherence ----------
 
 export function updateCachedSeen(ids: number[], seen: boolean) {
@@ -313,6 +344,8 @@ export function clearMailCache() {
   shownImages.clear();
   docs.clear();
   heights.clear();
+  preloadedUrls.clear();
+  warmImages.length = 0;
   readerPool.panes = [];
 }
 

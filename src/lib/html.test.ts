@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { emailWrap, frameDoc, hasRemoteContent, htmlToText, prefixed, sanitize, textToHtml, unwrapEmail } from "./html";
+import { emailWrap, extractRemoteImageUrls, frameDoc, hasRemoteContent, htmlToText, prefixed, sanitize, textToHtml, unwrapEmail } from "./html";
 
 describe("sanitize", () => {
   it("keeps safe markup, safe links, raster data images, and allowlisted styles", () => {
@@ -69,6 +69,25 @@ describe("hasRemoteContent", () => {
     expect(hasRemoteContent(`<link rel="stylesheet" href="https://a.test/x.css">`)).toBe(true);
     expect(hasRemoteContent(`<img src="data:image/png;base64,AQID">`)).toBe(false);
     expect(hasRemoteContent(`<a href="https://example.com">link</a>`)).toBe(false);
+  });
+});
+
+describe("extractRemoteImageUrls", () => {
+  it("extracts deduplicated http(s) img src and srcset URLs while skipping data URIs and 1x1 pixels", () => {
+    const html = [
+      `<img src="https://cdn.example.com/hero.png">`,
+      `<img src="https://cdn.example.com/hero.png">`,
+      `<img src="//cdn.example.com/banner.jpg" srcset="https://cdn.example.com/banner@2x.jpg 2x">`,
+      `<img src="data:image/png;base64,AQID">`,
+      `<img src="https://track.example.com/open.gif" width="1" height="1">`,
+      `<img src="https://track.example.com/zero.gif" width="0" height="0">`,
+    ].join("");
+
+    expect(extractRemoteImageUrls(html)).toEqual([
+      "https://cdn.example.com/hero.png",
+      "https://cdn.example.com/banner.jpg",
+      "https://cdn.example.com/banner@2x.jpg",
+    ]);
   });
 });
 

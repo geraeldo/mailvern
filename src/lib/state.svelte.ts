@@ -3,13 +3,13 @@ import {
 } from "./api";
 import { formatAddr } from "./format";
 import { threadText } from "./copy";
-import { textToHtml, unwrapEmail } from "./html";
+import { extractRemoteImageUrls, textToHtml, unwrapEmail } from "./html";
 import { extractEmailAddress, isRemoteImageAllowed, normalizeTrustEntry } from "./trust";
 import { toUnix, whenLabel } from "./when";
 import {
   cachedDetailsFor, cachedFrameDoc, clearMailCache, evictMessages, getCachedDetail, getCachedThread, hasShownImages,
-  markCachedFolderRead, peekCachedDetail, putDetail, putThread, updateCachedFlagged, updateCachedSeen, updatePaneThread,
-  upsertReaderPane,
+  markCachedFolderRead, peekCachedDetail, preloadRemoteImages, putDetail, putThread, updateCachedFlagged,
+  updateCachedSeen, updatePaneThread, upsertReaderPane,
 } from "./mail-cache.svelte";
 
 export type ComposeMode = "new" | "reply" | "replyAll" | "forward" | "draft";
@@ -523,11 +523,19 @@ export async function prewarmMessage(id: number): Promise<void> {
     putDetail(d);
     const t = thread.length ? thread : [d];
     putThread(id, t);
-    // Pre-run DOMParser inertly (no network/image loads) so opening skips main-thread parsing.
+    // Pre-run DOMParser inertly so opening skips main-thread parsing.
     const isPlain = !d.html;
     const body = d.html ?? textToHtml(d.text ?? "");
-    const allowRemote = isSenderTrusted(d.fromAddr) || hasShownImages(id);
+    const trusted = isSenderTrusted(d.fromAddr);
+    const allowRemote = trusted || hasShownImages(id);
     cachedFrameDoc(id, body, allowRemote, isPlain);
+    // Preload remote images ONLY when the sender is allowed (never for untrusted senders, junk, or trash).
+    if (d.html && trusted) {
+      const role = roleOf(d);
+      if (role !== "junk" && role !== "trash") {
+        preloadRemoteImages(extractRemoteImageUrls(d.html));
+      }
+    }
   } finally {
     prewarmInFlight.delete(id);
   }

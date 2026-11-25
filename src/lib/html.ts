@@ -20,6 +20,55 @@ export function hasRemoteContent(html: string): boolean {
   return REMOTE.test(html);
 }
 
+const MAX_PRELOAD_IMAGES = 24;
+
+function normalizeHttpUrl(raw: string): string | null {
+  const s = raw.trim();
+  if (!s) return null;
+  if (s.startsWith("//")) return `https:${s}`;
+  if (/^https?:\/\//i.test(s)) return s;
+  return null;
+}
+
+function isTinyPixel(el: Element): boolean {
+  const w = el.getAttribute("width")?.trim();
+  const h = el.getAttribute("height")?.trim();
+  return (w === "0" || w === "1") && (h === "0" || h === "1");
+}
+
+/**
+ * Extracts deduplicated remote http(s) image URLs from email HTML for background preloading
+ * (only called for explicitly trusted senders). Skips explicit 0x0 / 1x1 tracking pixels.
+ */
+export function extractRemoteImageUrls(html: string): string[] {
+  if (!hasRemoteContent(html)) return [];
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const urls: string[] = [];
+  const seen = new Set<string>();
+  const add = (raw: string | null | undefined) => {
+    if (!raw || urls.length >= MAX_PRELOAD_IMAGES) return;
+    const u = normalizeHttpUrl(raw);
+    if (u && !seen.has(u)) {
+      seen.add(u);
+      urls.push(u);
+    }
+  };
+
+  for (const img of doc.querySelectorAll("img")) {
+    if (isTinyPixel(img)) continue;
+    add(img.getAttribute("src"));
+    const srcset = img.getAttribute("srcset");
+    if (srcset) {
+      for (const candidate of srcset.split(",")) {
+        const first = candidate.trim().split(/\s+/)[0];
+        add(first);
+      }
+    }
+    if (urls.length >= MAX_PRELOAD_IMAGES) break;
+  }
+  return urls;
+}
+
 /**
  * Prepares untrusted email HTML for the sandboxed reading frame:
  * - Removes `<meta>` (preventing `<meta http-equiv="refresh">` zero-click navigation),
