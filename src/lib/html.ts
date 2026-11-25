@@ -33,7 +33,72 @@ function normalizeHttpUrl(raw: string): string | null {
 function isTinyPixel(el: Element): boolean {
   const w = el.getAttribute("width")?.trim();
   const h = el.getAttribute("height")?.trim();
-  return (w === "0" || w === "1") && (h === "0" || h === "1");
+  if ((w === "0" || w === "1") && (h === "0" || h === "1")) return true;
+  if (w === "0" || h === "0") return true;
+  const style = el.getAttribute("style");
+  if (style) {
+    if (/(?:^|;)\s*display\s*:\s*none\b/i.test(style)) return true;
+    if (/(?:^|;)\s*visibility\s*:\s*hidden\b/i.test(style)) return true;
+    if (/(?:^|;)\s*opacity\s*:\s*0(?:\.0+)?(?:\s*;|\s*$)/i.test(style)) return true;
+    const sw = style.match(/(?:^|;)\s*width\s*:\s*(\d+(?:\.\d+)?)\s*(?:px)?(?:\s*!important)?\s*(?:;|$)/i);
+    const sh = style.match(/(?:^|;)\s*height\s*:\s*(\d+(?:\.\d+)?)\s*(?:px)?(?:\s*!important)?\s*(?:;|$)/i);
+    const wn = sw ? Number(sw[1]) : null;
+    const hn = sh ? Number(sh[1]) : null;
+    if (wn === 0 || hn === 0) return true;
+    if (wn != null && hn != null && wn <= 1 && hn <= 1) return true;
+  }
+  return false;
+}
+
+/** Known email open-tracking hosts (matched on hostname or subdomain). */
+const TRACKER_HOSTS = [
+  "mailtrack.io", "mltrk.io", "emltrk.com", "t.yesware.com", "app.yesware.com",
+  "track.hubspot.com", "bananatag.com", "getnotify.com", "boomeranggmail.com",
+  "doubleclick.net", "google-analytics.com", "px.ads.linkedin.com", "bat.bing.com",
+  "pixel.inbox.exacttarget.com", "open.substack.com", "clicks.aweber.com",
+  "trk.klclick.com", "trk.klclick1.com", "trk.klclick2.com", "trk.klclick3.com",
+];
+
+/** Known email open-tracking URL patterns across major ESPs and tracking services. */
+const TRACKER_URL_PATTERNS = [
+  /\.sidekickopen\d*\.com\//i,
+  /^https?:\/\/open\.convertkit-mail\d*\.com\//i,
+  /^https?:\/\/[^/]*\.mandrillapp\.com\/track\/open/i,
+  /^https?:\/\/[^/]*\.sendgrid\.net\/wf\/open/i,
+  /^https?:\/\/[^/]*\.list-manage\.com\/track\/open/i,
+  /^https?:\/\/[^/]*\.mailchimp\.com\/track\/open/i,
+  /^https?:\/\/[^/]*\.intercom-mail\.com\/o\b/i,
+  /^https?:\/\/[^/]*\.mixmax\.com\/api\/track/i,
+  /^https?:\/\/[^/]*\.streak\.com\/.*pixel/i,
+  /^https?:\/\/(?:www\.)?facebook\.com\/tr\b/i,
+  /\/(?:track\/open|wf\/open|email\/open|open\.gif|pixel\.gif|beacon\.gif)(?:[/?#]|$)/i,
+];
+
+/** Returns true if a remote image URL looks like an email open-tracking pixel. */
+export function isTrackerUrl(raw: string): boolean {
+  const url = normalizeHttpUrl(raw);
+  if (!url) return false;
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    for (const h of TRACKER_HOSTS) {
+      if (host === h || host.endsWith(`.${h}`)) return true;
+    }
+  } catch {
+    return false;
+  }
+  return TRACKER_URL_PATTERNS.some((re) => re.test(url));
+}
+
+function stripTrackingImages(doc: Document) {
+  for (const img of Array.from(doc.querySelectorAll("img"))) {
+    const src = img.getAttribute("src") ?? "";
+    const srcset = img.getAttribute("srcset") ?? "";
+    const hasRemoteSrc = !!normalizeHttpUrl(src) || srcset.split(",").some((c) => !!normalizeHttpUrl(c.trim().split(/\s+/)[0] ?? ""));
+    if (!hasRemoteSrc) continue;
+    if (isTinyPixel(img) || isTrackerUrl(src) || srcset.split(",").some((c) => isTrackerUrl(c.trim().split(/\s+/)[0] ?? ""))) {
+      img.remove();
+    }
+  }
 }
 
 /**
@@ -48,7 +113,7 @@ export function extractRemoteImageUrls(html: string): string[] {
   const add = (raw: string | null | undefined) => {
     if (!raw || urls.length >= MAX_PRELOAD_IMAGES) return;
     const u = normalizeHttpUrl(raw);
-    if (u && !seen.has(u)) {
+    if (u && !isTrackerUrl(u) && !seen.has(u)) {
       seen.add(u);
       urls.push(u);
     }
@@ -76,10 +141,11 @@ export function extractRemoteImageUrls(html: string): string[] {
  * - Drops `target` attributes via DOM APIs so every link navigates the frame itself
  *   and is intercepted cleanly by the app's external-link handler.
  */
-function prepareFrameBody(html: string): string {
+function prepareFrameBody(html: string, stripTrackers = false): string {
   const doc = new DOMParser().parseFromString(html, "text/html");
   doc.querySelectorAll("script, meta, base, iframe, object, embed, applet, frame, frameset, portal").forEach((n) => n.remove());
   doc.querySelectorAll("a[target], area[target]").forEach((el) => el.removeAttribute("target"));
+  if (stripTrackers) stripTrackingImages(doc);
   // Preserve <style> blocks that originally lived in <head> (DOMParser puts them in doc.head).
   const headStyles = Array.from(doc.head.querySelectorAll("style"))
     .map((s) => s.outerHTML)
@@ -88,7 +154,7 @@ function prepareFrameBody(html: string): string {
 }
 
 /** A self-contained document for the sandboxed reading frame. Scripts never run. */
-export function frameDoc(body: string, allowRemote: boolean, plain = false): string {
+export function frameDoc(body: string, allowRemote: boolean, plain = false, stripTrackers = false): string {
   const remote = allowRemote ? " https: http:" : "";
   const csp = `default-src 'none'; img-src data: cid:${remote}; style-src 'unsafe-inline'${remote}; font-src data:${remote}; media-src data:${remote}`;
   const colorScheme = plain ? "light dark" : "light";
@@ -112,7 +178,7 @@ export function frameDoc(body: string, allowRemote: boolean, plain = false): str
   pre{white-space:pre-wrap}
   a{color:#2459e0}
   blockquote{margin:0 0 0 2px;padding-left:12px;border-left:2px solid #e3e1dc;color:#55524c}
-</style>${darkOverride}</head><body>${prepareFrameBody(body)}</body></html>`;
+</style>${darkOverride}</head><body>${prepareFrameBody(body, stripTrackers)}</body></html>`;
 }
 
 const XHTML_NS = "http://www.w3.org/1999/xhtml";

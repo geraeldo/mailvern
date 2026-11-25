@@ -58,6 +58,27 @@ describe("frameDoc", () => {
     const remoteDoc = frameDoc(`<img src="https://ok.test/a.png">`, true);
     expect(remoteDoc).toContain("img-src data: cid: https: http:");
   });
+
+  it("strips tracking pixels and known tracker domains when stripTrackers is enabled", () => {
+    const html = [
+      `<img src="https://cdn.example.com/photo.jpg" width="400" height="300">`,
+      `<img src="https://cdn.example.com/tiny.gif" width="1" height="1">`,
+      `<img src="https://cdn.example.com/hidden.png" style="display:none">`,
+      `<img src="https://mailtrack.io/trace/mail/abc123.png">`,
+      `<img src="https://u123.ct.sendgrid.net/wf/open?upn=xyz">`,
+      `<img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" width="1" height="1">`,
+    ].join("");
+    const stripped = frameDoc(html, true, false, true);
+    expect(stripped).toContain("https://cdn.example.com/photo.jpg");
+    expect(stripped).toContain("data:image/gif;base64");
+    expect(stripped).not.toContain("tiny.gif");
+    expect(stripped).not.toContain("hidden.png");
+    expect(stripped).not.toContain("mailtrack.io");
+    expect(stripped).not.toContain("sendgrid.net/wf/open");
+
+    const unstripped = frameDoc(html, true, false, false);
+    expect(unstripped).toContain("mailtrack.io");
+  });
 });
 
 describe("hasRemoteContent", () => {

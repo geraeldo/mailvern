@@ -192,15 +192,21 @@ export function markShownImages(id: number) {
 }
 
 /** Cached `frameDoc` builder to avoid repeated DOMParser passes on the same message. */
-export function cachedFrameDoc(cacheKey: number | undefined, html: string, allowRemote: boolean, plain: boolean): string {
-  if (cacheKey == null) return frameDoc(html, allowRemote, plain);
-  const key = `${cacheKey}:${allowRemote ? 1 : 0}:${plain ? 1 : 0}`;
+export function cachedFrameDoc(
+  cacheKey: number | undefined,
+  html: string,
+  allowRemote: boolean,
+  plain: boolean,
+  stripTrackers = false,
+): string {
+  if (cacheKey == null) return frameDoc(html, allowRemote, plain, stripTrackers);
+  const key = `${cacheKey}:${allowRemote ? 1 : 0}:${plain ? 1 : 0}:${stripTrackers ? 1 : 0}`;
   const hit = docs.get(key);
   if (hit !== undefined) {
     touchMap(docs, key, hit);
     return hit;
   }
-  const built = frameDoc(html, allowRemote, plain);
+  const built = frameDoc(html, allowRemote, plain, stripTrackers);
   touchMap(docs, key, built);
   while (docs.size > MAX_DOCS) {
     const oldest = docs.keys().next().value;

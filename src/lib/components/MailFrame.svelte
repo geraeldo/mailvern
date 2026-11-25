@@ -2,13 +2,19 @@
   import { untrack } from "svelte";
   import { cachedFrameDoc, getCachedFrameHeight, setCachedFrameHeight } from "../mail-cache.svelte";
 
-  let { html, allowRemote, plain = false, cacheKey }: { html: string; allowRemote: boolean; plain?: boolean; cacheKey?: number } = $props();
+  let {
+    html,
+    allowRemote,
+    plain = false,
+    stripTrackers = false,
+    cacheKey,
+  }: { html: string; allowRemote: boolean; plain?: boolean; stripTrackers?: boolean; cacheKey?: number } = $props();
   let frame: HTMLIFrameElement;
   let h = $state(untrack(() => getCachedFrameHeight(cacheKey) ?? 40));
   let ro: ResizeObserver | undefined;
   let watched: HTMLElement | null = null;
 
-  const doc = $derived(cachedFrameDoc(cacheKey, html, allowRemote, plain));
+  const doc = $derived(cachedFrameDoc(cacheKey, html, allowRemote, plain, stripTrackers));
 
   // Starts sizing the frame to the current document's body once it has been parsed. Returns false
   // while the frame still shows the previous document (or the initial blank one).

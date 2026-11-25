@@ -4,7 +4,7 @@ import {
 import { formatAddr } from "./format";
 import { threadText } from "./copy";
 import { extractRemoteImageUrls, textToHtml, unwrapEmail } from "./html";
-import { extractEmailAddress, isRemoteImageAllowed, normalizeTrustEntry } from "./trust";
+import { extractEmailAddress, isRemoteImageAllowed, validateTrustEntry, type TrustEntryResult } from "./trust";
 import { toUnix, whenLabel } from "./when";
 import {
   cachedDetailsFor, cachedFrameDoc, clearMailCache, evictMessages, getCachedDetail, getCachedThread, hasShownImages,
@@ -17,7 +17,7 @@ export type ComposeMode = "new" | "reply" | "replyAll" | "forward" | "draft";
 export type Restore = { message: Outgoing; attachments: FileInfo[]; unsaved?: boolean };
 export type ComposeInit = { mode: ComposeMode; source?: Detail; accountId?: number; to?: string[]; restore?: Restore; key: number };
 export type SettingsSection = "general" | "accounts" | "rules" | "ai" | "agents" | "shortcuts";
-export type RemoteImagesMode = "ask" | "always";
+export type RemoteImagesMode = "ask" | "strip_trackers" | "always";
 export type SyncStatus = { state: "syncing" | "idle" | "error"; message: string | null };
 /** One thing AI search did, shown while it works. */
 export type AiStep = { kind: "search" | "read" | "attachment" | "count" | "thread" | "folders" | "note"; text: string; done: boolean; error?: boolean };
@@ -246,7 +246,7 @@ export async function loadPrefs() {
   const lw = Number(listW);
   if (listW != null && Number.isFinite(lw) && lw >= 260 && lw <= 480) ui.listWidth = lw;
   ui.sidebarCollapsed = sideCol === "on";
-  ui.remoteImages = remoteImg === "always" ? "always" : "ask";
+  ui.remoteImages = remoteImg === "always" || remoteImg === "strip_trackers" ? remoteImg : "ask";
   ui.autoTrustSent = autoTrust !== "off";
 }
 
@@ -528,7 +528,8 @@ export async function prewarmMessage(id: number): Promise<void> {
     const body = d.html ?? textToHtml(d.text ?? "");
     const trusted = isSenderTrusted(d.fromAddr);
     const allowRemote = trusted || hasShownImages(id);
-    cachedFrameDoc(id, body, allowRemote, isPlain);
+    const stripTrackers = shouldStripTrackers(d.fromAddr);
+    cachedFrameDoc(id, body, allowRemote, isPlain, stripTrackers);
     // Preload remote images ONLY when the sender is allowed (never for untrusted senders, junk, or trash).
     if (d.html && trusted) {
       const role = roleOf(d);
@@ -1172,15 +1173,24 @@ export function noteSentRecipients(addrs: string[]) {
   if (next) ui.sentRecipients = next;
 }
 
-export function isSenderTrusted(email: string): boolean {
+function isExplicitlyTrusted(email: string): boolean {
   const ownEmails = new Set(ui.accounts.map((a) => a.email.toLowerCase()));
   return isRemoteImageAllowed(email, {
-    always: ui.remoteImages === "always",
+    always: false,
     entries: ui.trustedSenders,
     autoTrustSent: ui.autoTrustSent,
     sentRecipients: ui.sentRecipients,
     ownEmails,
   });
+}
+
+export function isSenderTrusted(email: string): boolean {
+  if (ui.remoteImages === "always" || ui.remoteImages === "strip_trackers") return true;
+  return isExplicitlyTrusted(email);
+}
+
+export function shouldStripTrackers(email: string): boolean {
+  return ui.remoteImages === "strip_trackers" && !isExplicitlyTrusted(email);
 }
 
 export async function loadTrusted() {
@@ -1192,17 +1202,17 @@ export async function loadTrusted() {
   if (ui.autoTrustSent) await loadSentRecipients();
 }
 
-export async function trustSender(entry: string): Promise<boolean> {
-  const normalized = normalizeTrustEntry(entry);
-  if (!normalized) return false;
-  if (!ui.trustedSenders.includes(normalized)) {
-    ui.trustedSenders = [...ui.trustedSenders, normalized];
+export async function trustSender(entry: string): Promise<TrustEntryResult> {
+  const res = validateTrustEntry(entry);
+  if (!res.ok) return res;
+  if (!ui.trustedSenders.includes(res.entry)) {
+    ui.trustedSenders = [...ui.trustedSenders, res.entry];
     await api.setSetting("trusted_senders", JSON.stringify(ui.trustedSenders));
   }
-  return true;
+  return res;
 }
 
-export async function trustDomain(domain: string): Promise<boolean> {
+export async function trustDomain(domain: string): Promise<TrustEntryResult> {
   return trustSender(`@${domain.trim().replace(/^@+/, "")}`);
 }
 

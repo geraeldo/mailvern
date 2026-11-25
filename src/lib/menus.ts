@@ -3,6 +3,7 @@ import type { Account, Addr, Detail, MailView, Summary } from "./api";
 import { api } from "./api";
 import { formatAddr } from "./format";
 import { openRuleEditor, ruleFromAddress, ruleFromMessage, describeFromMessage, type FromMessage } from "./rules.svelte";
+import { isSharedEmailDomain } from "./trust";
 import {
   ui, openAccountSettings, openMessage, compose, archiveSelected, trashSelected, toggleJunk, selectedIsJunk, toggleSeen, toggleFlag, markAllRead,
   toast, setQuery, isSenderTrusted, trustSender, trustDomain, checkForMail, checkAccountForMail, copyThread, selectedRows, snoozeSelected, unsnoozeSelected, moveRows, moveSelected, roleOf, editDraft,
@@ -135,6 +136,7 @@ export function addressMenu(e: MouseEvent, a: Addr, d?: Detail, sender = false) 
   const email = a.email.toLowerCase();
   const mine = ui.accounts.some((x) => x.email.toLowerCase() === email);
   const domain = email.split("@")[1] ?? "";
+  const canTrustDomain = !!domain && !isSharedEmailDomain(domain);
   const accountId = d?.accountId ?? null;
   const trusted = isSenderTrusted(email);
   return popup([
@@ -157,7 +159,7 @@ export function addressMenu(e: MouseEvent, a: Addr, d?: Detail, sender = false) 
     ...(sender && !mine && !trusted ? [
       "-" as const,
       { text: "Always Load Images from This Sender", action: () => trustSender(a.email) },
-      ...(domain ? [{ text: `Always Load Images from @${domain}`, action: () => trustDomain(domain) }] : []),
+      ...(canTrustDomain ? [{ text: `Always Load Images from @${domain}`, action: () => trustDomain(domain) }] : []),
     ] : []),
   ]);
 }

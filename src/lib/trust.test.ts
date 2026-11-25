@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { emailDomain, extractEmailAddress, isRemoteImageAllowed, isTrustedEntry, normalizeTrustEntry } from "./trust";
+import {
+  emailDomain, extractEmailAddress, isRemoteImageAllowed, isSharedEmailDomain,
+  isTrustedEntry, normalizeTrustEntry, trustableDomain, validateTrustEntry,
+} from "./trust";
 
 describe("emailDomain", () => {
   it("extracts lowercased domain", () => {
@@ -78,5 +81,33 @@ describe("extractEmailAddress", () => {
   it("handles bare and display-name formatted addresses", () => {
     expect(extractEmailAddress("Alice <Alice@Example.com>")).toBe("alice@example.com");
     expect(extractEmailAddress("bob@example.com")).toBe("bob@example.com");
+  });
+});
+
+describe("shared email provider guardrails", () => {
+  it("detects shared webmail providers including country TLDs", () => {
+    expect(isSharedEmailDomain("gmail.com")).toBe(true);
+    expect(isSharedEmailDomain("@Gmail.com")).toBe(true);
+    expect(isSharedEmailDomain("yahoo.co.id")).toBe(true);
+    expect(isSharedEmailDomain("hotmail.co.uk")).toBe(true);
+    expect(isSharedEmailDomain("icloud.com")).toBe(true);
+    expect(isSharedEmailDomain("proton.me")).toBe(true);
+    expect(isSharedEmailDomain("github.com")).toBe(false);
+    expect(isSharedEmailDomain("mail.stripe.com")).toBe(false);
+  });
+
+  it("returns empty trustableDomain for shared providers and real domain for orgs", () => {
+    expect(trustableDomain("alice@gmail.com")).toBe("");
+    expect(trustableDomain("bob@yahoo.co.jp")).toBe("");
+    expect(trustableDomain("noreply@github.com")).toBe("github.com");
+    expect(trustableDomain("receipts@mail.stripe.com")).toBe("mail.stripe.com");
+  });
+
+  it("blocks domain-level trust for shared providers while allowing exact addresses", () => {
+    expect(validateTrustEntry("gmail.com")).toEqual({ ok: false, reason: "shared_provider", domain: "gmail.com" });
+    expect(validateTrustEntry("@outlook.com")).toEqual({ ok: false, reason: "shared_provider", domain: "outlook.com" });
+    expect(validateTrustEntry("alice@gmail.com")).toEqual({ ok: true, entry: "alice@gmail.com" });
+    expect(validateTrustEntry("github.com")).toEqual({ ok: true, entry: "@github.com" });
+    expect(validateTrustEntry("not valid")).toEqual({ ok: false, reason: "invalid" });
   });
 });

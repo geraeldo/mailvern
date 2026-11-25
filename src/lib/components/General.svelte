@@ -9,6 +9,7 @@
   const UNDO = [0, 5, 10, 20, 30];
   const REMOTE_MODES: { value: RemoteImagesMode; label: string }[] = [
     { value: "ask", label: "Ask before loading" },
+    { value: "strip_trackers", label: "Block trackers only" },
     { value: "always", label: "Always load" },
   ];
 
@@ -19,9 +20,12 @@
     e.preventDefault();
     const raw = newTrust.trim();
     if (!raw) return;
-    if (await trustSender(raw)) {
+    const res = await trustSender(raw);
+    if (res.ok) {
       newTrust = "";
       trustError = "";
+    } else if (res.reason === "shared_provider") {
+      trustError = `${res.domain} is a shared email provider — trust a specific email address instead.`;
     } else {
       trustError = "Enter a valid email address or domain (e.g. alice@example.com or @github.com).";
     }

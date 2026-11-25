@@ -2,13 +2,13 @@
   import { onMount, untrack } from "svelte";
   import Icon from "./Icon.svelte";
   import MailFrame from "./MailFrame.svelte";
-  import { ui, compose, accountById, accountLabel, isSenderTrusted, trustSender, trustDomain, toast, roleOf, editDraft } from "../state.svelte";
+  import { ui, compose, accountById, accountLabel, isSenderTrusted, shouldStripTrackers, trustSender, trustDomain, toast, roleOf, editDraft } from "../state.svelte";
   import { api, type Addr, type Summary } from "../api";
   import { longDate, shortDate, displayName, fileSize } from "../format";
   import Avatar from "./Avatar.svelte";
   import { addressMenu } from "../menus";
   import { hasRemoteContent, textToHtml } from "../html";
-  import { emailDomain } from "../trust";
+  import { trustableDomain } from "../trust";
   import { getCachedDetail, hasShownImages, markShownImages, putDetail } from "../mail-cache.svelte";
 
   let {
@@ -27,9 +27,10 @@
   const isPlain = $derived(!!d && !d.html);
   const body = $derived(d ? (d.html ?? textToHtml(d.text ?? "")) : "");
   const remote = $derived(!!d?.html && hasRemoteContent(d.html));
-  const domain = $derived(emailDomain(m.fromAddr));
+  const domain = $derived(trustableDomain(m.fromAddr));
   const trusted = $derived(isSenderTrusted(m.fromAddr));
   const allowRemote = $derived(trusted || hasShownImages(m.id));
+  const stripTrackers = $derived(shouldStripTrackers(m.fromAddr));
   const isDraft = $derived(roleOf(m) === "drafts");
   const acc = $derived(accountById(m.accountId));
 
@@ -170,7 +171,7 @@
       {/if}
 
       <div class="paper" class:plain={isPlain}>
-        <MailFrame html={body} {allowRemote} plain={isPlain} cacheKey={m.id} />
+        <MailFrame html={body} {allowRemote} plain={isPlain} {stripTrackers} cacheKey={m.id} />
       </div>
     {:else if error}
       <div class="err">{error}</div>
