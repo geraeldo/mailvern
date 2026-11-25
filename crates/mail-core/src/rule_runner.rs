@@ -275,38 +275,45 @@ impl Engine {
     }
 
     /// (message id, account id, queued at) rows from the queue.
+    /// Processes accounts concurrently so a slow body fetch on one account never stalls another.
     async fn process_queue(&self, batch: Vec<(i64, i64, i64)>) {
         let mine = self.my_addresses().unwrap_or_default();
-        let mut announce: HashMap<i64, Vec<Facts>> = HashMap::new();
+        let mut by_account: HashMap<i64, Vec<(i64, i64)>> = HashMap::new();
         for (id, account_id, queued_at) in batch {
-            let facts = self.db.rule_facts(id);
-            let _ = self.db.unqueue_for_rules(&[id]);
-            let f = match facts {
-                Ok(Some(f)) => f,
-                Ok(None) => continue,
-                Err(e) => {
-                    eprintln!("rules: {e:#}");
-                    continue;
-                }
-            };
-            let applied = self.run_rules_on(&f, &mine).await.unwrap_or_else(|e| {
-                eprintln!("rules: {e:#}");
-                Applied::default()
-            });
-            if !f.seen && !applied.relocated && !applied.read && !applied.quiet && now() - queued_at < STALE_AFTER {
-                announce.entry(account_id).or_default().push(f);
-            }
+            by_account.entry(account_id).or_default().push((id, queued_at));
         }
-        for (account_id, list) in announce {
-            if let Some(last) = list.iter().max_by_key(|f| f.date) {
+        let mine_ref = &mine;
+        let futs = by_account.into_iter().map(|(account_id, items)| async move {
+            let mut announce: Vec<Facts> = Vec::new();
+            for (id, queued_at) in items {
+                let facts = self.db.rule_facts(id);
+                let _ = self.db.unqueue_for_rules(&[id]);
+                let f = match facts {
+                    Ok(Some(f)) => f,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        eprintln!("rules: {e:#}");
+                        continue;
+                    }
+                };
+                let applied = self.run_rules_on(&f, mine_ref).await.unwrap_or_else(|e| {
+                    eprintln!("rules: {e:#}");
+                    Applied::default()
+                });
+                if !f.seen && !applied.relocated && !applied.read && !applied.quiet && now() - queued_at < STALE_AFTER {
+                    announce.push(f);
+                }
+            }
+            if let Some(last) = announce.iter().max_by_key(|f| f.date) {
                 let _ = self.events.send(Event::NewMail {
                     account_id,
                     from: if last.from_name.is_empty() { last.from_addr.clone() } else { last.from_name.clone() },
                     subject: last.subject.clone(),
-                    count: list.len(),
+                    count: announce.len(),
                 });
             }
-        }
+        });
+        futures::future::join_all(futs).await;
     }
 
     async fn run_rules_on(&self, f: &Facts, mine: &[String]) -> Result<Applied> {
@@ -398,6 +405,7 @@ impl Engine {
         }
         if let Some((rule, a)) = first(|a| *a == RuleAction::SkipNotification) {
             applied.quiet = true;
+            let _ = self.db.mark_quiet(f.id);
             self.log(rule, f, a);
         }
         if let Some((rule, a)) = first(RuleAction::relocates) {
@@ -477,7 +485,8 @@ impl Engine {
 mod tests {
     use super::super::Handle;
     use super::*;
-    use crate::worker::{Cmd, Target};
+    use crate::db::PendingOpPayload;
+    use crate::worker::Cmd;
     use tokio::sync::mpsc;
 
     fn account() -> Account {
@@ -568,9 +577,12 @@ mod tests {
         assert_eq!(ids.len(), 2);
         run_queue(&s, &ids).await;
 
-        // The GitHub mail left the Inbox and the server was told to move it.
+        // The GitHub mail left the Inbox and the server was told to move it via durable pending_ops.
         assert_eq!(inbox_ids(&s.engine, s.account).len(), 1);
-        assert!(matches!(s.rx.try_recv().unwrap(), Cmd::Move { to: Target::Role("archive"), .. }));
+        assert!(matches!(s.rx.try_recv().unwrap(), Cmd::FlushOps));
+        let ops = s.engine.db.due_pending_ops(s.account, None, now() + 10).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].payload, PendingOpPayload::MoveRole { role: "archive".into() });
         // Only unread mail still in the Inbox is announced: Pat's is read, GitHub's is gone.
         while let Ok(ev) = events.try_recv() {
             assert!(!matches!(ev, Event::NewMail { .. }), "nothing should be announced");
@@ -696,7 +708,9 @@ mod tests {
         s.engine.db.insert_messages(s.account, archive, &[crate::parse::parse_header(1, &raw, false, false, 10, now())]).unwrap();
         while s.rx.try_recv().is_ok() {}
         s.engine.undo_rule_activity(entry.id).unwrap();
-        assert!(matches!(s.rx.try_recv().unwrap(), Cmd::Move { to: Target::Folder(_), .. }));
+        assert!(matches!(s.rx.try_recv().unwrap(), Cmd::FlushOps));
+        let ops = s.engine.db.due_pending_ops(s.account, None, now() + 10).unwrap();
+        assert!(ops.iter().any(|op| matches!(op.payload, PendingOpPayload::MoveFolder { .. })));
         assert!(!s.engine.rule_activity(1).unwrap()[0].can_undo);
     }
 
@@ -716,5 +730,17 @@ mod tests {
         let log_id = s.engine.db.log_rule(&r, s.account, Some("<missing@x>"), "Gone", "shop@example.org", &RuleAction::MarkRead, now()).unwrap();
         assert!(s.engine.undo_rule_activity(log_id).is_err());
         assert!(s.engine.rule_activity(1).unwrap()[0].can_undo);
+    }
+
+    #[tokio::test]
+    async fn skip_notification_rule_excludes_message_from_new_badge() {
+        let s = setup(vec![]);
+        s.engine.mark_badge_seen().unwrap();
+        s.engine.save_rule(rule("Quiet", vec![from("bot")], vec![RuleAction::SkipNotification]), false).unwrap();
+        let inbox = s.engine.db.folder_by_role(s.account, "inbox").unwrap().unwrap().0;
+        let raw = mail("Bot <bot@example.org>", "Build green", "q@x", "");
+        let ids = s.engine.db.insert_messages(s.account, inbox, &[crate::parse::parse_header(1, &raw, false, false, 10, now())]).unwrap();
+        run_queue(&s, &ids).await;
+        assert_eq!(s.engine.badge_count().unwrap(), 0);
     }
 }

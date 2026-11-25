@@ -1,11 +1,12 @@
-use crate::db::{Db, DueSnooze, OutboxRow};
+use crate::db::{Db, DueSnooze, OutboxRow, PendingOpPayload};
 use crate::model::*;
-use crate::worker::{idle_loop, Cmd, Target, Worker};
+use crate::worker::{idle_loop, Cmd, Worker};
 use crate::icons::{self, Icon, Outcome};
 use crate::{imap, parse, secrets, smtp};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::AtomicI64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, Notify};
@@ -116,11 +117,19 @@ impl Engine {
 
     fn start_account(&self, acc: Account) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let worker = Worker::new(acc.clone(), self.db.clone(), self.events.clone(), self.rules_wake.clone(), rx);
-        let _ = tx.send(Cmd::SyncAll);
+        let last_inbox_write_ms = Arc::new(AtomicI64::new(0));
+        let worker = Worker::new(
+            acc.clone(),
+            self.db.clone(),
+            self.events.clone(),
+            self.rules_wake.clone(),
+            last_inbox_write_ms.clone(),
+            rx,
+        );
+        let _ = tx.send(Cmd::SyncAll { force: false });
         let tasks = vec![
             tokio::spawn(worker.run()),
-            tokio::spawn(idle_loop(acc.clone(), self.db.clone(), tx.clone())),
+            tokio::spawn(idle_loop(acc.clone(), self.db.clone(), last_inbox_write_ms, tx.clone())),
         ];
         self.workers.lock().unwrap_or_else(|e| e.into_inner()).insert(acc.id, Handle { tx, tasks });
     }
@@ -133,19 +142,19 @@ impl Engine {
 
     pub fn sync_now(&self) {
         for h in self.workers.lock().unwrap_or_else(|e| e.into_inner()).values() {
-            let _ = h.tx.send(Cmd::SyncAll);
+            let _ = h.tx.send(Cmd::SyncAll { force: true });
         }
     }
 
     /// Checks every folder of one account.
     pub fn sync_account(&self, account_id: i64) -> Result<()> {
-        self.send_cmd(account_id, Cmd::SyncAll)
+        self.send_cmd(account_id, Cmd::SyncAll { force: true })
     }
 
     /// Checks just the folders behind a view (one folder, or one role across accounts).
     pub fn sync_view(&self, view: &View) -> Result<()> {
         for (acc, folder_id) in self.view_folders(view)? {
-            self.send_cmd(acc, Cmd::SyncFolder(folder_id))?;
+            self.send_cmd(acc, Cmd::SyncFolder { folder_id, from_idle: false })?;
         }
         Ok(())
     }
@@ -500,25 +509,24 @@ impl Engine {
     pub fn set_seen(&self, ids: &[i64], seen: bool) -> Result<()> {
         let g = self.group(ids)?;
         self.db.set_seen(ids, seen)?;
+        let t = now();
+        let payload = PendingOpPayload::Store { flag: "\\Seen".into(), add: seen };
         for ((acc, folder_id), uids) in g {
-            self.send_cmd(acc, Cmd::Store { folder_id, uids, flag: "\\Seen", add: seen })?;
+            self.db.enqueue_pending_op(acc, folder_id, &payload, &uids, t)?;
+            self.send_cmd(acc, Cmd::FlushOps)?;
+            let _ = self.events.send(Event::Changed { account_id: acc, folder_id: Some(folder_id) });
         }
-        self.notify_changed(ids);
         Ok(())
     }
 
     /// Marks everything in the view's folders as read, including mail not cached locally.
     pub fn mark_read(&self, view: &View) -> Result<()> {
-        let mut accounts = Vec::new();
+        let t = now();
         for (acc, folder_id) in self.view_folders(view)? {
             self.db.mark_folder_read(folder_id)?;
-            self.send_cmd(acc, Cmd::MarkAllRead { folder_id })?;
-            if !accounts.contains(&acc) {
-                accounts.push(acc);
-            }
-        }
-        for account_id in accounts {
-            let _ = self.events.send(Event::Changed { account_id });
+            self.db.enqueue_pending_op(acc, folder_id, &PendingOpPayload::MarkAllRead, &[], t)?;
+            self.send_cmd(acc, Cmd::FlushOps)?;
+            let _ = self.events.send(Event::Changed { account_id: acc, folder_id: Some(folder_id) });
         }
         Ok(())
     }
@@ -526,37 +534,50 @@ impl Engine {
     pub fn set_flagged(&self, ids: &[i64], flagged: bool) -> Result<()> {
         let g = self.group(ids)?;
         self.db.set_flagged(ids, flagged)?;
+        let t = now();
+        let payload = PendingOpPayload::Store { flag: "\\Flagged".into(), add: flagged };
         for ((acc, folder_id), uids) in g {
-            self.send_cmd(acc, Cmd::Store { folder_id, uids, flag: "\\Flagged", add: flagged })?;
+            self.db.enqueue_pending_op(acc, folder_id, &payload, &uids, t)?;
+            self.send_cmd(acc, Cmd::FlushOps)?;
+            let _ = self.events.send(Event::Changed { account_id: acc, folder_id: Some(folder_id) });
         }
-        self.notify_changed(ids);
         Ok(())
     }
 
     fn move_role(&self, ids: &[i64], role: &'static str) -> Result<()> {
         let g = self.group_ids(ids)?;
         let mut moved = Vec::new();
-        let mut accounts = Vec::new();
+        let mut to_stash = Vec::new();
+        let mut changed = Vec::new();
+        let t = now();
         for ((acc, folder_id), msgs) in g {
             let (_, _, from_role) = self.db.folder(folder_id)?;
-            let uids = msgs.iter().map(|m| m.1).collect();
+            let uids: Vec<u32> = msgs.iter().map(|m| m.1).collect();
+            let msg_ids: Vec<i64> = msgs.iter().map(|m| m.0).collect();
             if from_role.as_deref() == Some(role) {
                 if role == "trash" {
-                    self.send_cmd(acc, Cmd::Delete { folder_id, uids })?;
+                    self.db.enqueue_pending_op(acc, folder_id, &PendingOpPayload::Delete, &uids, t)?;
                 } else {
                     continue;
                 }
             } else {
-                self.send_cmd(acc, Cmd::Move { folder_id, uids, to: Target::Role(role) })?;
+                to_stash.extend_from_slice(&msg_ids);
+                self.db.enqueue_pending_op(
+                    acc,
+                    folder_id,
+                    &PendingOpPayload::MoveRole { role: role.to_string() },
+                    &uids,
+                    t,
+                )?;
             }
-            moved.extend(msgs.iter().map(|m| m.0));
-            if !accounts.contains(&acc) {
-                accounts.push(acc);
-            }
+            self.send_cmd(acc, Cmd::FlushOps)?;
+            moved.extend(msg_ids);
+            changed.push((acc, folder_id));
         }
+        self.db.stash_moved_bodies(&to_stash, t)?;
         self.db.delete_messages(&moved)?;
-        for account_id in accounts {
-            let _ = self.events.send(Event::Changed { account_id });
+        for (account_id, folder_id) in changed {
+            let _ = self.events.send(Event::Changed { account_id, folder_id: Some(folder_id) });
         }
         Ok(())
     }
@@ -589,18 +610,25 @@ impl Engine {
             }
         }
         let mut moved = Vec::new();
-        let mut accounts = Vec::new();
+        let mut changed = Vec::new();
+        let t = now();
         for ((acc, folder_id), msgs) in g {
-            let uids = msgs.iter().map(|m| m.1).collect();
-            self.send_cmd(acc, Cmd::Move { folder_id, uids, to: Target::Role("trash") })?;
+            let uids: Vec<u32> = msgs.iter().map(|m| m.1).collect();
+            self.db.enqueue_pending_op(
+                acc,
+                folder_id,
+                &PendingOpPayload::MoveRole { role: "trash".into() },
+                &uids,
+                t,
+            )?;
+            self.send_cmd(acc, Cmd::FlushOps)?;
             moved.extend(msgs.iter().map(|m| m.0));
-            if !accounts.contains(&acc) {
-                accounts.push(acc);
-            }
+            changed.push((acc, folder_id));
         }
+        self.db.stash_moved_bodies(&moved, t)?;
         self.db.delete_messages(&moved)?;
-        for account_id in accounts {
-            let _ = self.events.send(Event::Changed { account_id });
+        for (account_id, folder_id) in changed {
+            let _ = self.events.send(Event::Changed { account_id, folder_id: Some(folder_id) });
         }
         Ok(moved.len())
     }
@@ -623,16 +651,29 @@ impl Engine {
             return Err(anyhow!("Messages can only be moved to a folder in their own account"));
         }
         let mut moved = Vec::new();
+        let mut changed_folders = Vec::new();
+        let t = now();
         for ((acc, from), msgs) in g {
             if from == folder_id {
                 continue;
             }
-            let uids = msgs.iter().map(|m| m.1).collect();
-            self.send_cmd(acc, Cmd::Move { folder_id: from, uids, to: Target::Folder(folder_id) })?;
+            let uids: Vec<u32> = msgs.iter().map(|m| m.1).collect();
+            self.db.enqueue_pending_op(
+                acc,
+                from,
+                &PendingOpPayload::MoveFolder { to_folder_id: folder_id },
+                &uids,
+                t,
+            )?;
+            self.send_cmd(acc, Cmd::FlushOps)?;
             moved.extend(msgs.iter().map(|m| m.0));
+            changed_folders.push(from);
         }
+        self.db.stash_moved_bodies(&moved, t)?;
         self.db.delete_messages(&moved)?;
-        let _ = self.events.send(Event::Changed { account_id: target_acc });
+        for fid in changed_folders {
+            let _ = self.events.send(Event::Changed { account_id: target_acc, folder_id: Some(fid) });
+        }
         Ok(())
     }
 
@@ -645,7 +686,8 @@ impl Engine {
         }
         let g = self.group_ids(ids)?;
         let mut moved = Vec::new();
-        let mut accounts = Vec::new();
+        let mut changed = Vec::new();
+        let t = now();
         for ((acc, folder_id), msgs) in g {
             let (_, path, role) = self.db.folder(folder_id)?;
             let back_to = self.db.folder_by_role(acc, "inbox")?.map(|f| f.1).unwrap_or(path);
@@ -654,18 +696,24 @@ impl Engine {
                 self.db.add_snooze(acc, &mid, &back_to, until)?;
             }
             if role.as_deref() != Some("snoozed") {
-                let uids = msgs.iter().map(|m| m.1).collect();
-                self.send_cmd(acc, Cmd::Move { folder_id, uids, to: Target::Role("snoozed") })?;
+                let uids: Vec<u32> = msgs.iter().map(|m| m.1).collect();
+                self.db.enqueue_pending_op(
+                    acc,
+                    folder_id,
+                    &PendingOpPayload::MoveRole { role: "snoozed".into() },
+                    &uids,
+                    t,
+                )?;
+                self.send_cmd(acc, Cmd::FlushOps)?;
                 moved.extend(msgs.iter().map(|m| m.0));
             }
-            if !accounts.contains(&acc) {
-                accounts.push(acc);
-            }
+            changed.push((acc, folder_id));
         }
+        self.db.stash_moved_bodies(&moved, t)?;
         self.db.delete_messages(&moved)?;
         self.wake.notify_one();
-        for account_id in accounts {
-            let _ = self.events.send(Event::Changed { account_id });
+        for (account_id, folder_id) in changed {
+            let _ = self.events.send(Event::Changed { account_id, folder_id: Some(folder_id) });
         }
         Ok(())
     }
@@ -684,20 +732,6 @@ impl Engine {
         }
         self.wake.notify_one();
         Ok(())
-    }
-
-    fn notify_changed(&self, ids: &[i64]) {
-        let mut accounts = Vec::new();
-        for id in ids {
-            if let Ok((acc, ..)) = self.db.locate(*id) {
-                if !accounts.contains(&acc) {
-                    accounts.push(acc);
-                }
-            }
-        }
-        for account_id in accounts {
-            let _ = self.events.send(Event::Changed { account_id });
-        }
     }
 
     // ---------- sending ----------
@@ -814,7 +848,7 @@ impl Engine {
         }
         if let Some((folder_id, _)) = self.db.folder_by_role(account_id, "drafts")? {
             if self.db.delete_by_message_id(folder_id, message_id)? > 0 {
-                let _ = self.events.send(Event::Changed { account_id });
+                let _ = self.events.send(Event::Changed { account_id, folder_id: Some(folder_id) });
             }
         }
         self.send_cmd(account_id, Cmd::DeleteDraft { message_id: message_id.to_string() })
@@ -961,6 +995,6 @@ async fn wake_snooze(db: Arc<Db>, events: broadcast::Sender<Event>, workers: Wor
     // Back in the Inbox as unread, it notifies like any new mail.
     if let Ok(Ok(Ok(_))) = tokio::time::timeout(Duration::from_secs(90), rrx).await {
         let _ = db.mark_woke(s.id, now());
-        let _ = events.send(Event::Changed { account_id: s.account_id });
+        let _ = events.send(Event::Changed { account_id: s.account_id, folder_id: None });
     }
 }

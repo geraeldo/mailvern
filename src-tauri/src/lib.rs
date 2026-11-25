@@ -638,7 +638,7 @@ pub fn run() {
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             // Catch up folders, list, thread, badge, and outbox after dropped events.
-                            let _ = handle.emit("mail-event", mail_core::model::Event::Changed { account_id: 0 });
+                            let _ = handle.emit("mail-event", mail_core::model::Event::Changed { account_id: 0, folder_id: None });
                             let _ = handle.emit("mail-event", mail_core::model::Event::Outbox);
                         }
                         Err(_) => break,

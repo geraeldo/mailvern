@@ -35,11 +35,58 @@
   let resizing = $state<"side" | "list" | null>(null);
 
   let pending: ReturnType<typeof setTimeout> | undefined;
-  function scheduleRefresh() {
+  let pendingRefreshAll = false;
+  const pendingFolders = new Set<number>();
+  const pendingAccounts = new Set<number>();
+
+  function viewAffected(): boolean {
+    if (pendingRefreshAll || ui.query.trim() || ui.ai) return true;
+    const v = ui.view;
+    if (v.kind === "outbox") return false;
+    if (v.kind === "folder") {
+      if (pendingFolders.has(v.folderId)) return true;
+      const f = ui.folders.find((x) => x.id === v.folderId);
+      return !!f && pendingAccounts.has(f.accountId);
+    }
+    if (v.kind === "unified") {
+      for (const f of ui.folders) {
+        if (f.role === v.role && (pendingFolders.has(f.id) || pendingAccounts.has(f.accountId))) return true;
+      }
+      // If folders haven't loaded yet, refresh to be safe.
+      return ui.folders.length === 0;
+    }
+    return true;
+  }
+
+  function threadAffected(): boolean {
+    if (pendingRefreshAll || ui.selectedId == null) return ui.selectedId != null;
+    for (const m of ui.thread) {
+      if (pendingFolders.has(m.folderId) || pendingAccounts.has(m.accountId)) return true;
+    }
+    return false;
+  }
+
+  function scheduleRefresh(accountId?: number, folderId?: number) {
+    if (!accountId) {
+      pendingRefreshAll = true;
+    } else if (folderId != null) {
+      pendingFolders.add(folderId);
+    } else {
+      pendingAccounts.add(accountId);
+    }
     clearTimeout(pending);
     pending = setTimeout(async () => {
-      await Promise.all([loadFolders(), loadList(true)]);
-      refreshThread();
+      const reloadList = viewAffected();
+      const reloadThread = reloadList || threadAffected();
+      pendingRefreshAll = false;
+      pendingFolders.clear();
+      pendingAccounts.clear();
+      if (reloadList) {
+        await Promise.all([loadFolders(), loadList(true)]);
+      } else {
+        await loadFolders();
+      }
+      if (reloadThread) refreshThread();
       refreshBadge();
     }, 150);
   }
@@ -58,7 +105,7 @@
     })();
 
     const un = listen<MailEvent>("mail-event", ({ payload: e }) => {
-      if (e.kind === "changed") scheduleRefresh();
+      if (e.kind === "changed") scheduleRefresh(e.accountId, e.folderId);
       else if (e.kind === "status") ui.status[e.accountId] = { state: e.state, message: e.message };
       else if (e.kind === "newMail" && notify) {
         const acc = accountById(e.accountId);

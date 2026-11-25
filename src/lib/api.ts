@@ -248,7 +248,7 @@ export type RuleActivity = {
 };
 
 export type MailEvent =
-  | { kind: "changed"; accountId: number }
+  | { kind: "changed"; accountId: number; folderId?: number }
   | { kind: "status"; accountId: number; state: "syncing" | "idle" | "error"; message: string | null }
   | { kind: "newMail"; accountId: number; from: string; subject: string; count: number }
   | { kind: "outbox" }

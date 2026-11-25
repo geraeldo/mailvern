@@ -10,6 +10,42 @@ pub type OutboxSummaryRow = (i64, i64, String, i64, Option<String>);
 
 pub struct Db {
     conn: Mutex<Connection>,
+    read: Mutex<Connection>,
+}
+
+/// Persisted IMAP sync watermarks for a folder.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FolderSyncState {
+    pub uidvalidity: u32,
+    pub synced: bool,
+    pub uidnext: u32,
+    /// Last known server EXISTS count, or -1 if unknown/invalidated.
+    pub msg_count: i64,
+    /// Last known server UNSEEN count, or -1 if unknown.
+    pub unseen_count: i64,
+    /// Last known CONDSTORE HIGHESTMODSEQ (0 if unsupported/unknown).
+    pub highest_modseq: u64,
+    /// Unix timestamp of the last full flag reconciliation.
+    pub last_full_sync: i64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum PendingOpPayload {
+    Store { flag: String, add: bool },
+    MarkAllRead,
+    MoveRole { role: String },
+    MoveFolder { to_folder_id: i64 },
+    Delete,
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingOp {
+    pub id: i64,
+    pub folder_id: i64,
+    pub payload: PendingOpPayload,
+    pub uids: Vec<u32>,
+    pub attempts: i64,
 }
 
 /// Header-level data for a message, as stored after a sync.
@@ -59,6 +95,17 @@ CREATE TABLE IF NOT EXISTS sender_icons (
   logo INTEGER NOT NULL DEFAULT 0,
   retry_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS moved_bodies (
+  account_id INTEGER NOT NULL,
+  message_id TEXT NOT NULL,
+  raw BLOB NOT NULL,
+  snippet TEXT NOT NULL DEFAULT '',
+  search_text TEXT NOT NULL DEFAULT '',
+  has_attachments INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (account_id, message_id)
+);
 "#;
 
 /// Schema history. `PRAGMA user_version` records how many of these have run.
@@ -66,7 +113,37 @@ CREATE TABLE IF NOT EXISTS sender_icons (
 /// Rules: never edit or reorder a shipped entry. To change the schema, append a new
 /// entry (e.g. `ALTER TABLE messages ADD COLUMN ...`). Each one runs once, in a
 /// transaction, and the database is backed up before any upgrade.
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8];
+
+/// v8: folder sync watermarks (UIDNEXT/EXISTS/UNSEEN/HIGHESTMODSEQ), durable pending IMAP ops,
+/// quiet flag for SkipNotification badge accuracy, and sync/query indexes.
+const V8: &str = r#"
+ALTER TABLE folders ADD COLUMN uidnext INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE folders ADD COLUMN msg_count INTEGER NOT NULL DEFAULT -1;
+ALTER TABLE folders ADD COLUMN unseen_count INTEGER NOT NULL DEFAULT -1;
+ALTER TABLE folders ADD COLUMN highest_modseq INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE folders ADD COLUMN last_full_sync INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN quiet INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS pending_ops (
+  id INTEGER PRIMARY KEY,
+  account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  folder_id INTEGER NOT NULL REFERENCES folders(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  uids_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_retry INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_pending_ops_acc ON pending_ops(account_id, id);
+CREATE INDEX IF NOT EXISTS idx_pending_ops_folder ON pending_ops(folder_id);
+
+CREATE INDEX IF NOT EXISTS idx_messages_folder_seen ON messages(folder_id, seen);
+CREATE INDEX IF NOT EXISTS idx_messages_folder_sparse_uid ON messages(folder_id, sparse, uid);
+CREATE INDEX IF NOT EXISTS idx_messages_missing_body ON messages(folder_id, date DESC) WHERE has_body = 0;
+CREATE INDEX IF NOT EXISTS idx_messages_acc_msgid ON messages(account_id, message_id);
+"#;
 
 /// v7: per-account MCP permission overrides and the pending/recent agent actions queue.
 const V7: &str = r#"
@@ -548,7 +625,12 @@ impl Db {
         conn.execute_batch(PRAGMAS)?;
         migrate(&mut conn, path)?;
         conn.execute_batch(CACHES)?;
-        let db = Db { conn: Mutex::new(conn) };
+        let read = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        read.execute_batch("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON;")?;
+        let db = Db { conn: Mutex::new(conn), read: Mutex::new(read) };
         db.assign_threads()?;
         Ok(db)
     }
@@ -575,10 +657,15 @@ impl Db {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Dedicated read-only connection so UI queries run concurrently with sync writes under WAL.
+    fn r(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.read.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     // ---------- accounts ----------
 
     pub fn accounts(&self) -> Result<Vec<Account>> {
-        let c = self.c();
+        let c = self.r();
         let mut st = c.prepare(
             "SELECT id, name, email, imap_host, imap_port, smtp_host, smtp_port, color, signature, position, label
              FROM accounts ORDER BY position, id",
@@ -588,7 +675,7 @@ impl Db {
     }
 
     pub fn account(&self, id: i64) -> Result<Account> {
-        let c = self.c();
+        let c = self.r();
         Ok(c.query_row(
             "SELECT id, name, email, imap_host, imap_port, smtp_host, smtp_port, color, signature, position, label
              FROM accounts WHERE id = ?",
@@ -687,7 +774,7 @@ impl Db {
     /// Folders in display order: accounts in their order, then each account's
     /// folders by user position, falling back to a sensible default.
     pub fn folders(&self) -> Result<Vec<Folder>> {
-        let c = self.c();
+        let c = self.r();
         let mut st = c.prepare(
             "SELECT f.id, f.account_id, f.path, f.name, f.role,
                     (SELECT COUNT(*) FROM messages m WHERE m.folder_id = f.id AND m.seen = 0),
@@ -732,7 +819,7 @@ impl Db {
 
     /// (id, path, role) of one account's folders.
     pub fn account_folders(&self, account_id: i64) -> Result<Vec<(i64, String, Option<String>)>> {
-        let c = self.c();
+        let c = self.r();
         let rows = c
             .prepare("SELECT id, path, role FROM folders WHERE account_id = ?")?
             .query_map([account_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
@@ -741,7 +828,7 @@ impl Db {
     }
 
     pub fn folder_by_path(&self, account_id: i64, path: &str) -> Result<Option<(i64, Option<String>)>> {
-        let c = self.c();
+        let c = self.r();
         Ok(c.query_row(
             "SELECT id, role FROM folders WHERE account_id = ? AND path = ?",
             params![account_id, path],
@@ -751,14 +838,14 @@ impl Db {
     }
 
     pub fn folder(&self, id: i64) -> Result<(i64, String, Option<String>)> {
-        let c = self.c();
+        let c = self.r();
         Ok(c.query_row("SELECT account_id, path, role FROM folders WHERE id = ?", [id], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?)
     }
 
     pub fn folder_by_role(&self, account_id: i64, role: &str) -> Result<Option<(i64, String)>> {
-        let c = self.c();
+        let c = self.r();
         Ok(c.query_row(
             "SELECT id, path FROM folders WHERE account_id = ? AND role = ?",
             params![account_id, role],
@@ -767,18 +854,62 @@ impl Db {
         .optional()?)
     }
 
-    pub fn folder_uidvalidity(&self, folder_id: i64) -> Result<u32> {
-        let c = self.c();
-        let v: i64 = c.query_row("SELECT uidvalidity FROM folders WHERE id = ?", [folder_id], |r| r.get(0))?;
-        Ok(v as u32)
+    pub fn folder_sync_state(&self, folder_id: i64) -> Result<FolderSyncState> {
+        let c = self.r();
+        Ok(c.query_row(
+            "SELECT uidvalidity, synced, uidnext, msg_count, unseen_count, highest_modseq, last_full_sync FROM folders WHERE id = ?",
+            [folder_id],
+            |r| {
+                let uv: i64 = r.get(0)?;
+                let uidnext: i64 = r.get(2)?;
+                let modseq: i64 = r.get(5)?;
+                Ok(FolderSyncState {
+                    uidvalidity: uv.max(0) as u32,
+                    synced: r.get(1)?,
+                    uidnext: uidnext.max(0) as u32,
+                    msg_count: r.get(3)?,
+                    unseen_count: r.get(4)?,
+                    highest_modseq: modseq.max(0) as u64,
+                    last_full_sync: r.get(6)?,
+                })
+            },
+        )?)
     }
 
+    pub fn update_folder_sync_state(&self, folder_id: i64, st: &FolderSyncState) -> Result<()> {
+        self.c().execute(
+            "UPDATE folders SET uidvalidity = ?, synced = ?, uidnext = ?, msg_count = ?, unseen_count = ?, highest_modseq = ?, last_full_sync = ? WHERE id = ?",
+            params![
+                st.uidvalidity as i64,
+                st.synced,
+                st.uidnext as i64,
+                st.msg_count,
+                st.unseen_count,
+                st.highest_modseq as i64,
+                st.last_full_sync,
+                folder_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Invalidates cached EXISTS/UNSEEN counts after a local mutation changes the server mailbox.
+    pub fn invalidate_folder_counts(&self, folder_id: i64) -> Result<()> {
+        self.c().execute(
+            "UPDATE folders SET msg_count = -1, unseen_count = -1 WHERE id = ?",
+            [folder_id],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn folder_synced(&self, folder_id: i64) -> Result<bool> {
-        let c = self.c();
+        let c = self.r();
         let v: bool = c.query_row("SELECT synced FROM folders WHERE id = ?", [folder_id], |r| r.get(0))?;
         Ok(v)
     }
 
+    #[cfg(test)]
     pub fn mark_folder_synced(&self, folder_id: i64) -> Result<()> {
         self.c().execute("UPDATE folders SET synced = 1 WHERE id = ?", [folder_id])?;
         Ok(())
@@ -789,16 +920,107 @@ impl Db {
         let tx = c.transaction()?;
         tx.execute("DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE folder_id = ?)", [folder_id])?;
         tx.execute("DELETE FROM messages WHERE folder_id = ?", [folder_id])?;
-        tx.execute("UPDATE folders SET uidvalidity = ?, synced = 0 WHERE id = ?", params![uidvalidity as i64, folder_id])?;
+        tx.execute(
+            "UPDATE folders SET uidvalidity = ?, synced = 0, uidnext = 0, msg_count = -1, unseen_count = -1, highest_modseq = 0, last_full_sync = 0 WHERE id = ?",
+            params![uidvalidity as i64, folder_id],
+        )?;
         tx.commit()?;
         Ok(())
+    }
+
+    // ---------- pending IMAP operations (durable offline/race-safe queue) ----------
+
+    pub fn enqueue_pending_op(&self, account_id: i64, folder_id: i64, payload: &PendingOpPayload, uids: &[u32], now: i64) -> Result<i64> {
+        let kind = match payload {
+            PendingOpPayload::Store { .. } => "store",
+            PendingOpPayload::MarkAllRead => "mark_all_read",
+            PendingOpPayload::MoveRole { .. } => "move_role",
+            PendingOpPayload::MoveFolder { .. } => "move_folder",
+            PendingOpPayload::Delete => "delete",
+        };
+        let c = self.c();
+        c.execute(
+            "INSERT INTO pending_ops (account_id, folder_id, kind, payload, uids_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            params![account_id, folder_id, kind, serde_json::to_string(payload)?, serde_json::to_string(uids)?, now],
+        )?;
+        Ok(c.last_insert_rowid())
+    }
+
+    pub fn due_pending_ops(&self, account_id: i64, folder_id: Option<i64>, now: i64) -> Result<Vec<PendingOp>> {
+        let c = self.r();
+        let (sql, args): (&str, Vec<rusqlite::types::Value>) = match folder_id {
+            Some(fid) => (
+                "SELECT id, account_id, folder_id, payload, uids_json, attempts FROM pending_ops
+                 WHERE account_id = ?1 AND folder_id = ?2 AND next_retry <= ?3 ORDER BY id ASC",
+                vec![account_id.into(), fid.into(), now.into()],
+            ),
+            None => (
+                "SELECT id, account_id, folder_id, payload, uids_json, attempts FROM pending_ops
+                 WHERE account_id = ?1 AND next_retry <= ?2 ORDER BY id ASC",
+                vec![account_id.into(), now.into()],
+            ),
+        };
+        let mut st = c.prepare(sql)?;
+        let rows = st
+            .query_map(rusqlite::params_from_iter(args), |r| {
+                let payload_s: String = r.get(3)?;
+                let uids_s: String = r.get(4)?;
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, payload_s, uids_s, r.get::<_, i64>(5)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, _acc, fid, payload_s, uids_s, attempts) in rows {
+            if let (Ok(payload), Ok(uids)) = (serde_json::from_str(&payload_s), serde_json::from_str(&uids_s)) {
+                out.push(PendingOp { id, folder_id: fid, payload, uids, attempts });
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn delete_pending_op(&self, id: i64) -> Result<()> {
+        self.c().execute("DELETE FROM pending_ops WHERE id = ?", [id])?;
+        Ok(())
+    }
+
+    pub fn fail_pending_op(&self, id: i64, next_retry: i64) -> Result<()> {
+        self.c().execute(
+            "UPDATE pending_ops SET attempts = attempts + 1, next_retry = ? WHERE id = ?",
+            params![next_retry, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn has_pending_ops_for_folder(&self, folder_id: i64) -> Result<bool> {
+        let c = self.r();
+        let n: i64 = c.query_row("SELECT COUNT(*) FROM pending_ops WHERE folder_id = ?", [folder_id], |r| r.get(0))?;
+        Ok(n > 0)
+    }
+
+    /// UIDs in `folder_id` that have un-flushed local mutations (flags, moves, deletes).
+    /// Also returns `true` in the second tuple element if a folder-wide op (MarkAllRead) is pending.
+    pub fn pending_uids_for_folder(&self, folder_id: i64) -> Result<(std::collections::HashSet<u32>, bool)> {
+        let c = self.r();
+        let mut st = c.prepare("SELECT kind, uids_json FROM pending_ops WHERE folder_id = ?")?;
+        let rows: Vec<(String, String)> = st
+            .query_map([folder_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut uids = std::collections::HashSet::new();
+        let mut mark_all_read = false;
+        for (kind, uids_s) in rows {
+            if kind == "mark_all_read" {
+                mark_all_read = true;
+            } else if let Ok(list) = serde_json::from_str::<Vec<u32>>(&uids_s) {
+                uids.extend(list);
+            }
+        }
+        Ok((uids, mark_all_read))
     }
 
     // ---------- messages ----------
 
     /// Bounds of the window of recent mail kept in step with the server (search hits excluded).
     pub fn uid_range(&self, folder_id: i64) -> Result<(u32, u32)> {
-        let c = self.c();
+        let c = self.r();
         let (min, max): (Option<i64>, Option<i64>) = c.query_row(
             "SELECT MIN(uid), MAX(uid) FROM messages WHERE folder_id = ? AND sparse = 0",
             [folder_id],
@@ -809,7 +1031,7 @@ impl Db {
 
     /// Search hits stored below the sync window: (uid) for a folder, below `below`.
     pub fn sparse_uids_below(&self, folder_id: i64, below: u32) -> Result<Vec<u32>> {
-        let c = self.c();
+        let c = self.r();
         let rows = c
             .prepare("SELECT uid FROM messages WHERE folder_id = ? AND sparse = 1 AND uid < ?")?
             .query_map(params![folder_id, below], |r| r.get(0))?
@@ -817,21 +1039,23 @@ impl Db {
         Ok(rows)
     }
 
-    /// Of these uids, the ones not stored yet.
+    /// Of these uids, the ones not stored yet (loaded in one query instead of N+1).
     pub fn missing_uids(&self, folder_id: i64, uids: &[u32]) -> Result<Vec<u32>> {
-        let c = self.c();
-        let mut st = c.prepare("SELECT 1 FROM messages WHERE folder_id = ? AND uid = ?")?;
-        let mut out = Vec::new();
-        for u in uids {
-            if !st.exists(params![folder_id, u])? {
-                out.push(*u);
-            }
+        if uids.is_empty() {
+            return Ok(vec![]);
         }
-        Ok(out)
+        let c = self.r();
+        let min_u = *uids.iter().min().unwrap();
+        let max_u = *uids.iter().max().unwrap();
+        let existing: std::collections::HashSet<u32> = c
+            .prepare("SELECT uid FROM messages WHERE folder_id = ? AND uid >= ? AND uid <= ?")?
+            .query_map(params![folder_id, min_u, max_u], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(uids.iter().copied().filter(|u| !existing.contains(u)).collect())
     }
 
     pub fn ids_for_uids(&self, folder_id: i64, uids: &[u32]) -> Result<Vec<i64>> {
-        let c = self.c();
+        let c = self.r();
         let mut st = c.prepare("SELECT id FROM messages WHERE folder_id = ? AND uid = ?")?;
         let mut out = Vec::new();
         for u in uids {
@@ -899,30 +1123,92 @@ impl Db {
         Ok(added)
     }
 
-    /// Applies server flags for every uid >= `from_uid` and deletes rows the server no longer has.
-    pub fn reconcile_flags(&self, folder_id: i64, from_uid: u32, flags: &[(u32, bool, bool)]) -> Result<bool> {
+    /// Single-pass reconciliation: applies server flags for every uid >= `from_uid`, deletes
+    /// rows the server no longer has, and returns `(changed, missing_server_uids)`.
+    /// UIDs in `skip_uids` (which have un-flushed local ops) are never reverted or resurrected.
+    pub fn reconcile_flags_and_missing(
+        &self,
+        folder_id: i64,
+        from_uid: u32,
+        flags: &[(u32, bool, bool)],
+        skip_uids: &std::collections::HashSet<u32>,
+        skip_seen_revert: bool,
+    ) -> Result<(bool, Vec<u32>)> {
         let mut c = self.c();
         let tx = c.transaction()?;
         let mut changed = false;
+        let mut missing = Vec::new();
         {
             let local: Vec<(i64, u32, bool, bool)> = tx
                 .prepare("SELECT id, uid, seen, flagged FROM messages WHERE folder_id = ? AND uid >= ?")?
                 .query_map(params![folder_id, from_uid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
                 .collect::<rusqlite::Result<_>>()?;
+            let mut local_uids = std::collections::HashSet::with_capacity(local.len());
             let server: std::collections::HashMap<u32, (bool, bool)> =
                 flags.iter().map(|(u, s, f)| (*u, (*s, *f))).collect();
+            let mut del_fts = tx.prepare("DELETE FROM messages_fts WHERE rowid = ?")?;
+            let mut del_msg = tx.prepare("DELETE FROM messages WHERE id = ?")?;
+            let mut upd_msg = tx.prepare("UPDATE messages SET seen = ?, flagged = ? WHERE id = ?")?;
             for (id, uid, seen, flagged) in local {
+                local_uids.insert(uid);
+                if skip_uids.contains(&uid) {
+                    continue;
+                }
                 match server.get(&uid) {
                     None => {
-                        tx.execute("DELETE FROM messages_fts WHERE rowid = ?", [id])?;
-                        tx.execute("DELETE FROM messages WHERE id = ?", [id])?;
+                        del_fts.execute([id])?;
+                        del_msg.execute([id])?;
                         changed = true;
                     }
-                    Some(&(s, f)) if s != seen || f != flagged => {
-                        tx.execute("UPDATE messages SET seen = ?, flagged = ? WHERE id = ?", params![s, f, id])?;
+                    Some(&(s, f)) => {
+                        let next_seen = if skip_seen_revert && seen { true } else { s };
+                        if next_seen != seen || f != flagged {
+                            upd_msg.execute(params![next_seen, f, id])?;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            for &(u, _, _) in flags {
+                if u >= from_uid && !local_uids.contains(&u) && !skip_uids.contains(&u) {
+                    missing.push(u);
+                }
+            }
+        }
+        tx.commit()?;
+        Ok((changed, missing))
+    }
+
+    /// Applies CONDSTORE CHANGEDSINCE flag updates without deleting unmentioned rows.
+    pub fn apply_changed_flags(
+        &self,
+        folder_id: i64,
+        flags: &[(u32, bool, bool)],
+        skip_uids: &std::collections::HashSet<u32>,
+        skip_seen_revert: bool,
+    ) -> Result<bool> {
+        if flags.is_empty() {
+            return Ok(false);
+        }
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let mut changed = false;
+        {
+            let mut sel = tx.prepare("SELECT id, seen, flagged FROM messages WHERE folder_id = ? AND uid = ?")?;
+            let mut upd = tx.prepare("UPDATE messages SET seen = ?, flagged = ? WHERE id = ?")?;
+            for &(uid, s, f) in flags {
+                if skip_uids.contains(&uid) {
+                    continue;
+                }
+                let row: Option<(i64, bool, bool)> = sel
+                    .query_row(params![folder_id, uid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .optional()?;
+                if let Some((id, seen, flagged)) = row {
+                    let next_seen = if skip_seen_revert && seen { true } else { s };
+                    if next_seen != seen || f != flagged {
+                        upd.execute(params![next_seen, f, id])?;
                         changed = true;
                     }
-                    _ => {}
                 }
             }
         }
@@ -930,13 +1216,63 @@ impl Db {
         Ok(changed)
     }
 
+    /// Reconciles deletions and missing UIDs using a compact UID set (e.g., from UID SEARCH).
+    pub fn reconcile_existing_uids(
+        &self,
+        folder_id: i64,
+        from_uid: u32,
+        server_uids: &std::collections::HashSet<u32>,
+        skip_uids: &std::collections::HashSet<u32>,
+    ) -> Result<(bool, Vec<u32>)> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let mut changed = false;
+        let mut missing = Vec::new();
+        {
+            let local: Vec<(i64, u32)> = tx
+                .prepare("SELECT id, uid FROM messages WHERE folder_id = ? AND uid >= ?")?
+                .query_map(params![folder_id, from_uid], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            let mut local_uids = std::collections::HashSet::with_capacity(local.len());
+            let mut del_fts = tx.prepare("DELETE FROM messages_fts WHERE rowid = ?")?;
+            let mut del_msg = tx.prepare("DELETE FROM messages WHERE id = ?")?;
+            for (id, uid) in local {
+                local_uids.insert(uid);
+                if skip_uids.contains(&uid) {
+                    continue;
+                }
+                if !server_uids.contains(&uid) {
+                    del_fts.execute([id])?;
+                    del_msg.execute([id])?;
+                    changed = true;
+                }
+            }
+            for &u in server_uids {
+                if u >= from_uid && !local_uids.contains(&u) && !skip_uids.contains(&u) {
+                    missing.push(u);
+                }
+            }
+        }
+        tx.commit()?;
+        Ok((changed, missing))
+    }
+
     /// Applies server flags to exactly these uids; ones the server didn't return are gone.
-    pub fn reconcile_uids(&self, folder_id: i64, uids: &[u32], flags: &[(u32, bool, bool)]) -> Result<bool> {
+    pub fn reconcile_uids(
+        &self,
+        folder_id: i64,
+        uids: &[u32],
+        flags: &[(u32, bool, bool)],
+        skip_uids: &std::collections::HashSet<u32>,
+    ) -> Result<bool> {
         let mut c = self.c();
         let tx = c.transaction()?;
         let server: std::collections::HashMap<u32, (bool, bool)> = flags.iter().map(|(u, s, f)| (*u, (*s, *f))).collect();
         let mut changed = false;
         for uid in uids {
+            if skip_uids.contains(uid) {
+                continue;
+            }
             let row: Option<(i64, bool, bool)> = tx
                 .query_row("SELECT id, seen, flagged FROM messages WHERE folder_id = ? AND uid = ?", params![folder_id, uid], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -960,14 +1296,15 @@ impl Db {
         Ok(changed)
     }
 
-    pub fn missing_bodies(&self, folder_id: i64, limit: usize, max_size: u32) -> Result<Vec<u32>> {
-        let c = self.c();
+    /// Recent messages missing bodies in `folder_id`, as `(uid, size)` pairs.
+    pub fn missing_bodies_with_size(&self, folder_id: i64, limit: usize, max_size: u32) -> Result<Vec<(u32, u32)>> {
+        let c = self.r();
         let mut st = c.prepare(
-            "SELECT uid FROM messages WHERE folder_id = ? AND has_body = 0 AND size <= ? ORDER BY date DESC LIMIT ?",
+            "SELECT uid, size FROM messages WHERE folder_id = ? AND has_body = 0 AND size <= ? ORDER BY date DESC LIMIT ?",
         )?;
         let rows = st
-            .query_map(params![folder_id, max_size, limit as i64], |r| r.get(0))?
-            .collect::<rusqlite::Result<Vec<u32>>>()?;
+            .query_map(params![folder_id, max_size, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<(u32, u32)>>>()?;
         Ok(rows)
     }
 
@@ -989,14 +1326,178 @@ impl Db {
         Ok(())
     }
 
+    /// Stores a whole batch of prefetched bodies in a single SQLite transaction.
+    pub fn store_bodies_batch(&self, folder_id: i64, items: &[(u32, Vec<u8>, BodyInfo)]) -> Result<usize> {
+        if items.is_empty() {
+            return Ok(0);
+        }
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let mut stored = 0;
+        {
+            let mut find_id = tx.prepare("SELECT id FROM messages WHERE folder_id = ? AND uid = ?")?;
+            let mut ins_body = tx.prepare("INSERT OR REPLACE INTO bodies (message_id, raw) VALUES (?, ?)")?;
+            let mut upd_msg = tx.prepare("UPDATE messages SET has_body = 1, snippet = ?, has_attachments = ? WHERE id = ?")?;
+            let mut upd_fts = tx.prepare("UPDATE messages_fts SET body = ? WHERE rowid = ?")?;
+            for (uid, raw, info) in items {
+                let id: Option<i64> = find_id.query_row(params![folder_id, uid], |r| r.get(0)).optional()?;
+                if let Some(id) = id {
+                    ins_body.execute(params![id, raw.as_slice()])?;
+                    upd_msg.execute(params![info.snippet, info.has_attachments, id])?;
+                    upd_fts.execute(params![info.search_text, id])?;
+                    stored += 1;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(stored)
+    }
+
+    /// Preserves bodies of messages about to be optimistically removed by Move/Archive/Trash
+    /// so the destination copy can hydrate them locally without re-downloading over IMAP.
+    pub fn stash_moved_bodies(&self, ids: &[i64], now: i64) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        {
+            let mut sel = tx.prepare(
+                "SELECT m.account_id, m.message_id, b.raw, m.snippet, COALESCE(f.body, ''), m.has_attachments
+                 FROM messages m
+                 JOIN bodies b ON b.message_id = m.id
+                 LEFT JOIN messages_fts f ON f.rowid = m.id
+                 WHERE m.id = ? AND m.message_id IS NOT NULL AND m.has_body = 1",
+            )?;
+            let mut ins = tx.prepare(
+                "INSERT OR REPLACE INTO moved_bodies (account_id, message_id, raw, snippet, search_text, has_attachments, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )?;
+            for &id in ids {
+                let row: Option<(i64, String, Vec<u8>, String, String, bool)> = sel
+                    .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+                    .optional()?;
+                if let Some((acc, mid, raw, snippet, search_text, has_att)) = row {
+                    ins.execute(params![acc, mid, raw, snippet, search_text, has_att, now])?;
+                }
+            }
+            // Keep the stash small and short-lived.
+            tx.execute("DELETE FROM moved_bodies WHERE created_at < ?", [now - 3600])?;
+            tx.execute(
+                "DELETE FROM moved_bodies WHERE rowid NOT IN (SELECT rowid FROM moved_bodies ORDER BY created_at DESC LIMIT 200)",
+                [],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Hydrates messages missing bodies in `folder_id` from either `moved_bodies` or another
+    /// folder in the same account that already holds the same `Message-ID` (e.g., Gmail labels).
+    pub fn copy_existing_bodies_for_folder(&self, account_id: i64, folder_id: i64) -> Result<usize> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let mut hydrated = 0;
+        {
+            let candidates: Vec<(i64, String)> = tx
+                .prepare("SELECT id, message_id FROM messages WHERE folder_id = ? AND has_body = 0 AND message_id IS NOT NULL")?
+                .query_map([folder_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            if !candidates.is_empty() {
+                let mut from_stash = tx.prepare(
+                    "SELECT raw, snippet, search_text, has_attachments FROM moved_bodies WHERE account_id = ? AND message_id = ?",
+                )?;
+                let mut del_stash = tx.prepare("DELETE FROM moved_bodies WHERE account_id = ? AND message_id = ?")?;
+                let mut from_other = tx.prepare(
+                    "SELECT b.raw, m.snippet, COALESCE(f.body, ''), m.has_attachments
+                     FROM messages m
+                     JOIN bodies b ON b.message_id = m.id
+                     LEFT JOIN messages_fts f ON f.rowid = m.id
+                     WHERE m.account_id = ? AND m.message_id = ? AND m.has_body = 1 AND m.id != ?
+                     LIMIT 1",
+                )?;
+                let mut ins_body = tx.prepare("INSERT OR REPLACE INTO bodies (message_id, raw) VALUES (?, ?)")?;
+                let mut upd_msg = tx.prepare("UPDATE messages SET has_body = 1, snippet = ?, has_attachments = ? WHERE id = ?")?;
+                let mut upd_fts = tx.prepare("UPDATE messages_fts SET body = ? WHERE rowid = ?")?;
+
+                for (id, mid) in candidates {
+                    let stashed: Option<(Vec<u8>, String, String, bool)> = from_stash
+                        .query_row(params![account_id, &mid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                        .optional()?;
+                    let found = match stashed {
+                        Some(v) => {
+                            del_stash.execute(params![account_id, &mid])?;
+                            Some(v)
+                        }
+                        None => from_other
+                            .query_row(params![account_id, &mid, id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                            .optional()?,
+                    };
+                    if let Some((raw, snippet, search_text, has_att)) = found {
+                        ins_body.execute(params![id, raw])?;
+                        upd_msg.execute(params![snippet, has_att, id])?;
+                        upd_fts.execute(params![search_text, id])?;
+                        hydrated += 1;
+                    }
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(hydrated)
+    }
+
+    /// Evicts oldest cached raw bodies for `account_id` when total stored body size exceeds `max_bytes`.
+    /// Preserves snippets and FTS body text; prefers keeping recent Inbox bodies.
+    pub fn prune_old_bodies(&self, account_id: i64, max_bytes: i64) -> Result<usize> {
+        let total: i64 = self.r().query_row(
+            "SELECT COALESCE(SUM(LENGTH(b.raw)), 0) FROM bodies b JOIN messages m ON m.id = b.message_id WHERE m.account_id = ?",
+            [account_id],
+            |r| r.get(0),
+        )?;
+        if total <= max_bytes {
+            return Ok(0);
+        }
+        let target = (max_bytes * 8) / 10;
+        let mut to_drop = total - target;
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let mut evicted = 0;
+        {
+            let candidates: Vec<(i64, i64)> = tx
+                .prepare(
+                    "SELECT m.id, LENGTH(b.raw)
+                     FROM bodies b
+                     JOIN messages m ON m.id = b.message_id
+                     JOIN folders f ON f.id = m.folder_id
+                     WHERE m.account_id = ?
+                     ORDER BY (f.role IS 'inbox') ASC, m.date ASC, m.id ASC",
+                )?
+                .query_map([account_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            let mut del_body = tx.prepare("DELETE FROM bodies WHERE message_id = ?")?;
+            let mut clear_flag = tx.prepare("UPDATE messages SET has_body = 0 WHERE id = ?")?;
+            for (id, sz) in candidates {
+                if to_drop <= 0 {
+                    break;
+                }
+                del_body.execute([id])?;
+                clear_flag.execute([id])?;
+                to_drop -= sz;
+                evicted += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(evicted)
+    }
+
     pub fn body(&self, id: i64) -> Result<Option<Vec<u8>>> {
-        let c = self.c();
+        let c = self.r();
         Ok(c.query_row("SELECT raw FROM bodies WHERE message_id = ?", [id], |r| r.get(0)).optional()?)
     }
 
     /// (account_id, folder_id, folder_path, uid)
     pub fn locate(&self, id: i64) -> Result<(i64, i64, String, u32)> {
-        let c = self.c();
+        let c = self.r();
         Ok(c.query_row(
             "SELECT m.account_id, m.folder_id, f.path, m.uid FROM messages m JOIN folders f ON f.id = m.folder_id WHERE m.id = ?",
             [id],
@@ -1007,7 +1508,7 @@ impl Db {
     /// One row per conversation: its newest message in the view, standing for all of its
     /// messages in the view (`ids`). Conversations are ordered by their freshest message.
     pub fn list_threads(&self, view: &View, offset: i64, limit: i64) -> Result<Vec<MessageSummary>> {
-        let c = self.c();
+        let c = self.r();
         let scope = scope_sql(view)?;
         let sql = format!(
             "WITH scoped AS (
@@ -1051,7 +1552,7 @@ impl Db {
     /// message in several folders (Gmail's All Mail) appear once. Trash and Junk are left
     /// out unless the message itself is there.
     pub fn thread(&self, id: i64) -> Result<Vec<MessageSummary>> {
-        let c = self.c();
+        let c = self.r();
         let (account_id, thread_id, role): (i64, Option<String>, Option<String>) = c.query_row(
             "SELECT m.account_id, m.thread_id, f.role FROM messages m JOIN folders f ON f.id = m.folder_id WHERE m.id = ?",
             [id],
@@ -1101,7 +1602,7 @@ impl Db {
     }
 
     pub fn summaries(&self, ids: &[i64]) -> Result<Vec<MessageSummary>> {
-        let c = self.c();
+        let c = self.r();
         let mut st = c.prepare(&format!("SELECT {SUMMARY_COLS} FROM messages m WHERE m.id = ?"))?;
         let mut out = Vec::new();
         for id in ids {
@@ -1113,7 +1614,7 @@ impl Db {
     }
 
     pub fn list(&self, view: &View, query: Option<&str>, offset: i64, limit: i64) -> Result<Vec<MessageSummary>> {
-        let c = self.c();
+        let c = self.r();
         let scope = scope_sql(view)?;
         let fts = query.and_then(fts_query);
         let sql = match fts {
@@ -1141,7 +1642,7 @@ impl Db {
             SearchScope::Unified { role } => scope_sql(&View::Unified { role: role.clone() })?,
             SearchScope::Folder { folder_id } => scope_sql(&View::Folder { folder_id: *folder_id })?,
         };
-        let c = self.c();
+        let c = self.r();
         let sql = format!(
             "SELECT {SUMMARY_COLS} FROM messages m JOIN messages_fts ON messages_fts.rowid = m.id
              WHERE {filter} AND messages_fts MATCH ?1 ORDER BY m.date DESC LIMIT ?2"
@@ -1154,7 +1655,7 @@ impl Db {
     /// Structured search: one page of matches, newest first (or oldest first), and the total.
     pub fn query_mail(&self, q: &MailQuery) -> Result<MailQueryResult> {
         let (filter, args) = query_where(q)?;
-        let c = self.c();
+        let c = self.r();
         let total: i64 = c.query_row(
             &format!("SELECT COUNT(*) FROM messages m WHERE {filter}"),
             rusqlite::params_from_iter(args.iter()),
@@ -1193,7 +1694,7 @@ impl Db {
             "account" => ("messages m", "CAST(m.account_id AS TEXT)", "(SELECT a.email FROM accounts a WHERE a.id = m.account_id)"),
             _ => return Err(anyhow!("Unknown grouping {by:?}: use sender, domain, recipient, month, year, folder or account")),
         };
-        let c = self.c();
+        let c = self.r();
         let total: i64 = c.query_row(
             &format!("SELECT COUNT(*) FROM messages m WHERE {filter}"),
             rusqlite::params_from_iter(args.iter()),
@@ -1219,7 +1720,7 @@ impl Db {
     }
 
     pub fn summary(&self, id: i64) -> Result<SummaryDetailRow> {
-        let c = self.c();
+        let c = self.r();
         let sql = format!(
             "SELECT {SUMMARY_COLS}, m.to_json, m.cc_json, m.reply_to_json, m.message_id, m.refs, m.in_reply_to FROM messages m WHERE m.id = ?"
         );
@@ -1278,9 +1779,14 @@ impl Db {
         Ok(())
     }
 
+    pub fn mark_quiet(&self, id: i64) -> Result<()> {
+        self.c().execute("UPDATE messages SET quiet = 1 WHERE id = ?", [id])?;
+        Ok(())
+    }
+
     /// The Message-ID header of a stored message.
     pub fn message_id_of(&self, id: i64) -> Result<Option<String>> {
-        let c = self.c();
+        let c = self.r();
         Ok(c.query_row("SELECT message_id FROM messages WHERE id = ?", [id], |r| r.get(0))?)
     }
 
@@ -1297,7 +1803,7 @@ impl Db {
     /// The newest local copy of a draft, by Message-ID, in any account's Drafts folder:
     /// (message id, account id).
     pub fn find_draft(&self, message_id: &str) -> Result<Option<(i64, i64)>> {
-        let c = self.c();
+        let c = self.r();
         Ok(c
             .query_row(
                 "SELECT m.id, m.account_id FROM messages m JOIN folders f ON f.id = m.folder_id
@@ -1309,7 +1815,7 @@ impl Db {
     }
 
     pub fn has_message_id(&self, folder_id: i64, message_id: &str) -> Result<bool> {
-        let c = self.c();
+        let c = self.r();
         let n: i64 = c.query_row(
             "SELECT COUNT(*) FROM messages WHERE folder_id = ? AND message_id = ?",
             params![folder_id, message_id],
@@ -1319,7 +1825,7 @@ impl Db {
     }
 
     pub fn unified_unread(&self) -> Result<i64> {
-        let c = self.c();
+        let c = self.r();
         Ok(c.query_row(
             "SELECT COUNT(*) FROM messages WHERE seen = 0 AND folder_id IN (SELECT id FROM folders WHERE role = 'inbox')",
             [],
@@ -1329,15 +1835,15 @@ impl Db {
 
     /// Highest message id stored. Ids only grow as mail arrives, so this marks "now".
     pub fn max_message_id(&self) -> Result<i64> {
-        let c = self.c();
+        let c = self.r();
         Ok(c.query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |r| r.get(0))?)
     }
 
-    /// Unread inbox messages stored after the given id.
+    /// Unread inbox messages stored after the given id (excluding messages silenced by SkipNotification).
     pub fn unified_unread_after(&self, after_id: i64) -> Result<i64> {
-        let c = self.c();
+        let c = self.r();
         Ok(c.query_row(
-            "SELECT COUNT(*) FROM messages WHERE seen = 0 AND id > ?1 AND folder_id IN (SELECT id FROM folders WHERE role = 'inbox')",
+            "SELECT COUNT(*) FROM messages WHERE seen = 0 AND quiet = 0 AND id > ?1 AND folder_id IN (SELECT id FROM folders WHERE role = 'inbox')",
             [after_id],
             |r| r.get(0),
         )?)
@@ -1345,7 +1851,7 @@ impl Db {
 
     /// Address suggestions, ranked by how often you write to / hear from them.
     pub fn contacts(&self, q: &str) -> Result<Vec<Addr>> {
-        let c = self.c();
+        let c = self.r();
         let like = like_any(q);
         let mut st = c.prepare(
             "SELECT COALESCE(MAX(NULLIF(name, '')), ''), email, SUM(w) AS score FROM (
@@ -1380,7 +1886,7 @@ impl Db {
 
     /// (id, account_id, payload, send_at, error) for everything in the outbox, soonest first.
     pub fn outbox(&self) -> Result<Vec<OutboxSummaryRow>> {
-        let c = self.c();
+        let c = self.r();
         let rows = c
             .prepare("SELECT id, account_id, payload, send_at, error FROM outbox ORDER BY send_at, id")?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
@@ -1475,7 +1981,7 @@ impl Db {
     }
 
     pub fn due_snoozes(&self, now: i64) -> Result<Vec<DueSnooze>> {
-        let c = self.c();
+        let c = self.r();
         let rows = c
             .prepare("SELECT id, account_id, message_id, return_path FROM snoozes WHERE woke_at IS NULL AND wake_at <= ?")?
             .query_map([now], |r| Ok(DueSnooze { id: r.get(0)?, account_id: r.get(1)?, message_id: r.get(2)?, return_path: r.get(3)? }))?
@@ -1490,7 +1996,7 @@ impl Db {
 
     /// The soonest moment the scheduler has work: an outbox message or a snooze coming due.
     pub fn next_due(&self) -> Result<Option<i64>> {
-        let c = self.c();
+        let c = self.r();
         Ok(c.query_row(
             "SELECT MIN(t) FROM (SELECT MIN(send_at) AS t FROM outbox WHERE sending = 0
                                  UNION ALL SELECT MIN(wake_at) FROM snoozes WHERE woke_at IS NULL)",
@@ -1517,14 +2023,14 @@ impl Db {
 
     /// Every rule, in the order they run.
     pub fn rules(&self) -> Result<Vec<Rule>> {
-        let c = self.c();
+        let c = self.r();
         let sql = format!("SELECT {} FROM rules ORDER BY position, id", Self::RULE_COLS);
         let rows = c.prepare(&sql)?.query_map([], Self::rule_row)?.collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
 
     pub fn rule(&self, id: i64) -> Result<Option<Rule>> {
-        let c = self.c();
+        let c = self.r();
         let sql = format!("SELECT {} FROM rules WHERE id = ?", Self::RULE_COLS);
         Ok(c.query_row(&sql, [id], Self::rule_row).optional()?)
     }
@@ -1584,7 +2090,7 @@ impl Db {
     }
 
     pub fn rules_waiting_for_approval(&self) -> Result<usize> {
-        let c = self.c();
+        let c = self.r();
         Ok(c.query_row("SELECT COUNT(*) FROM rules WHERE needs_approval = 1", [], |r| r.get::<_, i64>(0))? as usize)
     }
 
@@ -1601,7 +2107,7 @@ impl Db {
 
     /// The oldest queued messages: (message id, account id, queued at).
     pub fn rule_queue(&self, limit: usize) -> Result<Vec<(i64, i64, i64)>> {
-        let c = self.c();
+        let c = self.r();
         let rows = c
             .prepare("SELECT message_id, account_id, queued_at FROM rule_queue ORDER BY queued_at, message_id LIMIT ?")?
             .query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
@@ -1659,14 +2165,14 @@ impl Db {
 
     /// What rules look at in a stored message.
     pub fn rule_facts(&self, id: i64) -> Result<Option<crate::rules::Facts>> {
-        let c = self.c();
+        let c = self.r();
         let sql = format!("SELECT {} FROM messages m JOIN folders f ON f.id = m.folder_id WHERE m.id = ?", Self::FACT_COLS);
         Ok(c.query_row(&sql, [id], Self::facts_row).optional()?)
     }
 
     /// The newest stored messages in a folder, or in the Inbox of one or every account.
     pub fn rule_candidates(&self, account_id: Option<i64>, folder_id: Option<i64>, limit: usize) -> Result<Vec<crate::rules::Facts>> {
-        let c = self.c();
+        let c = self.r();
         let (scope, arg): (&str, Option<i64>) = match (folder_id, account_id) {
             (Some(f), _) => ("m.folder_id = ?1", Some(f)),
             (None, Some(a)) => ("f.role = 'inbox' AND m.account_id = ?1", Some(a)),
@@ -1682,7 +2188,7 @@ impl Db {
 
     /// The body as plain text (quoted replies left out), if it has been downloaded.
     pub fn body_text(&self, id: i64) -> Result<Option<String>> {
-        let c = self.c();
+        let c = self.r();
         let has: Option<bool> = c.query_row("SELECT has_body FROM messages WHERE id = ?", [id], |r| r.get(0)).optional()?;
         if has != Some(true) {
             return Ok(None);
@@ -1691,13 +2197,13 @@ impl Db {
     }
 
     pub fn list_id(&self, id: i64) -> Result<Option<String>> {
-        let c = self.c();
+        let c = self.r();
         Ok(c.query_row("SELECT list_id FROM messages WHERE id = ?", [id], |r| r.get(0)).optional()?.flatten())
     }
 
     /// Stored copies of a message in a folder, by Message-ID.
     pub fn ids_by_message_id(&self, folder_id: i64, msgid: &str) -> Result<Vec<i64>> {
-        let c = self.c();
+        let c = self.r();
         let rows = c
             .prepare("SELECT id FROM messages WHERE folder_id = ? AND message_id = ?")?
             .query_map(params![folder_id, msgid], |r| r.get(0))?
@@ -1707,7 +2213,7 @@ impl Db {
 
     /// Stored copies of a message anywhere in an account, by Message-ID.
     pub fn ids_in_account(&self, account_id: i64, msgid: &str) -> Result<Vec<i64>> {
-        let c = self.c();
+        let c = self.r();
         let rows = c
             .prepare("SELECT id FROM messages WHERE account_id = ? AND message_id = ?")?
             .query_map(params![account_id, msgid], |r| r.get(0))?
@@ -1737,7 +2243,7 @@ impl Db {
     }
 
     fn rule_log_where(&self, filter: &str, arg: i64) -> Result<Vec<(RuleActivity, Option<String>)>> {
-        let c = self.c();
+        let c = self.r();
         let sql = format!("SELECT id, rule_id, rule_name, account_id, subject, from_addr, action, at, undone, msgid FROM rule_log WHERE {filter}");
         let rows = c
             .prepare(&sql)?
@@ -1775,7 +2281,7 @@ impl Db {
 
     /// Forwards and replies a rule has sent since `since`.
     pub fn rule_sends_since(&self, rule_id: i64, since: i64) -> Result<i64> {
-        let c = self.c();
+        let c = self.r();
         Ok(c.query_row(
             "SELECT COUNT(*) FROM rule_log WHERE rule_id = ? AND at >= ?
                AND (action LIKE '{\"type\":\"forward\"%' OR action LIKE '{\"type\":\"reply\"%')",
@@ -1786,7 +2292,7 @@ impl Db {
 
     /// Whether a rule auto-replied to this address since `since`.
     pub fn replied_since(&self, rule_id: i64, addr: &str, since: i64) -> Result<bool> {
-        let c = self.c();
+        let c = self.r();
         Ok(c.query_row(
             "SELECT COUNT(*) > 0 FROM rule_replies WHERE rule_id = ? AND addr = ? AND at >= ?",
             params![rule_id, addr.to_lowercase(), since],
@@ -1806,7 +2312,7 @@ impl Db {
     // ---------- settings ----------
 
     pub fn setting(&self, key: &str) -> Result<Option<String>> {
-        let c = self.c();
+        let c = self.r();
         Ok(c.query_row("SELECT value FROM settings WHERE key = ?", [key], |r| r.get(0)).optional()?)
     }
 
@@ -1828,7 +2334,7 @@ impl Db {
     // ---------- agent permissions & actions ----------
 
     pub fn agent_account_modes(&self) -> Result<std::collections::HashMap<i64, AgentMode>> {
-        let c = self.c();
+        let c = self.r();
         let mut s = c.prepare("SELECT account_id, mode FROM agent_account_modes")?;
         let mut out = std::collections::HashMap::new();
         let rows = s.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
@@ -1898,7 +2404,7 @@ impl Db {
     }
 
     pub fn agent_action(&self, id: i64) -> Result<Option<AgentAction>> {
-        let c = self.c();
+        let c = self.r();
         Ok(c.query_row(
             "SELECT id, account_id, kind, summary, payload, preview, status, error, created_at, resolved_at
              FROM agent_actions WHERE id = ?",
@@ -1910,7 +2416,7 @@ impl Db {
 
     /// Pending actions (oldest first for review/batching) followed by recent resolved actions (newest first).
     pub fn agent_actions(&self, recent_limit: usize) -> Result<Vec<AgentAction>> {
-        let c = self.c();
+        let c = self.r();
         let mut out = Vec::new();
         {
             let mut s = c.prepare(
@@ -1936,14 +2442,14 @@ impl Db {
     }
 
     pub fn pending_agent_action_ids(&self) -> Result<Vec<i64>> {
-        let c = self.c();
+        let c = self.r();
         let mut s = c.prepare("SELECT id FROM agent_actions WHERE status = 'pending' ORDER BY created_at ASC, id ASC")?;
         let rows = s.query_map([], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn pending_agent_actions_count(&self) -> Result<usize> {
-        let c = self.c();
+        let c = self.r();
         let n: i64 = c.query_row("SELECT COUNT(*) FROM agent_actions WHERE status = 'pending'", [], |r| r.get(0))?;
         Ok(n.max(0) as usize)
     }
@@ -1984,7 +2490,7 @@ impl Db {
 
     /// The cached picture for a domain (None inside when it has none) and when to look again.
     pub fn sender_icon(&self, domain: &str) -> Result<Option<(Option<Icon>, i64)>> {
-        let c = self.c();
+        let c = self.r();
         Ok(c.query_row("SELECT mime, data, logo, retry_at FROM sender_icons WHERE domain = ?", [domain], |r| {
             let mime: Option<String> = r.get(0)?;
             let icon = match mime {
@@ -2137,7 +2643,7 @@ mod tests {
         assert_eq!(db.missing_uids(inbox, &[7, 8, 500]).unwrap(), vec![8]);
 
         // The server no longer has it.
-        assert!(db.reconcile_uids(inbox, &[7], &[]).unwrap());
+        assert!(db.reconcile_uids(inbox, &[7], &[], &Default::default()).unwrap());
         assert!(db.sparse_uids_below(inbox, 500).unwrap().is_empty());
 
         // Sync scrolling down to a hit takes it into the window.
@@ -2500,5 +3006,135 @@ mod tests {
         db.delete_account(1).unwrap();
         assert!(db.agent_account_modes().unwrap().is_empty());
         assert_eq!(db.pending_agent_actions_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn v7_upgrades_to_v8_and_persists_sync_state_and_pending_ops() {
+        let path = temp_db();
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            migrate_with(&mut conn, &path, &[V1, V2, V3, V4, V5, V6, V7]).unwrap();
+            conn.execute(
+                "INSERT INTO accounts (name, email, imap_host, imap_port, smtp_host, smtp_port) VALUES ('Me', 'me@x.com', 'i', 993, 's', 465)",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO folders (account_id, path, name, role, uidvalidity, synced) VALUES (1, 'INBOX', 'Inbox', 'inbox', 7, 1)", [])
+                .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(version(&path), SCHEMA_VERSION);
+        let st = db.folder_sync_state(1).unwrap();
+        assert_eq!((st.uidvalidity, st.synced, st.msg_count, st.highest_modseq), (7, true, -1, 0));
+
+        let next_st = FolderSyncState {
+            uidvalidity: 7,
+            synced: true,
+            uidnext: 50,
+            msg_count: 12,
+            unseen_count: 3,
+            highest_modseq: 999,
+            last_full_sync: 1000,
+        };
+        db.update_folder_sync_state(1, &next_st).unwrap();
+        assert_eq!(db.folder_sync_state(1).unwrap(), next_st);
+
+        let op_id = db
+            .enqueue_pending_op(1, 1, &PendingOpPayload::Store { flag: "\\Seen".into(), add: true }, &[10, 11], 100)
+            .unwrap();
+        assert!(db.has_pending_ops_for_folder(1).unwrap());
+        let (pending_uids, mark_all) = db.pending_uids_for_folder(1).unwrap();
+        assert!(!mark_all && pending_uids.contains(&10) && pending_uids.contains(&11));
+        assert_eq!(db.due_pending_ops(1, Some(1), 100).unwrap().len(), 1);
+        db.fail_pending_op(op_id, 200).unwrap();
+        assert!(db.due_pending_ops(1, Some(1), 150).unwrap().is_empty());
+        assert_eq!(db.due_pending_ops(1, Some(1), 200).unwrap()[0].attempts, 1);
+        db.delete_pending_op(op_id).unwrap();
+        assert!(!db.has_pending_ops_for_folder(1).unwrap());
+    }
+
+    #[test]
+    fn reconciliation_protects_pending_ops_and_computes_missing_uids() {
+        let db = Db::open(&temp_db()).unwrap();
+        let acc = db.save_account(&account()).unwrap();
+        let inbox = db.upsert_folder(acc, "INBOX", "Inbox", Some("inbox")).unwrap();
+        // Local has UID 1 (optimistically marked seen), UID 2 (unseen), UID 3 (removed on server).
+        // UID 4 was optimistically archived locally (in pending_uids), UID 5 is genuinely missing locally.
+        db.insert_messages(acc, inbox, &[msg(1, true), msg(2, false), msg(3, false)]).unwrap();
+        let pending: std::collections::HashSet<u32> = [1, 4].into_iter().collect();
+        let server_flags = vec![(1, false, false), (2, true, true), (4, false, false), (5, false, false)];
+
+        let (changed, missing) = db.reconcile_flags_and_missing(inbox, 1, &server_flags, &pending, false).unwrap();
+        assert!(changed);
+        // UID 4 is pending move -> must NOT be resurrected; UID 5 is missing -> returned for healing.
+        assert_eq!(missing, vec![5]);
+        // UID 1 stays seen=true despite server saying false; UID 2 updated to seen=true, flagged=true; UID 3 deleted.
+        let rows = db.list(&View::Folder { folder_id: inbox }, None, 0, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        let r1 = rows.iter().find(|r| r.subject == "m1").unwrap();
+        let r2 = rows.iter().find(|r| r.subject == "m2").unwrap();
+        assert!(r1.seen);
+        assert!(r2.seen && r2.flagged);
+    }
+
+    #[test]
+    fn condstore_apply_changed_and_existing_uids_work() {
+        let db = Db::open(&temp_db()).unwrap();
+        let acc = db.save_account(&account()).unwrap();
+        let inbox = db.upsert_folder(acc, "INBOX", "Inbox", Some("inbox")).unwrap();
+        db.insert_messages(acc, inbox, &[msg(10, false), msg(11, false), msg(12, false)]).unwrap();
+        let empty = std::collections::HashSet::new();
+
+        assert!(db.apply_changed_flags(inbox, &[(11, true, true)], &empty, false).unwrap());
+        let present: std::collections::HashSet<u32> = [10, 11, 13].into_iter().collect();
+        let (changed, missing) = db.reconcile_existing_uids(inbox, 10, &present, &empty).unwrap();
+        assert!(changed);
+        assert_eq!(missing, vec![13]);
+        let rows = db.list(&View::Folder { folder_id: inbox }, None, 0, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().find(|r| r.subject == "m11").unwrap().flagged);
+    }
+
+    #[test]
+    fn bodies_dedup_across_folders_stash_on_move_and_prune_by_size() {
+        let db = Db::open(&temp_db()).unwrap();
+        let acc = db.save_account(&account()).unwrap();
+        let inbox = db.upsert_folder(acc, "INBOX", "Inbox", Some("inbox")).unwrap();
+        let archive = db.upsert_folder(acc, "Archive", "Archive", Some("archive")).unwrap();
+        let label = db.upsert_folder(acc, "Work", "Work", None).unwrap();
+
+        let ids = db.insert_messages(acc, inbox, &[mail(1, "<m1>", None, None, 100)]).unwrap();
+        let raw = vec![b'x'; 1024];
+        let info = BodyInfo { snippet: "hello".into(), search_text: "hello world".into(), has_attachments: false };
+        db.store_bodies_batch(inbox, &[(1, raw.clone(), info)]).unwrap();
+
+        // Cross-folder dedup (Gmail labels): Work has same Message-ID -> hydrates locally.
+        db.insert_messages(acc, label, &[mail(7, "<m1>", None, None, 100)]).unwrap();
+        assert_eq!(db.copy_existing_bodies_for_folder(acc, label).unwrap(), 1);
+        let label_id = db.ids_for_uids(label, &[7]).unwrap()[0];
+        assert_eq!(db.body(label_id).unwrap().unwrap(), raw);
+
+        // Stash on move: deleting from Inbox preserves body for Archive copy.
+        db.stash_moved_bodies(&ids, 500).unwrap();
+        db.delete_messages(&ids).unwrap();
+        db.insert_messages(acc, archive, &[mail(9, "<m1>", None, None, 100)]).unwrap();
+        assert_eq!(db.copy_existing_bodies_for_folder(acc, archive).unwrap(), 1);
+        let arch_id = db.ids_for_uids(archive, &[9]).unwrap()[0];
+        assert_eq!(db.body(arch_id).unwrap().unwrap(), raw);
+
+        // Prune evicts oldest bodies when account exceeds max_bytes (keeping snippet/FTS).
+        assert!(db.prune_old_bodies(acc, 500).unwrap() >= 1);
+    }
+
+    #[test]
+    fn quiet_messages_are_excluded_from_new_badge_count() {
+        let db = Db::open(&temp_db()).unwrap();
+        let acc = db.save_account(&account()).unwrap();
+        let inbox = db.upsert_folder(acc, "INBOX", "Inbox", Some("inbox")).unwrap();
+        let mark = db.max_message_id().unwrap();
+        let ids = db.insert_messages(acc, inbox, &[msg(1, false), msg(2, false)]).unwrap();
+        assert_eq!(db.unified_unread_after(mark).unwrap(), 2);
+        db.mark_quiet(ids[0]).unwrap();
+        assert_eq!(db.unified_unread_after(mark).unwrap(), 1);
     }
 }
