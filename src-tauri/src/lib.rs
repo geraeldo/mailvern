@@ -1,6 +1,6 @@
 use mail_core::model::{
     Account, AttachmentContent, Folder, MailGroup, MailQuery, MessageDetail, MessageSummary, Outgoing, OutboxItem, Rule, RuleActivity,
-    RuleRun, RuleTest, SearchScope, View,
+    RuleRun, RuleTest, SearchScope, SmartCounts, View,
 };
 use mail_core::text::{quarantine_file, safe_filename};
 use mail_core::Engine;
@@ -51,9 +51,39 @@ fn reorder_folders(engine: E, account_id: i64, ids: Vec<i64>) -> R<()> {
     engine.reorder_folders(account_id, &ids).map_err(err)
 }
 
+#[tauri::command]
+async fn create_folder(engine: E<'_>, account_id: i64, name: String, parent_id: Option<i64>) -> R<Folder> {
+    engine.create_folder(account_id, &name, parent_id).await.map_err(err)
+}
+
+#[tauri::command]
+async fn rename_folder(engine: E<'_>, folder_id: i64, new_name: String) -> R<()> {
+    engine.rename_folder(folder_id, &new_name).await.map_err(err)
+}
+
+#[tauri::command]
+async fn delete_folder(engine: E<'_>, folder_id: i64) -> R<()> {
+    engine.delete_folder(folder_id).await.map_err(err)
+}
+
+#[tauri::command(async)]
+fn empty_folder(engine: E, view: View) -> R<()> {
+    engine.empty_folder(&view).map_err(err)
+}
+
+#[tauri::command(async)]
+fn permanent_delete(engine: E, ids: Vec<i64>) -> R<()> {
+    engine.permanent_delete(&ids).map_err(err)
+}
+
 #[tauri::command(async)]
 fn folders(engine: E) -> R<Vec<Folder>> {
     engine.folders().map_err(err)
+}
+
+#[tauri::command(async)]
+fn smart_counts(engine: E) -> R<SmartCounts> {
+    engine.smart_counts().map_err(err)
 }
 
 #[tauri::command(async)]
@@ -172,6 +202,42 @@ fn mark_badge_seen(engine: E) -> R<()> {
 #[tauri::command]
 async fn message(engine: E<'_>, id: i64) -> R<MessageDetail> {
     engine.message(id).await.map_err(err)
+}
+
+#[tauri::command]
+async fn rsvp_invite(engine: E<'_>, id: i64, status: String) -> R<String> {
+    engine.rsvp_invite(id, &status).await.map_err(err)
+}
+
+#[tauri::command]
+async fn open_ics(app: tauri::AppHandle, engine: E<'_>, id: i64) -> R<()> {
+    let (name, bytes) = engine.raw_ics(id).await.map_err(err)?;
+    let dir = std::env::temp_dir().join("Mailvern").join(format!("ics-{id}"));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = write_unique_file(&dir, &safe_filename(&name), &bytes)?;
+    quarantine_file(&path);
+    app.opener().open_path(path.to_string_lossy(), None::<&str>).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn raw_source(engine: E<'_>, id: i64) -> R<String> {
+    let (_, raw) = engine.raw_message(id).await.map_err(err)?;
+    Ok(String::from_utf8_lossy(&raw).into_owned())
+}
+
+#[tauri::command]
+async fn export_eml(app: tauri::AppHandle, engine: E<'_>, id: i64, dest: Option<String>) -> R<String> {
+    let (name, raw) = engine.raw_message(id).await.map_err(err)?;
+    let path = if let Some(d) = dest.filter(|s| !s.trim().is_empty()) {
+        let p = PathBuf::from(d);
+        std::fs::write(&p, &raw).map_err(|e| e.to_string())?;
+        p
+    } else {
+        let dir = dirs::download_dir().ok_or("No Downloads folder")?;
+        write_unique_file(&dir, &safe_filename(&name), &raw)?
+    };
+    let _ = app.opener().reveal_item_in_dir(&path);
+    Ok(path.to_string_lossy().into())
 }
 
 #[tauri::command(async)]
@@ -423,6 +489,85 @@ async fn save_attachment(app: tauri::AppHandle, engine: E<'_>, id: i64, index: u
     Ok(path.to_string_lossy().into())
 }
 
+/// Saves every listed attachment of a message to `dest_dir` (or Downloads) and reveals the folder.
+#[tauri::command]
+async fn save_all_attachments(app: tauri::AppHandle, engine: E<'_>, id: i64, dest_dir: Option<String>) -> R<usize> {
+    let files = engine.all_attachments(id).await.map_err(err)?;
+    if files.is_empty() {
+        return Ok(0);
+    }
+    let dir = match dest_dir.filter(|s| !s.trim().is_empty()) {
+        Some(d) => PathBuf::from(d),
+        None => dirs::download_dir().ok_or("No Downloads folder")?,
+    };
+    let mut last_path = None;
+    for (name, bytes) in &files {
+        let path = write_unique_file(&dir, &safe_filename(name), bytes)?;
+        quarantine_file(&path);
+        last_path = Some(path);
+    }
+    if let Some(p) = last_path {
+        let _ = app.opener().reveal_item_in_dir(&p);
+    }
+    Ok(files.len())
+}
+
+/// Previews an attachment with macOS Quick Look (`qlmanage -p`).
+#[tauri::command]
+async fn quicklook_attachment(engine: E<'_>, id: i64, index: usize) -> R<()> {
+    let (name, bytes) = engine.attachment(id, index).await.map_err(err)?;
+    let safe = safe_filename(&name);
+    let dir = std::env::temp_dir().join("Mailvern").join(format!("ql-{id}-{index}"));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = write_unique_file(&dir, &safe, &bytes)?;
+    quarantine_file(&path);
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("/usr/bin/qlmanage")
+            .arg("-p")
+            .arg(&path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Couldn't open Quick Look: {e}"))?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        Err("Quick Look is only available on macOS".into())
+    }
+}
+
+/// Stages a single attachment in a temp directory so it can be dragged out or attached elsewhere.
+#[tauri::command]
+async fn stage_attachment(engine: E<'_>, id: i64, index: usize) -> R<FileInfo> {
+    let (name, bytes) = engine.attachment(id, index).await.map_err(err)?;
+    let safe = safe_filename(&name);
+    let dir = std::env::temp_dir().join("Mailvern").join(format!("drag-{id}-{index}"));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let candidate = dir.join(&safe);
+    let path = if candidate.is_file() {
+        candidate
+    } else {
+        let p = write_unique_file(&dir, &safe, &bytes)?;
+        quarantine_file(&p);
+        p
+    };
+    Ok(FileInfo { path: path.to_string_lossy().into(), name: safe, size: bytes.len() as u64 })
+}
+
+/// Writes a message's raw RFC 822 source to a temp `.eml` file so it can be attached to a draft.
+#[tauri::command]
+async fn stage_eml(engine: E<'_>, id: i64) -> R<FileInfo> {
+    let (name, raw) = engine.raw_message(id).await.map_err(err)?;
+    let safe = safe_filename(&name);
+    let dir = std::env::temp_dir().join("Mailvern").join(format!("eml-{id}"));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = write_unique_file(&dir, &safe, &raw)?;
+    Ok(FileInfo { path: path.to_string_lossy().into(), name: safe, size: raw.len() as u64 })
+}
+
 /// Puts text on the clipboard. Done natively: the webview's clipboard refuses writes that
 /// don't come straight from a click, such as after loading bodies or from a native menu.
 #[tauri::command]
@@ -563,7 +708,11 @@ fn external_links() -> tauri::plugin::TauriPlugin<tauri::Wry> {
             if is_app_url(app, url) {
                 return true;
             }
-            if matches!(url.scheme(), "http" | "https" | "mailto") {
+            if url.scheme() == "mailto" {
+                let _ = app.emit("open-mailto", url.as_str().to_string());
+                return false;
+            }
+            if matches!(url.scheme(), "http" | "https") {
                 let _ = app.opener().open_url(url.as_str(), None::<&str>);
             }
             false
@@ -673,7 +822,13 @@ pub fn run() {
             delete_account,
             reorder_accounts,
             reorder_folders,
+            create_folder,
+            rename_folder,
+            delete_folder,
+            empty_folder,
+            permanent_delete,
             folders,
+            smart_counts,
             messages,
             thread,
             search,
@@ -696,6 +851,10 @@ pub fn run() {
             badge_count,
             mark_badge_seen,
             message,
+            rsvp_invite,
+            open_ics,
+            raw_source,
+            export_eml,
             cached_message,
             set_seen,
             mark_read,
@@ -712,6 +871,10 @@ pub fn run() {
             set_setting,
             open_attachment,
             save_attachment,
+            save_all_attachments,
+            quicklook_attachment,
+            stage_attachment,
+            stage_eml,
             copy_text,
             file_info,
             attachment_files,
@@ -762,10 +925,20 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Mailvern")
         .run(|app, event| {
-            // Clicking the Dock icon brings the hidden window back.
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen { .. } = event {
-                show_main(app);
+            match event {
+                // Clicking the Dock icon brings the hidden window back.
+                tauri::RunEvent::Reopen { .. } => show_main(app),
+                // Default mail client: macOS delivers `mailto:` URLs via OpenURL AppleEvents.
+                tauri::RunEvent::Opened { urls } => {
+                    for url in urls {
+                        if url.scheme() == "mailto" {
+                            show_main(app);
+                            let _ = app.emit("open-mailto", url.as_str().to_string());
+                        }
+                    }
+                }
+                _ => {}
             }
             #[cfg(not(target_os = "macos"))]
             let _ = (app, event);

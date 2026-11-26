@@ -9,6 +9,7 @@
   const groups = [...new Set(ACTIONS.map((a) => a.group))];
   const extras = [
     { label: "Ask AI from search", keys: ["⌘↩"] },
+    { label: "Print conversation", keys: ["⌘P"] },
     { label: "Undo last action", keys: ["⌘Z"] },
     { label: "Toggle sidebar", keys: ["⌥⌘S"] },
     { label: "Pick snooze preset", keys: ["1–5"] },

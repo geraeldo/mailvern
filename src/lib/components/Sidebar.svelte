@@ -61,6 +61,7 @@
         (!showUnified && ui.view.kind === "unified" && f.role === ui.view.role);
   const isUnifiedActive = (role: string) =>
     searching ? ui.searchScope.kind === "unified" && ui.searchScope.role === role : ui.view.kind === "unified" && ui.view.role === role;
+  const isSmartActive = (name: "flagged" | "unread") => !searching && ui.view.kind === "smart" && ui.view.name === name;
   const isAccountScope = (id: number) => searching && ui.searchScope.kind === "account" && ui.searchScope.accountId === id;
 
   const everyCollapsed = () => (!showUnified || allCollapsed) && ui.accounts.every((a) => collapsed[a.id]);
@@ -111,12 +112,32 @@
                 <span class="label">{u.name}</span>
                 {#if u.unread && u.role === "inbox"}<span class="count">{u.unread}</span>{/if}
               </button>
-              {#if u.role === "inbox" && (scheduled.length || ui.view.kind === "outbox")}
-                <button class="item" class:active={ui.view.kind === "outbox" && !ui.query} onclick={() => setView({ kind: "outbox" })}>
-                  <Icon name="outbox" />
-                  <span class="label">Scheduled</span>
-                  <span class="count" class:failed={scheduled.some((o) => o.error)}>{scheduled.length || ""}</span>
+              {#if u.role === "inbox"}
+                <button
+                  class="item"
+                  class:active={isSmartActive("unread")}
+                  onclick={() => setView({ kind: "smart", name: "unread" })}
+                  oncontextmenu={(e) => openFolderMenu(e, { kind: "smart", name: "unread" }, ui.smartCounts.unread)}>
+                  <Icon name="unread" />
+                  <span class="label">Unread</span>
+                  {#if ui.smartCounts.unread}<span class="count">{ui.smartCounts.unread}</span>{/if}
                 </button>
+                <button
+                  class="item"
+                  class:active={isSmartActive("flagged")}
+                  onclick={() => setView({ kind: "smart", name: "flagged" })}
+                  oncontextmenu={(e) => openFolderMenu(e, { kind: "smart", name: "flagged" }, 0)}>
+                  <Icon name="flag" />
+                  <span class="label">Flagged</span>
+                  {#if ui.smartCounts.flagged}<span class="count">{ui.smartCounts.flagged}</span>{/if}
+                </button>
+                {#if scheduled.length || ui.view.kind === "outbox"}
+                  <button class="item" class:active={ui.view.kind === "outbox" && !ui.query} onclick={() => setView({ kind: "outbox" })}>
+                    <Icon name="outbox" />
+                    <span class="label">Scheduled</span>
+                    <span class="count" class:failed={scheduled.some((o) => o.error)}>{scheduled.length || ""}</span>
+                  </button>
+                {/if}
               {/if}
             {/each}
           </div>
@@ -161,12 +182,32 @@
                   <span class="label">{f.name}</span>
                   {#if showCount(f)}<span class="count">{f.unread}</span>{/if}
                 </button>
-                {#if !showUnified && f.role === "inbox" && (scheduled.length || ui.view.kind === "outbox")}
-                  <button class="item" class:active={ui.view.kind === "outbox" && !ui.query} onclick={() => setView({ kind: "outbox" })}>
-                    <Icon name="outbox" />
-                    <span class="label">Scheduled</span>
-                    <span class="count" class:failed={scheduled.some((o) => o.error)}>{scheduled.length || ""}</span>
+                {#if !showUnified && f.role === "inbox"}
+                  <button
+                    class="item"
+                    class:active={isSmartActive("unread")}
+                    onclick={() => setView({ kind: "smart", name: "unread" })}
+                    oncontextmenu={(e) => openFolderMenu(e, { kind: "smart", name: "unread" }, ui.smartCounts.unread)}>
+                    <Icon name="unread" />
+                    <span class="label">Unread</span>
+                    {#if ui.smartCounts.unread}<span class="count">{ui.smartCounts.unread}</span>{/if}
                   </button>
+                  <button
+                    class="item"
+                    class:active={isSmartActive("flagged")}
+                    onclick={() => setView({ kind: "smart", name: "flagged" })}
+                    oncontextmenu={(e) => openFolderMenu(e, { kind: "smart", name: "flagged" }, 0)}>
+                    <Icon name="flag" />
+                    <span class="label">Flagged</span>
+                    {#if ui.smartCounts.flagged}<span class="count">{ui.smartCounts.flagged}</span>{/if}
+                  </button>
+                  {#if scheduled.length || ui.view.kind === "outbox"}
+                    <button class="item" class:active={ui.view.kind === "outbox" && !ui.query} onclick={() => setView({ kind: "outbox" })}>
+                      <Icon name="outbox" />
+                      <span class="label">Scheduled</span>
+                      <span class="count" class:failed={scheduled.some((o) => o.error)}>{scheduled.length || ""}</span>
+                    </button>
+                  {/if}
                 {/if}
               {/each}
             </div>

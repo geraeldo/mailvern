@@ -11,6 +11,8 @@
   import ShortcutHelp from "./lib/components/ShortcutHelp.svelte";
   import WhenPicker from "./lib/components/WhenPicker.svelte";
   import MovePicker from "./lib/components/MovePicker.svelte";
+  import PromptModal from "./lib/components/PromptModal.svelte";
+  import SourceModal from "./lib/components/SourceModal.svelte";
   import { api, type MailEvent } from "./lib/api";
   import { allowNativeMenu } from "./lib/menus";
   import { refreshBadge, loadBadgeMode } from "./lib/badge.svelte";
@@ -20,7 +22,8 @@
     ui, loadAccounts, loadFolders, loadList, loadTrusted, loadSentRecipients, loadPrefs, loadOutbox, loadPendingAgentActions, refreshThread, move, compose,
     archiveSelected, trashSelected, toggleJunk, toggleSeen, toggleFlag, accountById, openSettings, openAccountSettings,
     moveSelected, snoozeSelected, unsnoozeSelected, selectAll, extendSelection, clearSelection, snoozeRows, moveRows,
-    selectedRows, roleOf, toast, undoToast, runToastAction, copyThread, openMessage, commitPending, setPaneWidths, toggleSidebar,
+    selectedRows, roleOf, toast, undoToast, runToastAction, copyThread, openMessage, commitPending, setPaneWidths, toggleSidebar, submitFolderPrompt,
+    openMailto, printOpenThread,
   } from "./lib/state.svelte";
   import { snoozePresets } from "./lib/when";
   import { exitAi } from "./lib/ai/search.svelte";
@@ -47,6 +50,9 @@
       if (pendingFolders.has(v.folderId)) return true;
       const f = ui.folders.find((x) => x.id === v.folderId);
       return !!f && pendingAccounts.has(f.accountId);
+    }
+    if (v.kind === "smart") {
+      return v.accountId == null || pendingAccounts.has(v.accountId) || pendingFolders.size > 0;
     }
     if (v.kind === "unified") {
       for (const f of ui.folders) {
@@ -159,6 +165,7 @@
       }
     });
     // Bringing the window forward counts as looking at your mail: clear "new" from the badge.
+    const unMailto = listen<string>("open-mailto", ({ payload }) => openMailto(payload));
     const unFocus = getCurrentWindow().onFocusChanged(({ payload: focused }) => {
       windowFocused = focused;
       if (focused) refreshBadge();
@@ -169,6 +176,7 @@
       commitPending();
       window.removeEventListener("beforeunload", onUnload);
       un.then((f) => f());
+      unMailto.then((f) => f());
       unFocus.then((f) => f());
     };
   });
@@ -241,8 +249,13 @@
     if (keymap.recording) return;
     const combo = comboOf(e);
     if (!combo) return;
-    // Composer, pickers, shortcut guide and the settings popup handle their own keys.
-    if (ui.compose || ui.settings || ui.picker || ui.shortcutHelp) return;
+    // Settings, pickers, shortcut guide, expanded composer and modals handle their own keys.
+    if (ui.settings || ui.picker || ui.shortcutHelp || ui.folderPrompt || ui.sourceView || ui.composers.some((c) => c.expanded)) return;
+    if (combo === "mod+p" && ui.detail && ui.selectedIds.length <= 1) {
+      e.preventDefault();
+      printOpenThread();
+      return;
+    }
     if (combo === "mod+alt+s") {
       e.preventDefault();
       toggleSidebar();
@@ -311,10 +324,12 @@
   <Reader />
 </div>
 
-{#if ui.compose}
-  {#key ui.compose.key}
-    <Composer init={ui.compose} />
-  {/key}
+{#if ui.composers.length}
+  <div class="compose-dock">
+    {#each ui.composers as session (session.key)}
+      <Composer {session} />
+    {/each}
+  </div>
 {/if}
 
 {#if ui.settings}
@@ -338,6 +353,25 @@
     exclude={[...new Set(ui.picker.rows.map((r) => r.folderId))]}
     onpick={(f) => ui.picker?.kind === "move" && moveRows(ui.picker.rows, f)}
     onclose={() => (ui.picker = null)} />
+{/if}
+
+{#if ui.folderPrompt}
+  {@const fp = ui.folderPrompt}
+  <PromptModal
+    title={fp.kind === "create" ? (fp.parentName ? `New subfolder in ${fp.parentName}` : "New folder") : `Rename “${fp.folder.name}”`}
+    placeholder="Folder name"
+    initial={fp.kind === "rename" ? fp.folder.name : ""}
+    action={fp.kind === "create" ? "Create" : "Rename"}
+    onsubmit={submitFolderPrompt}
+    onclose={() => (ui.folderPrompt = null)} />
+{/if}
+
+{#if ui.sourceView}
+  <SourceModal
+    messageId={ui.sourceView.id}
+    subject={ui.sourceView.subject}
+    source={ui.sourceView.raw}
+    onclose={() => (ui.sourceView = null)} />
 {/if}
 
 {#if ui.toast}
@@ -381,6 +415,17 @@
     transition: background 0.12s;
   }
   .splitter:hover::after, .splitter.active::after { background: var(--accent); opacity: 0.55; }
+  .compose-dock {
+    position: fixed;
+    right: 18px;
+    bottom: 0;
+    z-index: 45;
+    display: flex;
+    align-items: flex-end;
+    gap: 12px;
+    max-width: calc(100vw - 36px);
+    pointer-events: none;
+  }
   .toast {
     position: fixed;
     left: 50%;

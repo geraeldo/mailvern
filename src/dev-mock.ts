@@ -3,9 +3,9 @@
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 
 const accounts = [
-  { id: 1, label: "Acme", name: "Alex Rivera", email: "hello@acme.co", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465, color: "#2F6BFF", signature: "<b>Alex Rivera</b><br>Acme Co.", position: 0 },
-  { id: 2, label: "Personal", name: "Alex Rivera", email: "alex@rivera.me", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465, color: "#4FA05A", signature: "— Alex", position: 1 },
-  { id: 3, label: "", name: "Acme Billing", email: "billing@acme.co", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465, color: "#D9A21B", signature: "", position: 2 },
+  { id: 1, label: "Acme", name: "Alex Rivera", email: "hello@acme.co", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465, color: "#2F6BFF", signature: "<b>Alex Rivera</b><br>Acme Co.", position: 0, aliases: [{ name: "Acme Support", email: "support@acme.co" }], replyTo: "" },
+  { id: 2, label: "Personal", name: "Alex Rivera", email: "alex@rivera.me", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465, color: "#4FA05A", signature: "— Alex", position: 1, aliases: [], replyTo: "" },
+  { id: 3, label: "", name: "Acme Billing", email: "billing@acme.co", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465, color: "#D9A21B", signature: "", position: 2, aliases: [], replyTo: "" },
 ];
 
 const roles = ["inbox", "drafts", "sent", "archive", "junk", "trash", "snoozed"];
@@ -550,6 +550,39 @@ export function installMock() {
         const custom = b && typeof b === "object" ? (Object.values(b)[0] as unknown) : null;
         return Array.isArray(custom) ? custom[0] : typeof custom === "string" ? custom : "Yes";
       }
+      case "smart_counts":
+        return {
+          flagged: messages.filter((m) => m.flagged).length,
+          unread: messages.filter((m) => !m.seen).length,
+        };
+      case "raw_source":
+        return `From: Maya Chen <maya@northwind.io>\r\nTo: hello@acme.co\r\nSubject: Sample Raw Source\r\nMessage-ID: <m${args.id}@example.com>\r\n\r\nRaw RFC 822 message body.`;
+      case "export_eml": return "/tmp/message.eml";
+      case "rsvp_invite": return args.status;
+      case "open_ics": return null;
+      case "quicklook_attachment": return null;
+      case "save_all_attachments": return 2;
+      case "stage_attachment": return { path: `/tmp/att-${args.id}-${args.index}.pdf`, name: "Q4-agenda.pdf", size: 284_000 };
+      case "stage_eml": return { path: `/tmp/msg-${args.id}.eml`, name: "Forwarded.eml", size: 4096 };
+      case "create_folder": {
+        const id = Math.max(...folders.map((f) => f.id)) + 1;
+        const f = { id, accountId: args.accountId, path: args.name, name: args.name, role: null, unread: 0, position: null };
+        folders.push(f);
+        return f;
+      }
+      case "rename_folder": {
+        const f = folders.find((x) => x.id === args.folderId);
+        if (f) { f.name = args.newName; f.path = args.newName; }
+        return null;
+      }
+      case "delete_folder": {
+        const idx = folders.findIndex((x) => x.id === args.folderId);
+        if (idx >= 0) folders.splice(idx, 1);
+        return null;
+      }
+      case "empty_folder":
+      case "permanent_delete":
+        return null;
       case "copy_text": (window as any).__copied = args.text; return navigator.clipboard?.writeText(args.text).catch(() => {});
       default: return null;
     }

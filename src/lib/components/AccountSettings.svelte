@@ -34,13 +34,15 @@
       color: accountColors[ui.accounts.length % accountColors.length],
       signature: "",
       position: 0,
+      aliases: [],
+      replyTo: "",
     };
   }
 
   function fromTarget(t: number | "new"): Account {
     if (typeof t === "number") {
       const a = ui.accounts.find((x) => x.id === t);
-      if (a) return { ...a };
+      if (a) return { ...a, aliases: (a.aliases ?? []).map((x) => ({ ...x })), replyTo: a.replyTo ?? "" };
     }
     return blank();
   }
@@ -56,6 +58,9 @@
   let sigMode = $state<"visual" | "html">("visual");
   let sigHtml = $state("");
   let sigKey = $state(0);
+  let newAliasName = $state("");
+  let newAliasEmail = $state("");
+  let aliasError = $state("");
   let hostsTouched = false;
   let loadedTarget: number | "new" | null = null;
 
@@ -72,7 +77,33 @@
       smtpPort: a.smtpPort,
       color: a.color,
       signature: sig,
+      aliases: a.aliases,
+      replyTo: a.replyTo,
     });
+  }
+
+  function addAlias() {
+    const email = newAliasEmail.trim();
+    const name = newAliasName.trim();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      aliasError = "Enter a valid email address";
+      return;
+    }
+    if (
+      email.toLowerCase() === draft.email.trim().toLowerCase() ||
+      draft.aliases.some((a) => a.email.toLowerCase() === email.toLowerCase())
+    ) {
+      aliasError = "That address is already on this account";
+      return;
+    }
+    draft.aliases = [...draft.aliases, { name, email }];
+    newAliasName = "";
+    newAliasEmail = "";
+    aliasError = "";
+  }
+
+  function removeAlias(email: string) {
+    draft.aliases = draft.aliases.filter((a) => a.email !== email);
   }
 
   function loadTarget(t: number | "new") {
@@ -151,7 +182,15 @@
     try {
       const wasFirst = ui.accounts.length === 0;
       const saved = await api.saveAccount(
-        { ...draft, email: draft.email.trim(), label: draft.label.trim(), name: draft.name.trim(), signature: currentSignature() },
+        {
+          ...draft,
+          email: draft.email.trim(),
+          label: draft.label.trim(),
+          name: draft.name.trim(),
+          replyTo: draft.replyTo.trim(),
+          aliases: draft.aliases.map((a) => ({ name: a.name.trim(), email: a.email.trim() })).filter((a) => a.email),
+          signature: currentSignature(),
+        },
         password || null,
       );
       const keepMode = sigMode;
@@ -266,6 +305,10 @@
             <span>Sender name</span>
             <input class="field" bind:value={draft.name} placeholder="Your name" />
           </label>
+          <label class="wide">
+            <span>Default Reply-To</span>
+            <input class="field" bind:value={draft.replyTo} placeholder="Optional (e.g. replies@company.com)" spellcheck="false" />
+          </label>
           <div class="wide">
             <span class="lbl">Color</span>
             <div class="swatches">
@@ -281,6 +324,41 @@
             </div>
           </div>
         </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="sec-title">Send-as aliases</div>
+      <div class="card">
+        <div class="alias-add">
+          <input class="field" bind:value={newAliasName} placeholder="Display name (optional)" />
+          <input
+            class="field"
+            bind:value={newAliasEmail}
+            placeholder="alias@domain.com"
+            spellcheck="false"
+            oninput={() => (aliasError = "")}
+            onkeydown={(e) => { if (e.key === "Enter") { e.preventDefault(); addAlias(); } }} />
+          <button type="button" class="btn sm" onclick={addAlias}>Add</button>
+        </div>
+        {#if aliasError}<p class="hint err">{aliasError}</p>{/if}
+        {#if draft.aliases.length}
+          <div class="alias-list">
+            {#each draft.aliases as a (a.email)}
+              <div class="alias-row">
+                <span class="alias-info">
+                  {#if a.name}<strong>{a.name}</strong> {/if}
+                  <span class="alias-mail">{a.email}</span>
+                </span>
+                <button type="button" class="icon-btn sm" title="Remove alias" aria-label={`Remove ${a.email}`} onclick={() => removeAlias(a.email)}>
+                  <Icon name="x" size={14} />
+                </button>
+              </div>
+            {/each}
+          </div>
+        {:else}
+          <p class="hint">Add extra addresses configured on your mail provider to choose from in the composer.</p>
+        {/if}
       </div>
     </section>
 
@@ -477,6 +555,14 @@
   .servers-card { margin-top: 2px; }
   .servers { grid-template-columns: 1fr 96px; }
   .hint { margin: 8px 0 0; font-size: 12px; color: var(--muted); }
+  .hint.err { color: var(--danger); }
+  .alias-add { display: grid; grid-template-columns: 1fr 1.2fr auto; gap: 8px; align-items: center; }
+  .alias-list { display: flex; flex-direction: column; margin-top: 10px; border-top: 1px solid var(--line); }
+  .alias-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+  .alias-row:last-child { border-bottom: 0; padding-bottom: 0; }
+  .alias-info { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .alias-mail { color: var(--muted); }
+  .icon-btn.sm { width: 26px; height: 26px; flex: none; }
   .grow { flex: 1; }
   footer {
     display: flex;

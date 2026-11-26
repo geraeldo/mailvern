@@ -375,6 +375,7 @@ pub fn forward_outgoing(m: &MessageDetail, account_id: i64, to: &[String], files
         references: None,
         message_id: None,
         auto_submitted: Some(AUTO_FORWARDED.into()),
+        ..Default::default()
     }
 }
 
@@ -401,6 +402,7 @@ pub fn reply_outgoing(f: &Facts, account_id: i64, subject: Option<&str>, text: &
         references,
         message_id: None,
         auto_submitted: Some(AUTO_REPLIED.into()),
+        ..Default::default()
     }
 }
 

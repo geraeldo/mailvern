@@ -2,12 +2,14 @@
   import { onMount, untrack } from "svelte";
   import Icon from "./Icon.svelte";
   import MailFrame from "./MailFrame.svelte";
+  import CalendarCard from "./CalendarCard.svelte";
   import { ui, compose, accountById, accountLabel, isSenderTrusted, shouldStripTrackers, trustSender, trustDomain, toast, roleOf, editDraft } from "../state.svelte";
   import { api, type Addr, type Summary } from "../api";
   import { longDate, shortDate, displayName, fileSize } from "../format";
   import Avatar from "./Avatar.svelte";
   import { addressMenu } from "../menus";
   import { hasRemoteContent, textToHtml } from "../html";
+  import { scanHtmlPhishing } from "../phishing";
   import { trustableDomain } from "../trust";
   import { getCachedDetail, hasShownImages, markShownImages, putDetail } from "../mail-cache.svelte";
 
@@ -32,6 +34,13 @@
   const allowRemote = $derived(trusted || hasShownImages(m.id));
   const stripTrackers = $derived(shouldStripTrackers(m.fromAddr));
   const isDraft = $derived(roleOf(m) === "drafts");
+  const isSentOrDraft = $derived(roleOf(m) === "sent" || isDraft);
+  const warnings = $derived.by(() => {
+    if (!d || isSentOrDraft) return [];
+    const header = d.warnings ?? [];
+    const links = scanHtmlPhishing(d.html);
+    return [...header, ...links];
+  });
   const acc = $derived(accountById(m.accountId));
 
   $effect(() => {
@@ -70,9 +79,28 @@
     open = false;
   }
 
+  let stagedPaths = $state<Record<number, string>>({});
+
   async function save(index: number) {
     try {
       await api.saveAttachment(m.id, index);
+    } catch (e) {
+      toast(String(e));
+    }
+  }
+
+  async function saveAll() {
+    try {
+      const n = await api.saveAllAttachments(m.id, null);
+      if (n > 0) toast(n === 1 ? "Saved 1 attachment to Downloads" : `Saved ${n} attachments to Downloads`);
+    } catch (e) {
+      toast(String(e));
+    }
+  }
+
+  async function quickLook(index: number) {
+    try {
+      await api.quicklookAttachment(m.id, index);
     } catch (e) {
       toast(String(e));
     }
@@ -84,6 +112,23 @@
     } catch (e) {
       toast(String(e));
     }
+  }
+
+  function warmStage(index: number) {
+    if (stagedPaths[index]) return;
+    api.stageAttachment(m.id, index).then((info) => {
+      stagedPaths[index] = info.path;
+    }).catch(() => {});
+  }
+
+  function onDragAttachment(e: DragEvent, index: number, filename: string, mime: string) {
+    const p = stagedPaths[index];
+    if (!p || !e.dataTransfer) return;
+    const fileUrl = `file://${encodeURI(p)}`;
+    e.dataTransfer.setData("text/uri-list", fileUrl);
+    e.dataTransfer.setData("DownloadURL", `${mime || "application/octet-stream"}:${filename}:${fileUrl}`);
+    e.dataTransfer.setData("application/x-mailvern-file", p);
+    e.dataTransfer.effectAllowed = "copy";
   }
 </script>
 
@@ -141,20 +186,51 @@
     </div>
 
     {#if d}
+      {#if warnings.length}
+        {@const severe = warnings.some((w) => w.severity === "danger")}
+        <div class="phish" class:severe role="alert">
+          <Icon name="shieldAlert" size={16} />
+          <div class="phish-body">
+            {#each warnings as w (w.kind)}
+              <div class="phish-item">
+                <strong>{w.title}.</strong> {w.detail}
+              </div>
+            {/each}
+          </div>
+        </div>
+      {/if}
+
+      {#if d.calendarInvite}
+        <CalendarCard messageId={m.id} invite={d.calendarInvite} />
+      {/if}
+
       {#if d.attachments.length}
         <div class="files">
           {#each d.attachments as a (a.index)}
-            <div class="file">
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <div
+              class="file"
+              draggable="true"
+              onpointerenter={() => warmStage(a.index)}
+              ondragstart={(e) => onDragAttachment(e, a.index, a.filename, a.mime)}>
               <button type="button" class="openf" onclick={() => openFile(a.index)} title={`Open ${a.filename}`}>
                 <span class="ficon"><Icon name="file" size={16} /></span>
                 <span class="fname">{a.filename}</span>
                 <span class="fsize">{fileSize(a.size)}</span>
+              </button>
+              <button type="button" class="icon-btn dl" title="Quick Look preview" aria-label={`Quick Look ${a.filename}`} onclick={() => quickLook(a.index)}>
+                <Icon name="eye" size={14} />
               </button>
               <button type="button" class="icon-btn dl" title="Save to Downloads" aria-label={`Download ${a.filename}`} onclick={() => save(a.index)}>
                 <Icon name="download" size={15} />
               </button>
             </div>
           {/each}
+          {#if d.attachments.length > 1}
+            <button type="button" class="btn sm save-all" onclick={saveAll}>
+              <Icon name="download" size={13} /> Save all ({d.attachments.length})
+            </button>
+          {/if}
         </div>
       {/if}
 
@@ -225,7 +301,29 @@
     .meta { gap: 10px; }
     .own .icon-btn.small { width: 24px; }
   }
-  .files { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
+  .files { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 20px; }
+  .save-all { height: 34px; }
+  .phish {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 10px 13px;
+    margin-bottom: 14px;
+    border-radius: 9px;
+    border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent);
+    background: color-mix(in srgb, var(--warn) 10%, transparent);
+    color: var(--text);
+    font-size: 12.5px;
+    line-height: 1.45;
+  }
+  .phish :global(svg) { flex: none; margin-top: 2px; color: var(--warn); }
+  .phish.severe {
+    border-color: color-mix(in srgb, var(--danger) 35%, transparent);
+    background: var(--danger-soft);
+  }
+  .phish.severe :global(svg) { color: var(--danger); }
+  .phish-body { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .phish-item strong { font-weight: 600; }
   .file {
     display: flex;
     align-items: center;

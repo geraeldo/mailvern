@@ -1,6 +1,14 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Alias {
+    #[serde(default)]
+    pub name: String,
+    pub email: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Account {
     #[serde(default)]
@@ -20,6 +28,12 @@ pub struct Account {
     /// Short name for the sidebar. Falls back to `name`, then `email`.
     #[serde(default)]
     pub label: String,
+    /// Additional "Send as" addresses for this account.
+    #[serde(default)]
+    pub aliases: Vec<Alias>,
+    /// Default custom Reply-To address for outgoing mail (empty = none).
+    #[serde(default)]
+    pub reply_to: String,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -57,7 +71,7 @@ pub struct MessageSummary {
     pub snoozed_until: Option<i64>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Addr {
     pub name: Option<String>,
     pub email: String,
@@ -70,6 +84,47 @@ pub struct AttachmentInfo {
     pub filename: String,
     pub mime: String,
     pub size: usize,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SecurityWarning {
+    pub kind: String,
+    /// "warn" | "danger"
+    pub severity: String,
+    pub title: String,
+    pub detail: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarAttendee {
+    pub name: Option<String>,
+    pub email: String,
+    /// ACCEPTED | DECLINED | TENTATIVE | NEEDS-ACTION
+    pub status: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarInvite {
+    pub uid: String,
+    /// REQUEST | CANCEL | REPLY | PUBLISH
+    pub method: String,
+    pub summary: String,
+    pub location: Option<String>,
+    pub description: Option<String>,
+    pub start: Option<i64>,
+    pub end: Option<i64>,
+    pub all_day: bool,
+    pub tzid: Option<String>,
+    pub dtstart_raw: String,
+    pub dtend_raw: Option<String>,
+    pub organizer: Option<Addr>,
+    pub attendees: Vec<CalendarAttendee>,
+    pub sequence: i64,
+    /// Current user's RSVP status ("ACCEPTED" | "TENTATIVE" | "DECLINED" | "NEEDS-ACTION").
+    pub my_status: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -89,9 +144,15 @@ pub struct MessageDetail {
     pub attachments: Vec<AttachmentInfo>,
     /// The List-Id header, for "Create rule from this list".
     pub list_id: Option<String>,
+    /// Phishing / spoofing warnings detected on headers.
+    #[serde(default)]
+    pub warnings: Vec<SecurityWarning>,
+    /// Inline calendar invitation (.ics), if the message contains one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar_invite: Option<CalendarInvite>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Outgoing {
     pub account_id: i64,
@@ -114,6 +175,15 @@ pub struct Outgoing {
     /// An `Auto-Submitted` header (RFC 3834) for mail a rule sends: "auto-replied" or "auto-generated".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_submitted: Option<String>,
+    /// Optional send-as alias email; None uses the account's primary address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_email: Option<String>,
+    /// Optional sender display name override for `from_email`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_name: Option<String>,
+    /// Optional custom Reply-To address (None = use account default; Some("") = none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
 }
 
 // ---------- rules ----------
@@ -331,6 +401,20 @@ pub enum View {
         #[serde(rename = "folderId")]
         folder_id: i64,
     },
+    /// Smart view across non-trash/junk folders ("flagged" or "unread"), optionally scoped to an account.
+    Smart {
+        name: String,
+        #[serde(rename = "accountId", default)]
+        account_id: Option<i64>,
+    },
+}
+
+/// Live counts for sidebar smart views.
+#[derive(Serialize, Clone, Copy, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SmartCounts {
+    pub flagged: i64,
+    pub unread: i64,
 }
 
 /// Where a search looks.

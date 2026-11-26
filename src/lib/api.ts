@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
+export type Alias = { name: string; email: string };
+
 export type Account = {
   id: number;
   name: string;
@@ -12,6 +14,8 @@ export type Account = {
   signature: string;
   position: number;
   label: string;
+  aliases: Alias[];
+  replyTo: string;
 };
 
 export type Folder = {
@@ -49,6 +53,26 @@ export type Addr = { name: string | null; email: string };
 
 export type Attachment = { index: number; filename: string; mime: string; size: number };
 
+export type SecurityWarning = { kind: string; severity: "warn" | "danger"; title: string; detail: string };
+export type CalendarAttendee = { name: string | null; email: string; status: string };
+export type CalendarInvite = {
+  uid: string;
+  method: string;
+  summary: string;
+  location: string | null;
+  description: string | null;
+  start: number | null;
+  end: number | null;
+  allDay: boolean;
+  tzid: string | null;
+  dtstartRaw: string;
+  dtendRaw: string | null;
+  organizer: Addr | null;
+  attendees: CalendarAttendee[];
+  sequence: number;
+  myStatus: string | null;
+};
+
 export type Detail = Summary & {
   to: Addr[];
   cc: Addr[];
@@ -62,10 +86,19 @@ export type Detail = Summary & {
   attachments: Attachment[];
   /** The List-Id header of mailing lists and notifications. */
   listId: string | null;
+  warnings?: SecurityWarning[];
+  calendarInvite?: CalendarInvite | null;
 };
 
+export type SmartName = "flagged" | "unread";
+export type SmartCounts = { flagged: number; unread: number };
+
 /** "outbox" is the app's own list of queued mail; it never goes to the backend as a view. */
-export type View = { kind: "unified"; role: string } | { kind: "folder"; folderId: number } | { kind: "outbox" };
+export type View =
+  | { kind: "unified"; role: string }
+  | { kind: "folder"; folderId: number }
+  | { kind: "smart"; name: SmartName; accountId?: number | null }
+  | { kind: "outbox" };
 
 export type MailView = Exclude<View, { kind: "outbox" }>;
 /** Where a search looks. */
@@ -126,6 +159,12 @@ export type Outgoing = {
   references: string | null;
   /** Kept across draft saves so each replaces the last; sending it removes the draft. */
   messageId?: string | null;
+  /** Optional send-as alias email; omitted/null uses the account's primary address. */
+  fromEmail?: string | null;
+  /** Optional display name override for `fromEmail`. */
+  fromName?: string | null;
+  /** Optional custom Reply-To address (null/undefined = account default, "" = none). */
+  replyTo?: string | null;
 };
 
 export type OutboxItem = { id: number; accountId: number; message: Outgoing; sendAt: number; error: string | null };
@@ -264,7 +303,14 @@ export const api = {
   deleteAccount: (id: number) => invoke<void>("delete_account", { id }),
   reorderAccounts: (ids: number[]) => invoke<void>("reorder_accounts", { ids }),
   folders: () => invoke<Folder[]>("folders"),
+  smartCounts: () => invoke<SmartCounts>("smart_counts"),
   reorderFolders: (accountId: number, ids: number[]) => invoke<void>("reorder_folders", { accountId, ids }),
+  createFolder: (accountId: number, name: string, parentId: number | null = null) =>
+    invoke<Folder>("create_folder", { accountId, name, parentId }),
+  renameFolder: (folderId: number, newName: string) => invoke<void>("rename_folder", { folderId, newName }),
+  deleteFolder: (folderId: number) => invoke<void>("delete_folder", { folderId }),
+  emptyFolder: (view: MailView) => invoke<void>("empty_folder", { view }),
+  permanentDelete: (ids: number[]) => invoke<void>("permanent_delete", { ids }),
   messages: (view: MailView, query: string | null, offset: number, limit: number, threaded = true) =>
     invoke<Summary[]>("messages", { view, query, offset, limit, threaded }),
   thread: (id: number) => invoke<Summary[]>("thread", { id }),
@@ -281,6 +327,10 @@ export const api = {
   badgeCount: () => invoke<number>("badge_count"),
   markBadgeSeen: () => invoke<void>("mark_badge_seen"),
   message: (id: number) => invoke<Detail>("message", { id }),
+  rsvpInvite: (id: number, status: "ACCEPTED" | "TENTATIVE" | "DECLINED") => invoke<string>("rsvp_invite", { id, status }),
+  openIcs: (id: number) => invoke<void>("open_ics", { id }),
+  rawSource: (id: number) => invoke<string>("raw_source", { id }),
+  exportEml: (id: number, dest: string | null = null) => invoke<string>("export_eml", { id, dest }),
   cachedMessage: (id: number) => invoke<Detail | null>("cached_message", { id }),
   setSeen: (ids: number[], seen: boolean) => invoke<void>("set_seen", { ids, seen }),
   markRead: (view: MailView) => invoke<void>("mark_read", { view }),
@@ -306,6 +356,10 @@ export const api = {
   setSetting: (key: string, value: string) => invoke<void>("set_setting", { key, value }),
   openAttachment: (id: number, index: number) => invoke<void>("open_attachment", { id, index }),
   saveAttachment: (id: number, index: number) => invoke<string>("save_attachment", { id, index }),
+  saveAllAttachments: (id: number, destDir: string | null = null) => invoke<number>("save_all_attachments", { id, destDir }),
+  quicklookAttachment: (id: number, index: number) => invoke<void>("quicklook_attachment", { id, index }),
+  stageAttachment: (id: number, index: number) => invoke<FileInfo>("stage_attachment", { id, index }),
+  stageEml: (id: number) => invoke<FileInfo>("stage_eml", { id }),
   copyText: (text: string) => invoke<void>("copy_text", { text }),
   fileInfo: (paths: string[]) => invoke<FileInfo[]>("file_info", { paths }),
   attachmentFiles: (id: number) => invoke<FileInfo[]>("attachment_files", { id }),

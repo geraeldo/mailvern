@@ -125,10 +125,40 @@ impl lettre::message::header::Header for AutoSubmitted {
 ///
 /// A draft keeps its Bcc header (so reopening it shows Bcc) and may have no recipients yet.
 pub fn build(acc: &Account, out: &Outgoing, message_id: &str, draft: bool) -> Result<Built> {
-    let domain = acc.email.split('@').nth(1).unwrap_or("mailvern.local");
-    let from_addr: Address = acc.email.parse()?;
-    let from = Mailbox::new(Some(acc.name.clone()).filter(|n| !n.is_empty()), from_addr.clone());
+    let sender_email = out
+        .from_email
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&acc.email);
+    let alias_name = acc
+        .aliases
+        .iter()
+        .find(|a| a.email.eq_ignore_ascii_case(sender_email))
+        .map(|a| a.name.trim())
+        .filter(|s| !s.is_empty());
+    let sender_name = out
+        .from_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or(alias_name)
+        .or_else(|| {
+            let n = acc.name.trim();
+            (!n.is_empty()).then_some(n)
+        })
+        .map(str::to_string);
+    let domain = sender_email.split('@').nth(1).unwrap_or("mailvern.local");
+    let from_addr: Address = sender_email.parse().map_err(|_| anyhow!("Invalid From address: {sender_email}"))?;
+    let from = Mailbox::new(sender_name, from_addr.clone());
     let mut b = Message::builder().from(from).subject(&out.subject).message_id(Some(message_id.to_string()));
+    let reply_to = match out.reply_to.as_deref() {
+        Some(rt) => rt.trim(),
+        None => acc.reply_to.trim(),
+    };
+    if !reply_to.is_empty() {
+        b = b.reply_to(mailbox(reply_to)?);
+    }
     if draft {
         // Lettre needs an envelope to build; a draft is never sent, so any will do.
         b = b.keep_bcc().envelope(Envelope::new(Some(from_addr.clone()), vec![from_addr])?);
@@ -178,6 +208,43 @@ pub fn build(acc: &Account, out: &Outgoing, message_id: &str, draft: bool) -> Re
         b.multipart(mixed)?
     };
 
+    let env = msg.envelope();
+    let envelope = SimpleEnvelope {
+        from: env.from().map(|a| a.to_string()).unwrap_or_default(),
+        to: env.to().iter().map(|a| a.to_string()).collect(),
+    };
+    Ok(Built { raw: msg.formatted(), envelope })
+}
+
+/// Builds an iMIP (RFC 6047) RSVP reply email carrying `text/plain` and `text/calendar; method=REPLY`.
+pub fn build_rsvp(
+    acc: &Account,
+    to_email: &str,
+    subject: &str,
+    plain: &str,
+    ics_body: &str,
+    message_id: &str,
+    in_reply_to: Option<&str>,
+    references: Option<&str>,
+) -> Result<Built> {
+    let from_addr: Address = acc.email.parse()?;
+    let from = Mailbox::new(Some(acc.name.clone()).filter(|n| !n.is_empty()), from_addr);
+    let mut b = Message::builder()
+        .from(from)
+        .to(mailbox(to_email)?)
+        .subject(subject)
+        .message_id(Some(message_id.to_string()));
+    if let Some(irt) = in_reply_to.filter(|s| !s.is_empty()) {
+        b = b.in_reply_to(irt.to_string());
+    }
+    if let Some(r) = references.filter(|s| !s.is_empty()) {
+        b = b.references(r.to_string());
+    }
+    let cal_ct = ContentType::parse("text/calendar; charset=utf-8; method=REPLY")
+        .unwrap_or_else(|_| ContentType::parse("text/calendar").unwrap());
+    let cal_part = SinglePart::builder().header(cal_ct).body(ics_body.to_string());
+    let alt = MultiPart::alternative().singlepart(SinglePart::plain(plain.to_string())).singlepart(cal_part);
+    let msg = b.multipart(alt)?;
     let env = msg.envelope();
     let envelope = SimpleEnvelope {
         from: env.from().map(|a| a.to_string()).unwrap_or_default(),
@@ -251,6 +318,7 @@ mod tests {
             signature: String::new(),
             position: 0,
             label: String::new(),
+            ..Default::default()
         }
     }
 
@@ -268,7 +336,30 @@ mod tests {
             references: None,
             message_id: None,
             auto_submitted: None,
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn build_respects_alias_and_reply_to() {
+        let mut a = acc();
+        a.aliases.push(crate::model::Alias { name: "Support".into(), email: "support@example.com".into() });
+        a.reply_to = "replies@example.com".into();
+        let mut o = out(&["bob@example.org"], &[]);
+        o.from_email = Some("support@example.com".into());
+        let built = build(&a, &o, "<id1@example.com>", false).unwrap();
+        let raw = String::from_utf8_lossy(&built.raw);
+        assert!(raw.contains("From: Support <support@example.com>"), "{raw}");
+        assert!(raw.contains("Reply-To: replies@example.com"), "{raw}");
+        assert_eq!(built.envelope.from, "support@example.com");
+
+        // Explicit per-message Reply-To overrides default; empty clears it.
+        o.reply_to = Some("custom@example.com".into());
+        let raw2 = String::from_utf8_lossy(&build(&a, &o, "<id2@example.com>", false).unwrap().raw).to_string();
+        assert!(raw2.contains("Reply-To: custom@example.com"), "{raw2}");
+        o.reply_to = Some(String::new());
+        let raw3 = String::from_utf8_lossy(&build(&a, &o, "<id3@example.com>", false).unwrap().raw).to_string();
+        assert!(!raw3.contains("Reply-To:"), "{raw3}");
     }
 
     #[test]

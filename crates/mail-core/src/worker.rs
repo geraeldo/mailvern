@@ -80,6 +80,9 @@ pub enum Cmd {
     /// Searches the server, in `folders` or wherever the mail could be.
     /// Replies with the local ids of the hits (stored if they weren't).
     Search { criteria: String, folders: Option<Vec<i64>>, reply: oneshot::Sender<Result<Vec<i64>>> },
+    CreateFolder { name: String, parent_id: Option<i64>, reply: oneshot::Sender<Result<crate::model::Folder>> },
+    RenameFolder { folder_id: i64, new_name: String, reply: oneshot::Sender<Result<()>> },
+    DeleteFolder { folder_id: i64, reply: oneshot::Sender<Result<()>> },
 }
 
 pub struct Worker {
@@ -356,6 +359,30 @@ impl Worker {
                     })
                     .await;
             }
+            Cmd::CreateFolder { name, parent_id, reply } => {
+                let res = self
+                    .retry(false, |w| {
+                        let n = name.clone();
+                        Box::pin(async move { w.create_folder(&n, parent_id).await })
+                    })
+                    .await;
+                let _ = reply.send(res);
+            }
+            Cmd::RenameFolder { folder_id, new_name, reply } => {
+                let res = self
+                    .retry(false, |w| {
+                        let n = new_name.clone();
+                        Box::pin(async move { w.rename_folder(folder_id, &n).await })
+                    })
+                    .await;
+                let _ = reply.send(res);
+            }
+            Cmd::DeleteFolder { folder_id, reply } => {
+                let res = self
+                    .retry(false, |w| Box::pin(async move { w.delete_folder(folder_id).await }))
+                    .await;
+                let _ = reply.send(res);
+            }
             Cmd::SyncAll { .. } | Cmd::SyncFolder { .. } => {}
         }
     }
@@ -566,6 +593,17 @@ impl Worker {
                 self.db.invalidate_folder_counts(op.folder_id)?;
                 Ok(())
             }
+            PendingOpPayload::EmptyFolder => {
+                self.select(&path).await?;
+                let s = self.ensure().await?;
+                let uids = imap::uid_search(s, "ALL").await?;
+                self.touch();
+                if !uids.is_empty() {
+                    self.expunge_uids(&uids).await?;
+                }
+                self.db.invalidate_folder_counts(op.folder_id)?;
+                Ok(())
+            }
             PendingOpPayload::MoveRole { role } => {
                 if op.uids.is_empty() {
                     return Ok(());
@@ -587,6 +625,110 @@ impl Worker {
                 self.exec_move((op.folder_id, &path, is_inbox_src), &op.uids, (*to_folder_id, &to_path, to_role.as_deref())).await
             }
         }
+    }
+
+    fn infer_delimiter(&self) -> char {
+        if let Ok(folders) = self.db.account_folders(self.account.id) {
+            for (_, path, _) in &folders {
+                if path.contains('/') {
+                    return '/';
+                }
+                if path.contains('.') {
+                    return '.';
+                }
+            }
+        }
+        '/'
+    }
+
+    async fn create_folder(&mut self, name: &str, parent_id: Option<i64>) -> Result<crate::model::Folder> {
+        let clean = name.trim();
+        if clean.is_empty() {
+            return Err(anyhow!("Folder name can't be empty"));
+        }
+        if clean.contains(['\r', '\n', '\0']) {
+            return Err(anyhow!("Folder name contains invalid characters"));
+        }
+        let delim = self.infer_delimiter();
+        let path = match parent_id {
+            Some(pid) => {
+                let (acc, parent_path, _) = self.db.folder(pid)?;
+                if acc != self.account.id {
+                    return Err(anyhow!("Parent folder belongs to another account"));
+                }
+                format!("{parent_path}{delim}{clean}")
+            }
+            None => clean.to_string(),
+        };
+        let s = self.ensure().await?;
+        imap::create_folder(s, &path).await?;
+        self.touch();
+        let id = self.db.upsert_folder(self.account.id, &path, clean, None)?;
+        let _ = self.events.send(Event::Changed { account_id: self.account.id, folder_id: None });
+        Ok(crate::model::Folder {
+            id,
+            account_id: self.account.id,
+            path,
+            name: clean.to_string(),
+            role: None,
+            unread: 0,
+            position: None,
+        })
+    }
+
+    async fn rename_folder(&mut self, folder_id: i64, new_name: &str) -> Result<()> {
+        let clean = new_name.trim();
+        if clean.is_empty() {
+            return Err(anyhow!("Folder name can't be empty"));
+        }
+        if clean.contains(['\r', '\n', '\0']) {
+            return Err(anyhow!("Folder name contains invalid characters"));
+        }
+        let (acc, old_path, role) = self.db.folder(folder_id)?;
+        if acc != self.account.id {
+            return Err(anyhow!("Folder belongs to another account"));
+        }
+        if role.is_some() {
+            return Err(anyhow!("Standard folders can't be renamed"));
+        }
+        let new_path = if let Some((prefix, _)) = old_path.rsplit_once('/') {
+            format!("{prefix}/{clean}")
+        } else if let Some((prefix, _)) = old_path.rsplit_once('.') {
+            format!("{prefix}.{clean}")
+        } else {
+            clean.to_string()
+        };
+        if new_path == old_path {
+            return Ok(());
+        }
+        if self.selected.as_deref() == Some(old_path.as_str()) {
+            self.selected = None;
+        }
+        let s = self.ensure().await?;
+        imap::rename_folder(s, &old_path, &new_path).await?;
+        self.touch();
+        self.db.rename_folder_local(folder_id, &new_path, clean)?;
+        let _ = self.events.send(Event::Changed { account_id: self.account.id, folder_id: None });
+        Ok(())
+    }
+
+    async fn delete_folder(&mut self, folder_id: i64) -> Result<()> {
+        let (acc, path, role) = self.db.folder(folder_id)?;
+        if acc != self.account.id {
+            return Err(anyhow!("Folder belongs to another account"));
+        }
+        if role.is_some() {
+            return Err(anyhow!("Standard folders can't be deleted"));
+        }
+        if self.selected.as_deref() == Some(path.as_str()) {
+            let _ = self.select("INBOX").await;
+        }
+        let s = self.ensure().await?;
+        imap::delete_folder(s, &path).await?;
+        self.touch();
+        self.db.delete_folder_local(folder_id)?;
+        let _ = self.events.send(Event::Changed { account_id: self.account.id, folder_id: None });
+        Ok(())
     }
 
     async fn exec_move(
@@ -1568,6 +1710,7 @@ mod tests {
             signature: String::new(),
             position: 0,
             label: String::new(),
+            ..Default::default()
         };
         let (ev_tx, _) = broadcast::channel(8);
         let (tx, rx) = mpsc::unbounded_channel();

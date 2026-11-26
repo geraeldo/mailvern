@@ -195,6 +195,7 @@ pub fn compose(args: &DraftArgs, account: &Account, mine: &[String], source: Opt
         references,
         message_id: None,
         auto_submitted: None,
+        ..Default::default()
     })
 }
 
@@ -313,6 +314,7 @@ pub fn edit(args: &EditArgs, account: &Account, existing: &MessageDetail, kept: 
         references: existing.references.clone(),
         message_id: existing.message_id.clone(),
         auto_submitted: None,
+        ..Default::default()
     })
 }
 
@@ -334,6 +336,7 @@ mod tests {
             signature: "<b>Alex</b><br>Acme".into(),
             position: 0,
             label: String::new(),
+            ..Default::default()
         }
     }
 
@@ -368,6 +371,8 @@ mod tests {
             text: None,
             attachments: vec![],
             list_id: None,
+            warnings: vec![],
+            calendar_invite: None,
         }
     }
 

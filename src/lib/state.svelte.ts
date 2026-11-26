@@ -1,5 +1,5 @@
 import {
-  api, type Account, type Detail, type FileInfo, type Folder, type MailView, type OutboxItem, type Outgoing, type SearchScope, type Summary, type View,
+  api, type Account, type Detail, type FileInfo, type Folder, type MailView, type OutboxItem, type Outgoing, type SearchScope, type SmartCounts, type Summary, type View,
 } from "./api";
 import { formatAddr } from "./format";
 import { threadText } from "./copy";
@@ -15,7 +15,20 @@ import {
 export type ComposeMode = "new" | "reply" | "replyAll" | "forward" | "draft";
 /** A message to reopen in the composer: a saved draft, or one taken back out of the outbox. */
 export type Restore = { message: Outgoing; attachments: FileInfo[]; unsaved?: boolean };
-export type ComposeInit = { mode: ComposeMode; source?: Detail; accountId?: number; to?: string[]; restore?: Restore; key: number };
+export type ComposeInit = {
+  mode: ComposeMode;
+  source?: Detail;
+  accountId?: number;
+  to?: string[];
+  cc?: string[];
+  bcc?: string[];
+  subject?: string;
+  bodyText?: string;
+  attachments?: FileInfo[];
+  restore?: Restore;
+  key: number;
+};
+export type ComposeSession = ComposeInit & { minimized: boolean; expanded: boolean };
 export type SettingsSection = "general" | "accounts" | "rules" | "ai" | "agents" | "shortcuts";
 export type RemoteImagesMode = "ask" | "strip_trackers" | "always";
 export type SyncStatus = { state: "syncing" | "idle" | "error"; message: string | null };
@@ -49,12 +62,16 @@ export function aiSourceTurn(a: AiSearch | null): AiTurn | null {
 }
 export const aiRunning = (a: AiSearch | null) => !!a?.turns.some((t) => t.running);
 export type Picker = { kind: "snooze"; rows: Summary[] } | { kind: "move"; rows: Summary[]; accountId: number };
+export type FolderPrompt =
+  | { kind: "create"; accountId: number; parentId: number | null; parentName?: string }
+  | { kind: "rename"; folder: Folder };
 
 const PAGE = 200;
 
 export const ui = $state({
   accounts: [] as Account[],
   folders: [] as Folder[],
+  smartCounts: { flagged: 0, unread: 0 } as SmartCounts,
   view: { kind: "unified", role: "inbox" } as View,
   list: [] as Summary[],
   hasMore: false,
@@ -80,7 +97,9 @@ export const ui = $state({
   searchingServer: false,
   /** AI search results, shown in the list instead of the word search while set. */
   ai: null as AiSearch | null,
-  compose: null as ComposeInit | null,
+  /** Open non-blocking composer sessions (supports multiple simultaneous drafts). */
+  composers: [] as ComposeSession[],
+  activeComposerKey: null as number | null,
   /** Unified app & account settings modal. */
   settings: null as SettingsSection | null,
   /** Selected account inside Settings › Accounts (account id, or "new"). */
@@ -92,6 +111,8 @@ export const ui = $state({
   sideWidth: 214,
   listWidth: 336,
   picker: null as Picker | null,
+  folderPrompt: null as FolderPrompt | null,
+  sourceView: null as { id: number; subject: string; raw: string } | null,
   status: {} as Record<number, SyncStatus>,
   toast: null as { text: string; undo?: () => void; action?: { label: string; fn: () => void } } | null,
   trustedSenders: [] as string[],
@@ -203,6 +224,7 @@ export function beginSearch() {
 export function viewTitle(): string {
   if (ui.query.trim()) return "Search";
   if (ui.view.kind === "outbox") return "Scheduled";
+  if (ui.view.kind === "smart") return ui.view.name === "flagged" ? "Flagged" : "Unread";
   if (ui.view.kind === "unified") {
     const role = ui.view.role;
     return unifiedRoles.find((r) => r.role === role)?.name ?? "";
@@ -307,7 +329,12 @@ export async function reorderFolders(accountId: number, visibleIds: number[]) {
 }
 
 export async function loadFolders() {
-  ui.folders = await api.folders();
+  const [folders, counts] = await Promise.all([
+    api.folders(),
+    api.smartCounts().catch(() => ui.smartCounts),
+  ]);
+  ui.folders = folders;
+  ui.smartCounts = counts;
 }
 
 export async function loadOutbox() {
@@ -392,7 +419,8 @@ export async function loadList(reset = true) {
 
 /** Views whose folders have no older mail left on the server. */
 const reachedStart = new Set<string>();
-const viewKey = (v: View) => (v.kind === "folder" ? `f${v.folderId}` : v.kind === "unified" ? `u${v.role}` : v.kind);
+const viewKey = (v: View) =>
+  v.kind === "folder" ? `f${v.folderId}` : v.kind === "unified" ? `u${v.role}` : v.kind === "smart" ? `s${v.name}${v.accountId ?? ""}` : v.kind;
 
 /** Next page from the local cache; past its end, older mail from the server. */
 export async function loadMore() {
@@ -401,6 +429,7 @@ export async function loadMore() {
     await loadList(false);
     return;
   }
+  if (ui.view.kind === "smart") return;
   const view = ui.view;
   const key = viewKey(view);
   if (reachedStart.has(key)) return;
@@ -872,6 +901,79 @@ export async function loadPendingAgentActions() {
   }
 }
 
+export async function forwardAsAttachment(d: Detail) {
+  try {
+    const file = await api.stageEml(d.id);
+    compose("new", {
+      accountId: d.accountId,
+      subject: d.subject ? `Fwd: ${d.subject}` : "Forwarded message",
+      attachments: [file],
+    });
+  } catch (e) {
+    toast(String(e));
+  }
+}
+
+export async function openRawSource(id: number, subject = "") {
+  try {
+    const raw = await api.rawSource(id);
+    ui.sourceView = { id, subject, raw };
+  } catch (e) {
+    toast(String(e));
+  }
+}
+
+export async function exportMessageEml(id: number, subject = "") {
+  try {
+    const { save } = await import("@tauri-apps/plugin-dialog");
+    const stem = (subject || `message-${id}`).replace(/[/:*?"<>|\\]+/g, "_").trim() || `message-${id}`;
+    const dest = await save({
+      defaultPath: `${stem}.eml`,
+      filters: [{ name: "Email", extensions: ["eml"] }],
+    });
+    if (!dest) return;
+    await api.exportEml(id, dest);
+    toast("Exported .eml");
+  } catch (e) {
+    toast(String(e));
+  }
+}
+
+export async function printOpenThread() {
+  const d = ui.detail;
+  if (!d || ui.selectedIds.length > 1) return;
+  const thread = ui.thread.length ? ui.thread : [d];
+  try {
+    const items = await Promise.all(
+      thread.map(async (m) => {
+        const hit = getCachedDetail(m.id) ?? ui.details[m.id];
+        if (hit) return hit;
+        const fetched = await api.message(m.id);
+        putDetail(fetched);
+        return fetched;
+      }),
+    );
+    const { printMessages } = await import("./print");
+    printMessages(d.subject, items);
+  } catch (e) {
+    toast(`Couldn't print: ${e}`);
+  }
+}
+
+export function openMailto(url: string) {
+  import("./mailto").then(({ parseMailto }) => {
+    const parsed = parseMailto(url);
+    if (!parsed) return;
+    compose("new", {
+      to: parsed.to,
+      cc: parsed.cc,
+      bcc: parsed.bcc,
+      subject: parsed.subject,
+      bodyText: parsed.body,
+    });
+  });
+}
+
 /** Copies the open conversation as plain text (for an AI chat, notes, a ticket). */
 export async function copyThread() {
   const d = ui.detail;
@@ -973,6 +1075,93 @@ export const trashRows = (rows: Summary[]) => deferBulk(counted("Deleted", rows.
 export const archiveSelected = () => archiveRows(selectedRows());
 export const trashSelected = () => trashRows(selectedRows());
 
+export async function permanentDeleteRows(rows: Summary[]) {
+  if (!rows.length) return;
+  const { ask } = await import("@tauri-apps/plugin-dialog");
+  const n = rows.length;
+  const ok = await ask(
+    n === 1 ? "Permanently delete this message? This can't be undone." : `Permanently delete ${n} conversations? This can't be undone.`,
+    { title: "Delete Permanently", kind: "warning", okLabel: "Delete", cancelLabel: "Cancel" },
+  );
+  if (!ok) return;
+  commitPending();
+  const ids = removeRows(rows);
+  evictMessages(ids);
+  await run(api.permanentDelete(ids));
+  toast(counted("Permanently deleted", n));
+}
+
+export const permanentDeleteSelected = () => permanentDeleteRows(selectedRows());
+
+export async function emptyFolderView(view: MailView) {
+  const { ask } = await import("@tauri-apps/plugin-dialog");
+  const label =
+    view.kind === "unified"
+      ? view.role === "junk" ? "All Junk" : "All Trash"
+      : view.kind === "folder"
+        ? (folderById(view.folderId)?.name ?? "this folder")
+        : "this folder";
+  const ok = await ask(`Permanently delete all messages in ${label}? This can't be undone.`, {
+    title: `Empty ${label}`,
+    kind: "warning",
+    okLabel: "Empty",
+    cancelLabel: "Cancel",
+  });
+  if (!ok) return;
+  commitPending();
+  await run(api.emptyFolder(view));
+  loadList(true);
+  toast(`Emptied ${label}`);
+}
+
+export function promptCreateFolder(accountId: number, parentId: number | null = null, parentName?: string) {
+  ui.folderPrompt = { kind: "create", accountId, parentId, parentName };
+}
+
+export function promptRenameFolder(folder: Folder) {
+  ui.folderPrompt = { kind: "rename", folder };
+}
+
+export async function submitFolderPrompt(name: string) {
+  const p = ui.folderPrompt;
+  if (!p) return;
+  try {
+    if (p.kind === "create") {
+      await api.createFolder(p.accountId, name, p.parentId);
+      await loadFolders();
+      toast(`Created folder “${name}”`);
+    } else {
+      await api.renameFolder(p.folder.id, name);
+      await loadFolders();
+      toast(`Renamed to “${name}”`);
+    }
+  } catch (e) {
+    toast(String(e));
+    throw e;
+  }
+}
+
+export async function deleteFolderConfirm(folder: Folder) {
+  const { ask } = await import("@tauri-apps/plugin-dialog");
+  const ok = await ask(`Delete folder “${folder.name}” and its messages from the server? This can't be undone.`, {
+    title: "Delete Folder",
+    kind: "warning",
+    okLabel: "Delete",
+    cancelLabel: "Cancel",
+  });
+  if (!ok) return;
+  try {
+    await api.deleteFolder(folder.id);
+    if (ui.view.kind === "folder" && ui.view.folderId === folder.id) {
+      setView({ kind: "unified", role: "inbox" });
+    }
+    await loadFolders();
+    toast(`Deleted folder “${folder.name}”`);
+  } catch (e) {
+    toast(String(e));
+  }
+}
+
 /** True when the selection sits in a Junk folder, so the junk action means "Not Junk". */
 export function selectedIsJunk(): boolean {
   return roleOf(selectedRows()[0]) === "junk";
@@ -1018,8 +1207,15 @@ export function toggleFlag() {
   run(api.setFlagged(ids, flagged));
 }
 
-/** Marks everything in a folder (or a unified folder) as read, here and on the server. */
+/** Marks everything in a folder (or a unified/smart view) as read, here and on the server. */
 export async function markAllRead(view: MailView) {
+  if (view.kind === "smart") {
+    for (const m of ui.list) m.seen = true;
+    if (ui.detail) ui.detail.seen = true;
+    await run(api.markRead(view));
+    if (ui.view.kind === "smart" && ui.view.name === "unread") loadList(true);
+    return;
+  }
   const inView = (fid: number) =>
     view.kind === "folder" ? fid === view.folderId : view.kind === "unified" && folderById(fid)?.role === view.role;
   for (const m of ui.list) if (inView(m.folderId)) m.seen = true;
@@ -1078,7 +1274,64 @@ export function compose(mode: ComposeMode = "new", extra: Partial<ComposeInit> =
   }
   const source = mode === "new" || mode === "draft" ? undefined : (ui.detail ?? undefined);
   if ((mode === "reply" || mode === "replyAll" || mode === "forward") && !(extra.source ?? source)) return;
-  ui.compose = { mode, source, key: ++composeKey, ...extra };
+  const draftMid = extra.restore?.message.messageId;
+  if (draftMid) {
+    const existing = ui.composers.find((c) => c.restore?.message.messageId === draftMid);
+    if (existing) {
+      existing.minimized = false;
+      ui.activeComposerKey = existing.key;
+      return;
+    }
+  }
+  // Minimize older docked composers if opening a 3rd+ draft so the screen stays tidy.
+  const openDocked = ui.composers.filter((c) => !c.minimized && !c.expanded);
+  if (openDocked.length >= 2) {
+    openDocked[0].minimized = true;
+  }
+  const key = ++composeKey;
+  ui.composers = [...ui.composers, { mode, source, key, minimized: false, expanded: false, ...extra }];
+  ui.activeComposerKey = key;
+}
+
+export function closeComposer(key: number) {
+  ui.composers = ui.composers.filter((c) => c.key !== key);
+  if (ui.activeComposerKey === key) {
+    const open = ui.composers.filter((c) => !c.minimized);
+    const next = open[open.length - 1] ?? ui.composers[ui.composers.length - 1] ?? null;
+    ui.activeComposerKey = next ? next.key : null;
+  }
+}
+
+export function focusComposer(key: number) {
+  ui.activeComposerKey = key;
+  const c = ui.composers.find((x) => x.key === key);
+  if (c && c.minimized) c.minimized = false;
+}
+
+export function toggleMinimizeComposer(key: number) {
+  const c = ui.composers.find((x) => x.key === key);
+  if (!c) return;
+  c.minimized = !c.minimized;
+  if (c.minimized) {
+    c.expanded = false;
+    if (ui.activeComposerKey === key) {
+      const open = ui.composers.filter((x) => x.key !== key && !x.minimized);
+      const next = open[open.length - 1] ?? null;
+      ui.activeComposerKey = next ? next.key : null;
+    }
+  } else {
+    ui.activeComposerKey = key;
+  }
+}
+
+export function toggleExpandComposer(key: number) {
+  const c = ui.composers.find((x) => x.key === key);
+  if (!c) return;
+  c.expanded = !c.expanded;
+  if (c.expanded) {
+    c.minimized = false;
+    ui.activeComposerKey = key;
+  }
 }
 
 /** Opens a saved draft in the composer. */
@@ -1105,6 +1358,9 @@ export async function editDraft(d: Detail) {
         inReplyTo: d.inReplyTo,
         references: d.references,
         messageId: d.messageId,
+        fromEmail: d.fromAddr || null,
+        fromName: d.fromName || null,
+        replyTo: d.replyTo.length ? formatAddr(d.replyTo[0]) : "",
       },
       attachments,
     },

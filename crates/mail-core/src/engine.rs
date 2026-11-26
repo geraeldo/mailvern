@@ -231,6 +231,84 @@ impl Engine {
         self.db.reorder_folders(account_id, ids)
     }
 
+    pub async fn create_folder(&self, account_id: i64, name: &str, parent_id: Option<i64>) -> Result<Folder> {
+        let (tx, rx) = oneshot::channel();
+        self.send_cmd(account_id, Cmd::CreateFolder { name: name.to_string(), parent_id, reply: tx })?;
+        tokio::time::timeout(Duration::from_secs(30), rx)
+            .await
+            .map_err(|_| anyhow!("Timed out creating folder"))?
+            .map_err(|_| anyhow!("Account worker stopped"))?
+    }
+
+    pub async fn rename_folder(&self, folder_id: i64, new_name: &str) -> Result<()> {
+        let (account_id, _, role) = self.db.folder(folder_id)?;
+        if role.is_some() {
+            return Err(anyhow!("Standard folders can't be renamed"));
+        }
+        let (tx, rx) = oneshot::channel();
+        self.send_cmd(account_id, Cmd::RenameFolder { folder_id, new_name: new_name.to_string(), reply: tx })?;
+        tokio::time::timeout(Duration::from_secs(30), rx)
+            .await
+            .map_err(|_| anyhow!("Timed out renaming folder"))?
+            .map_err(|_| anyhow!("Account worker stopped"))?
+    }
+
+    pub async fn delete_folder(&self, folder_id: i64) -> Result<()> {
+        let (account_id, _, role) = self.db.folder(folder_id)?;
+        if role.is_some() {
+            return Err(anyhow!("Standard folders can't be deleted"));
+        }
+        let (tx, rx) = oneshot::channel();
+        self.send_cmd(account_id, Cmd::DeleteFolder { folder_id, reply: tx })?;
+        tokio::time::timeout(Duration::from_secs(30), rx)
+            .await
+            .map_err(|_| anyhow!("Timed out deleting folder"))?
+            .map_err(|_| anyhow!("Account worker stopped"))?
+    }
+
+    /// Permanently empties Trash or Junk (a single folder, or unified Trash/Junk across accounts).
+    pub fn empty_folder(&self, view: &View) -> Result<()> {
+        let folders: Vec<(i64, i64)> = match view {
+            View::Folder { folder_id } => {
+                let (acc, _, role) = self.db.folder(*folder_id)?;
+                if !matches!(role.as_deref(), Some("trash") | Some("junk")) {
+                    return Err(anyhow!("Only Trash and Junk folders can be emptied"));
+                }
+                vec![(acc, *folder_id)]
+            }
+            View::Unified { role } if matches!(role.as_str(), "trash" | "junk") => self.view_folders(view)?,
+            _ => return Err(anyhow!("Only Trash and Junk folders can be emptied")),
+        };
+        let t = now();
+        for (acc, folder_id) in folders {
+            self.db.clear_folder_messages(folder_id)?;
+            self.db.enqueue_pending_op(acc, folder_id, &PendingOpPayload::EmptyFolder, &[], t)?;
+            self.send_cmd(acc, Cmd::FlushOps)?;
+            let _ = self.events.send(Event::Changed { account_id: acc, folder_id: Some(folder_id) });
+        }
+        Ok(())
+    }
+
+    /// Permanently deletes messages from the server without moving them to Trash.
+    pub fn permanent_delete(&self, ids: &[i64]) -> Result<()> {
+        let g = self.group_ids(ids)?;
+        let mut deleted = Vec::new();
+        let mut changed = Vec::new();
+        let t = now();
+        for ((acc, folder_id), msgs) in g {
+            let uids: Vec<u32> = msgs.iter().map(|m| m.1).collect();
+            self.db.enqueue_pending_op(acc, folder_id, &PendingOpPayload::Delete, &uids, t)?;
+            self.send_cmd(acc, Cmd::FlushOps)?;
+            deleted.extend(msgs.iter().map(|m| m.0));
+            changed.push((acc, folder_id));
+        }
+        self.db.delete_messages(&deleted)?;
+        for (account_id, folder_id) in changed {
+            let _ = self.events.send(Event::Changed { account_id, folder_id: Some(folder_id) });
+        }
+        Ok(())
+    }
+
     pub fn delete_account(&self, id: i64) -> Result<()> {
         let acc = self.db.account(id)?;
         self.workers.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
@@ -299,16 +377,54 @@ impl Engine {
                 .map(|f| (f.account_id, f.id))
                 .collect(),
             View::Folder { folder_id } => vec![(self.db.folder(*folder_id)?.0, *folder_id)],
+            View::Smart { account_id, .. } => self
+                .db
+                .folders()?
+                .into_iter()
+                .filter(|f| {
+                    account_id.is_none_or(|a| f.account_id == a)
+                        && f.role.as_deref() == Some("inbox")
+                })
+                .map(|f| (f.account_id, f.id))
+                .collect(),
         })
     }
 
+    pub fn smart_counts(&self) -> Result<SmartCounts> {
+        self.db.smart_counts()
+    }
+
     pub fn search(&self, query: &str, scope: &SearchScope) -> Result<Vec<MessageSummary>> {
+        let parsed = crate::search::parse_search_query(query, scope);
+        if parsed.has_operators {
+            if !crate::search::has_criteria(&parsed.query) {
+                return Ok(vec![]);
+            }
+            let mut q = parsed.query;
+            q.limit = Some(300);
+            return Ok(self.db.query_mail(&q)?.rows);
+        }
         self.db.search(query, scope, 300)
     }
 
     /// Asks the servers behind a scope, which also finds mail never downloaded and words in
     /// bodies not cached yet. Hits are stored locally; returns them newest first.
     pub async fn search_server(&self, query: &str, scope: &SearchScope) -> Result<Vec<MessageSummary>> {
+        let parsed = crate::search::parse_search_query(query, scope);
+        if parsed.has_operators {
+            if !crate::search::has_criteria(&parsed.query) {
+                return Ok(vec![]);
+            }
+            let mut q = parsed.query;
+            q.limit = Some(300);
+            let (res, server_err) = self.query_mail_server(&q).await?;
+            if res.rows.is_empty() {
+                if let Some(err) = server_err {
+                    return Err(anyhow!(err));
+                }
+            }
+            return Ok(res.rows);
+        }
         let terms: Vec<String> = query.split_whitespace().map(|t| t.trim_matches('"').to_string()).filter(|t| !t.is_empty()).collect();
         if terms.is_empty() {
             return Ok(vec![]);
@@ -458,7 +574,18 @@ impl Engine {
 
     fn build_detail(&self, id: i64, raw: &[u8]) -> Result<MessageDetail> {
         let (summary, to, cc, reply_to, message_id, references, in_reply_to) = self.db.summary(id)?;
-        let p = parse::display(raw);
+        let mut p = parse::display(raw);
+        if let Some(inv) = p.calendar_invite.as_mut() {
+            if let Ok(Some(saved)) = self.db.ics_rsvp(summary.account_id, &inv.uid) {
+                inv.my_status = Some(saved);
+            } else if let Ok(acc) = self.db.account(summary.account_id) {
+                let mut mine = vec![acc.email.to_ascii_lowercase()];
+                mine.extend(acc.aliases.iter().map(|a| a.email.to_ascii_lowercase()));
+                if let Some(att) = inv.attendees.iter().find(|a| mine.iter().any(|m| m.eq_ignore_ascii_case(&a.email))) {
+                    inv.my_status = Some(att.status.clone());
+                }
+            }
+        }
         Ok(MessageDetail {
             summary,
             to,
@@ -472,7 +599,89 @@ impl Engine {
             text: p.text,
             attachments: p.attachments,
             list_id: self.db.list_id(id)?,
+            warnings: p.warnings,
+            calendar_invite: p.calendar_invite,
         })
+    }
+
+    /// Sends an iMIP RSVP reply (`ACCEPTED`, `TENTATIVE`, or `DECLINED`) to the organizer of a calendar invite.
+    pub async fn rsvp_invite(&self, id: i64, status: &str) -> Result<String> {
+        let norm = match status.trim().to_ascii_uppercase().as_str() {
+            "ACCEPTED" | "ACCEPT" => "ACCEPTED",
+            "TENTATIVE" | "MAYBE" => "TENTATIVE",
+            "DECLINED" | "DECLINE" => "DECLINED",
+            other => return Err(anyhow!("Invalid RSVP status: {other}")),
+        };
+        let raw = self.raw(id).await?;
+        let parsed_msg = mail_parser::MessageParser::default()
+            .parse(&raw)
+            .ok_or_else(|| anyhow!("Could not parse message"))?;
+        let invite = crate::ics::parse_from_message(&parsed_msg).ok_or_else(|| anyhow!("No calendar invite in this message"))?;
+        let (summary, _, _, reply_to, orig_mid, orig_refs, _) = self.db.summary(id)?;
+        let acc = self.db.account(summary.account_id)?;
+        let target = invite
+            .organizer
+            .as_ref()
+            .map(|o| o.email.clone())
+            .or_else(|| reply_to.first().map(|r| r.email.clone()))
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| summary.from_addr.clone());
+        if target.trim().is_empty() {
+            return Err(anyhow!("No organizer address to reply to"));
+        }
+
+        let verb = match norm {
+            "ACCEPTED" => "Accepted",
+            "TENTATIVE" => "Tentative",
+            _ => "Declined",
+        };
+        let subject = format!("{verb}: {}", invite.summary);
+        let responder = if acc.name.trim().is_empty() { acc.email.clone() } else { acc.name.clone() };
+        let plain = format!("{responder} has responded {verb} to “{}”.", invite.summary);
+        let ics_body = crate::ics::build_rsvp_ics(&invite, &acc.name, &acc.email, norm);
+        let msg_id = smtp::new_message_id(&acc);
+        let refs = match (orig_refs.as_deref(), orig_mid.as_deref()) {
+            (Some(r), Some(m)) => Some(format!("{r} {m}")),
+            (None, Some(m)) => Some(m.to_string()),
+            (r, None) => r.map(str::to_string),
+        };
+        let built = smtp::build_rsvp(&acc, &target, &subject, &plain, &ics_body, &msg_id, orig_mid.as_deref(), refs.as_deref())?;
+        let out_summary = Outgoing {
+            account_id: acc.id,
+            to: vec![target],
+            subject,
+            text: plain,
+            in_reply_to: orig_mid,
+            references: refs,
+            message_id: Some(msg_id.clone()),
+            ..Default::default()
+        };
+        self.db.add_outbox(
+            acc.id,
+            &msg_id,
+            &serde_json::to_string(&out_summary)?,
+            &built.raw,
+            &serde_json::to_string(&built.envelope)?,
+            now(),
+        )?;
+        self.db.set_ics_rsvp(acc.id, &invite.uid, norm, now())?;
+        self.wake.notify_one();
+        let _ = self.events.send(Event::Outbox);
+        Ok(norm.to_string())
+    }
+
+    /// Extracts raw `.ics` bytes for opening in macOS Calendar.
+    pub async fn raw_ics(&self, id: i64) -> Result<(String, Vec<u8>)> {
+        let raw = self.raw(id).await?;
+        let m = mail_parser::MessageParser::default()
+            .parse(&raw)
+            .ok_or_else(|| anyhow!("Could not parse message"))?;
+        let bytes = crate::ics::extract_raw_ics(&m).ok_or_else(|| anyhow!("No calendar invite in this message"))?;
+        let name = crate::ics::parse_ics(&bytes)
+            .map(|i| format!("{}.ics", i.summary.trim()))
+            .filter(|s| s.len() > 4)
+            .unwrap_or_else(|| format!("invite-{id}.ics"));
+        Ok((name, bytes))
     }
 
     /// Returns a parsed message detail ONLY if its body is already downloaded locally.
@@ -487,6 +696,15 @@ impl Engine {
     pub async fn message(&self, id: i64) -> Result<MessageDetail> {
         let raw = self.raw(id).await?;
         self.build_detail(id, &raw)
+    }
+
+    /// Returns `(suggested_filename, raw_rfc822_bytes)` for exporting `.eml` or viewing original source.
+    pub async fn raw_message(&self, id: i64) -> Result<(String, Vec<u8>)> {
+        let raw = self.raw(id).await?;
+        let subject = self.db.summary(id).map(|(s, ..)| s.subject).unwrap_or_default();
+        let stem = subject.trim();
+        let name = if stem.is_empty() { format!("message-{id}.eml") } else { format!("{stem}.eml") };
+        Ok((name, raw))
     }
 
     pub async fn attachment(&self, id: i64, index: usize) -> Result<(String, Vec<u8>)> {
@@ -538,6 +756,13 @@ impl Engine {
 
     /// Marks everything in the view's folders as read, including mail not cached locally.
     pub fn mark_read(&self, view: &View) -> Result<()> {
+        if matches!(view, View::Smart { .. }) {
+            let ids = self.db.smart_unread_ids(view)?;
+            if !ids.is_empty() {
+                self.set_seen(&ids, true)?;
+            }
+            return Ok(());
+        }
         let t = now();
         for (acc, folder_id) in self.view_folders(view)? {
             self.db.mark_folder_read(folder_id)?;

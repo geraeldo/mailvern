@@ -37,6 +37,7 @@ pub enum PendingOpPayload {
     MoveRole { role: String },
     MoveFolder { to_folder_id: i64 },
     Delete,
+    EmptyFolder,
 }
 
 #[derive(Clone, Debug)]
@@ -113,7 +114,24 @@ CREATE TABLE IF NOT EXISTS moved_bodies (
 /// Rules: never edit or reorder a shipped entry. To change the schema, append a new
 /// entry (e.g. `ALTER TABLE messages ADD COLUMN ...`). Each one runs once, in a
 /// transaction, and the database is backed up before any upgrade.
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9];
+
+/// v9: send-as aliases and default Reply-To per account, flagged message index for smart views,
+/// and persisted calendar invite (ICS) RSVP responses.
+const V9: &str = r#"
+ALTER TABLE accounts ADD COLUMN aliases_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE accounts ADD COLUMN reply_to TEXT NOT NULL DEFAULT '';
+
+CREATE INDEX IF NOT EXISTS idx_messages_flagged ON messages(flagged) WHERE flagged = 1;
+
+CREATE TABLE IF NOT EXISTS ics_rsvps (
+  account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  event_uid TEXT NOT NULL,
+  status TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (account_id, event_uid)
+);
+"#;
 
 /// v8: folder sync watermarks (UIDNEXT/EXISTS/UNSEEN/HIGHESTMODSEQ), durable pending IMAP ops,
 /// quiet flag for SkipNotification badge accuracy, and sync/query indexes.
@@ -441,6 +459,25 @@ fn scope_sql(view: &View) -> Result<String> {
             format!("m.folder_id IN (SELECT id FROM folders WHERE role = '{role}')")
         }
         View::Folder { folder_id } => format!("m.folder_id = {}", folder_id),
+        View::Smart { name, account_id } => {
+            let acc = match account_id {
+                Some(id) => format!(" AND m.account_id = {id}"),
+                None => String::new(),
+            };
+            let dedup = "(m.message_id IS NULL OR m.id = (SELECT d.id FROM messages d JOIN folders df ON df.id = d.folder_id \
+                         WHERE d.account_id = m.account_id AND d.message_id = m.message_id \
+                         AND (df.role IS NULL OR df.role NOT IN ('trash', 'junk')) \
+                         ORDER BY df.role IS 'all', d.id LIMIT 1))";
+            match name.as_str() {
+                "flagged" => format!(
+                    "m.flagged = 1 AND m.folder_id NOT IN (SELECT id FROM folders WHERE role IN ('trash', 'junk')){acc} AND {dedup}"
+                ),
+                "unread" => format!(
+                    "m.seen = 0 AND m.folder_id NOT IN (SELECT id FROM folders WHERE role IN ('trash', 'junk', 'drafts', 'sent')){acc} AND {dedup}"
+                ),
+                _ => return Err(anyhow!("Unknown smart view {name:?}")),
+            }
+        }
     })
 }
 
@@ -464,6 +501,7 @@ pub struct DueSnooze {
 }
 
 fn row_to_account(r: &rusqlite::Row) -> rusqlite::Result<Account> {
+    let aliases_json: String = r.get(11)?;
     Ok(Account {
         id: r.get(0)?,
         name: r.get(1)?,
@@ -476,6 +514,8 @@ fn row_to_account(r: &rusqlite::Row) -> rusqlite::Result<Account> {
         signature: r.get(8)?,
         position: r.get(9)?,
         label: r.get(10)?,
+        aliases: serde_json::from_str(&aliases_json).unwrap_or_default(),
+        reply_to: r.get(12)?,
     })
 }
 
@@ -667,7 +707,7 @@ impl Db {
     pub fn accounts(&self) -> Result<Vec<Account>> {
         let c = self.r();
         let mut st = c.prepare(
-            "SELECT id, name, email, imap_host, imap_port, smtp_host, smtp_port, color, signature, position, label
+            "SELECT id, name, email, imap_host, imap_port, smtp_host, smtp_port, color, signature, position, label, aliases_json, reply_to
              FROM accounts ORDER BY position, id",
         )?;
         let rows = st.query_map([], row_to_account)?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -677,7 +717,7 @@ impl Db {
     pub fn account(&self, id: i64) -> Result<Account> {
         let c = self.r();
         Ok(c.query_row(
-            "SELECT id, name, email, imap_host, imap_port, smtp_host, smtp_port, color, signature, position, label
+            "SELECT id, name, email, imap_host, imap_port, smtp_host, smtp_port, color, signature, position, label, aliases_json, reply_to
              FROM accounts WHERE id = ?",
             [id],
             row_to_account,
@@ -686,18 +726,19 @@ impl Db {
 
     pub fn save_account(&self, a: &Account) -> Result<i64> {
         let c = self.c();
+        let aliases_json = serde_json::to_string(&a.aliases)?;
         if a.id > 0 {
             c.execute(
-                "UPDATE accounts SET name=?, email=?, imap_host=?, imap_port=?, smtp_host=?, smtp_port=?, color=?, signature=?, label=? WHERE id=?",
-                params![a.name, a.email, a.imap_host, a.imap_port, a.smtp_host, a.smtp_port, a.color, a.signature, a.label, a.id],
+                "UPDATE accounts SET name=?, email=?, imap_host=?, imap_port=?, smtp_host=?, smtp_port=?, color=?, signature=?, label=?, aliases_json=?, reply_to=? WHERE id=?",
+                params![a.name, a.email, a.imap_host, a.imap_port, a.smtp_host, a.smtp_port, a.color, a.signature, a.label, aliases_json, a.reply_to, a.id],
             )?;
             Ok(a.id)
         } else {
             let pos: i64 = c.query_row("SELECT COALESCE(MAX(position), 0) + 1 FROM accounts", [], |r| r.get(0))?;
             c.execute(
-                "INSERT INTO accounts (name, email, imap_host, imap_port, smtp_host, smtp_port, color, signature, position, label)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                params![a.name, a.email, a.imap_host, a.imap_port, a.smtp_host, a.smtp_port, a.color, a.signature, pos, a.label],
+                "INSERT INTO accounts (name, email, imap_host, imap_port, smtp_host, smtp_port, color, signature, position, label, aliases_json, reply_to)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![a.name, a.email, a.imap_host, a.imap_port, a.smtp_host, a.smtp_port, a.color, a.signature, pos, a.label, aliases_json, a.reply_to],
             )?;
             Ok(c.last_insert_rowid())
         }
@@ -754,6 +795,57 @@ impl Db {
             params![account_id, path],
             |r| r.get(0),
         )?)
+    }
+
+    pub fn rename_folder_local(&self, folder_id: i64, new_path: &str, new_name: &str) -> Result<()> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let (account_id, old_path): (i64, String) = tx.query_row(
+            "SELECT account_id, path FROM folders WHERE id = ?",
+            [folder_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        tx.execute(
+            "UPDATE folders SET path = ?, name = ? WHERE id = ?",
+            params![new_path, new_name, folder_id],
+        )?;
+        // Also update nested child paths sharing the same delimiter prefix.
+        for sep in ['/', '.'] {
+            let old_prefix = format!("{old_path}{sep}");
+            let children: Vec<(i64, String)> = tx
+                .prepare("SELECT id, path FROM folders WHERE account_id = ? AND path LIKE ?")?
+                .query_map(params![account_id, format!("{old_prefix}%")], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            for (cid, cpath) in children {
+                if let Some(rest) = cpath.strip_prefix(&old_prefix) {
+                    tx.execute("UPDATE folders SET path = ? WHERE id = ?", params![format!("{new_path}{sep}{rest}"), cid])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_folder_local(&self, folder_id: i64) -> Result<()> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        tx.execute("DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE folder_id = ?)", [folder_id])?;
+        tx.execute("DELETE FROM folders WHERE id = ?", [folder_id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn clear_folder_messages(&self, folder_id: i64) -> Result<()> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        tx.execute("DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE folder_id = ?)", [folder_id])?;
+        tx.execute("DELETE FROM messages WHERE folder_id = ?", [folder_id])?;
+        tx.execute(
+            "UPDATE folders SET msg_count = 0, unseen_count = 0 WHERE id = ?",
+            [folder_id],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn remove_folders_except(&self, account_id: i64, keep: &[i64]) -> Result<()> {
@@ -937,6 +1029,7 @@ impl Db {
             PendingOpPayload::MoveRole { .. } => "move_role",
             PendingOpPayload::MoveFolder { .. } => "move_folder",
             PendingOpPayload::Delete => "delete",
+            PendingOpPayload::EmptyFolder => "empty_folder",
         };
         let c = self.c();
         c.execute(
@@ -1607,6 +1700,25 @@ impl Db {
             out.sort_by_key(|s| (s.date, s.id));
         }
         Ok(out)
+    }
+
+    /// Counts for the Flagged and Unread smart views (deduplicated across All Mail).
+    pub fn smart_counts(&self) -> Result<SmartCounts> {
+        let c = self.r();
+        let flagged_scope = scope_sql(&View::Smart { name: "flagged".into(), account_id: None })?;
+        let unread_scope = scope_sql(&View::Smart { name: "unread".into(), account_id: None })?;
+        let flagged: i64 = c.query_row(&format!("SELECT COUNT(*) FROM messages m WHERE {flagged_scope}"), [], |r| r.get(0))?;
+        let unread: i64 = c.query_row(&format!("SELECT COUNT(*) FROM messages m WHERE {unread_scope}"), [], |r| r.get(0))?;
+        Ok(SmartCounts { flagged, unread })
+    }
+
+    /// Returns every unread message id in a smart view, for "Mark All as Read".
+    pub fn smart_unread_ids(&self, view: &View) -> Result<Vec<i64>> {
+        let scope = scope_sql(view)?;
+        let c = self.r();
+        let mut st = c.prepare(&format!("SELECT m.id FROM messages m WHERE {scope} AND m.seen = 0"))?;
+        let rows = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn summaries(&self, ids: &[i64]) -> Result<Vec<MessageSummary>> {
@@ -2357,6 +2469,26 @@ impl Db {
         Ok(())
     }
 
+    pub fn ics_rsvp(&self, account_id: i64, event_uid: &str) -> Result<Option<String>> {
+        let c = self.r();
+        Ok(c.query_row(
+            "SELECT status FROM ics_rsvps WHERE account_id = ? AND event_uid = ?",
+            params![account_id, event_uid],
+            |r| r.get(0),
+        )
+        .optional()?)
+    }
+
+    pub fn set_ics_rsvp(&self, account_id: i64, event_uid: &str, status: &str, now: i64) -> Result<()> {
+        let c = self.c();
+        c.execute(
+            "INSERT INTO ics_rsvps (account_id, event_uid, status, updated_at) VALUES (?, ?, ?, ?)
+             ON CONFLICT(account_id, event_uid) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at",
+            params![account_id, event_uid, status, now],
+        )?;
+        Ok(())
+    }
+
     // ---------- agent permissions & actions ----------
 
     pub fn agent_account_modes(&self) -> Result<std::collections::HashMap<i64, AgentMode>> {
@@ -2566,6 +2698,7 @@ mod tests {
             signature: "<b>Me</b>".into(),
             position: 0,
             label: "Work".into(),
+            ..Default::default()
         }
     }
 
@@ -3233,5 +3366,55 @@ mod tests {
         assert_eq!(db.unified_unread_after(mark).unwrap(), 2);
         db.mark_quiet(ids[0]).unwrap();
         assert_eq!(db.unified_unread_after(mark).unwrap(), 1);
+    }
+
+    #[test]
+    fn v9_aliases_reply_to_ics_rsvps_smart_views_and_folder_crud() {
+        let db = Db::open(&temp_db()).unwrap();
+        let mut a = account();
+        a.aliases = vec![Alias { name: "Support".into(), email: "support@example.com".into() }];
+        a.reply_to = "replies@example.com".into();
+        let acc = db.save_account(&a).unwrap();
+        let loaded = db.account(acc).unwrap();
+        assert_eq!(loaded.aliases, a.aliases);
+        assert_eq!(loaded.reply_to, "replies@example.com");
+
+        // ICS RSVP persistence
+        assert_eq!(db.ics_rsvp(acc, "evt-1").unwrap(), None);
+        db.set_ics_rsvp(acc, "evt-1", "ACCEPTED", 1000).unwrap();
+        assert_eq!(db.ics_rsvp(acc, "evt-1").unwrap().as_deref(), Some("ACCEPTED"));
+        db.set_ics_rsvp(acc, "evt-1", "DECLINED", 2000).unwrap();
+        assert_eq!(db.ics_rsvp(acc, "evt-1").unwrap().as_deref(), Some("DECLINED"));
+
+        // Smart views: Unread & Flagged exclude trash/junk and deduplicate All Mail
+        let inbox = db.upsert_folder(acc, "INBOX", "Inbox", Some("inbox")).unwrap();
+        let trash = db.upsert_folder(acc, "Trash", "Trash", Some("trash")).unwrap();
+        let custom = db.upsert_folder(acc, "Projects", "Projects", None).unwrap();
+        let sub = db.upsert_folder(acc, "Projects/Alpha", "Alpha", None).unwrap();
+
+        let mut m1 = msg(1, false);
+        m1.flagged = true;
+        let m2 = msg(2, true);
+        let mut m3 = msg(3, false);
+        m3.flagged = true;
+        db.insert_messages(acc, inbox, &[m1, m2]).unwrap();
+        db.insert_messages(acc, trash, &[m3]).unwrap();
+
+        let counts = db.smart_counts().unwrap();
+        assert_eq!(counts.flagged, 1);
+        assert_eq!(counts.unread, 1);
+        assert_eq!(db.list_threads(&View::Smart { name: "flagged".into(), account_id: None }, 0, 50).unwrap().len(), 1);
+        assert_eq!(db.list_threads(&View::Smart { name: "unread".into(), account_id: None }, 0, 50).unwrap().len(), 1);
+
+        // Folder rename cascades child paths, clear_folder_messages empties Trash, delete removes folder
+        db.rename_folder_local(custom, "Clients", "Clients").unwrap();
+        assert_eq!(db.folder(custom).unwrap().1, "Clients");
+        assert_eq!(db.folder(sub).unwrap().1, "Clients/Alpha");
+
+        db.clear_folder_messages(trash).unwrap();
+        assert!(db.list(&View::Folder { folder_id: trash }, None, 0, 50).unwrap().is_empty());
+
+        db.delete_folder_local(sub).unwrap();
+        assert!(db.folder(sub).is_err());
     }
 }

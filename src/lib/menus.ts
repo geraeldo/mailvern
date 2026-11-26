@@ -5,8 +5,10 @@ import { formatAddr } from "./format";
 import { openRuleEditor, ruleFromAddress, ruleFromMessage, describeFromMessage, type FromMessage } from "./rules.svelte";
 import { isSharedEmailDomain } from "./trust";
 import {
-  ui, openAccountSettings, openMessage, compose, archiveSelected, trashSelected, toggleJunk, selectedIsJunk, toggleSeen, toggleFlag, markAllRead,
+  ui, openAccountSettings, openMessage, compose, archiveSelected, trashSelected, permanentDeleteSelected, toggleJunk, selectedIsJunk, toggleSeen, toggleFlag, markAllRead,
   toast, setQuery, isSenderTrusted, trustSender, trustDomain, checkForMail, checkAccountForMail, copyThread, selectedRows, snoozeSelected, unsnoozeSelected, moveRows, moveSelected, roleOf, editDraft,
+  folderById, emptyFolderView, promptCreateFolder, promptRenameFolder, deleteFolderConfirm,
+  openRawSource, exportMessageEml, printOpenThread, forwardAsAttachment,
 } from "./state.svelte";
 
 type Item = { text: string; action: () => void; enabled?: boolean } | { text: string; items: Item[] } | "-";
@@ -39,6 +41,7 @@ function foldItems(f: Fold): Item[] {
 export function accountMenu(acc: Account, fold: Fold) {
   return popup([
     { text: "Account Settings…", action: () => openAccountSettings(acc.id) },
+    { text: "New Folder…", action: () => promptCreateFolder(acc.id) },
     { text: "Add Account…", action: () => openAccountSettings("new") },
     { text: "Check for Mail", action: () => checkAccountForMail(acc.id) },
     "-",
@@ -56,10 +59,28 @@ export function allAccountsMenu(fold: Fold) {
 }
 
 export function folderMenu(view: MailView, unread: number) {
-  return popup([
+  const items: Item[] = [
     { text: "Check for Mail", action: () => checkForMail(view) },
     { text: "Mark All as Read", action: () => markAllRead(view), enabled: unread > 0 },
-  ]);
+  ];
+  const folder = view.kind === "folder" ? folderById(view.folderId) : null;
+  const role = view.kind === "unified" ? view.role : folder?.role ?? null;
+  if (role === "trash" || role === "junk") {
+    items.push("-", {
+      text: role === "trash" ? "Empty Trash…" : "Empty Junk…",
+      action: () => emptyFolderView(view),
+    });
+  }
+  if (folder) {
+    items.push("-", { text: "New Subfolder…", action: () => promptCreateFolder(folder.accountId, folder.id, folder.name) });
+    if (!folder.role) {
+      items.push(
+        { text: "Rename Folder…", action: () => promptRenameFolder(folder) },
+        { text: "Delete Folder…", action: () => deleteFolderConfirm(folder) },
+      );
+    }
+  }
+  return popup(items);
 }
 
 export async function messageMenu(m: Summary) {
@@ -82,14 +103,19 @@ export async function messageMenu(m: Summary) {
     { text: "Reply", action: () => compose("reply"), enabled: one && !!ui.detail },
     { text: "Reply All", action: () => compose("replyAll"), enabled: one && !!ui.detail },
     { text: "Forward", action: () => compose("forward"), enabled: one && !!ui.detail },
+    { text: "Forward as Attachment (.eml)", action: () => ui.detail && forwardAsAttachment(ui.detail), enabled: one && !!ui.detail },
     "-",
     { text: ui.thread.length > 1 ? "Copy Conversation" : "Copy Message", action: copyThread, enabled: one && !!ui.detail },
+    { text: "Print…", action: printOpenThread, enabled: one && !!ui.detail },
+    { text: "Export as .eml…", action: () => ui.detail && exportMessageEml(ui.detail.id, ui.detail.subject), enabled: one && !!ui.detail },
+    { text: "View Original Source…", action: () => ui.detail && openRawSource(ui.detail.id, ui.detail.subject), enabled: one && !!ui.detail },
     "-",
     { text: seenAll ? "Mark as Unread" : "Mark as Read", action: toggleSeen },
     { text: flaggedAll ? "Unflag" : "Flag", action: toggleFlag },
     "-",
     { text: "Archive", action: archiveSelected },
     { text: "Delete", action: trashSelected },
+    { text: "Delete Permanently…", action: permanentDeleteSelected },
     { text: selectedIsJunk() ? "Not Junk" : "Move to Junk", action: toggleJunk },
     targets.length
       ? { text: "Move to", items: [...targets.map((f) => ({ text: f.name, action: () => moveRows(rows, f) })), "-" as const, { text: "Other…", action: moveSelected }] }

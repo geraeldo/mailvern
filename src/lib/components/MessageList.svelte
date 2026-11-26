@@ -4,8 +4,8 @@
   import Avatar from "./Avatar.svelte";
   import {
     ui, openMessage, loadMore, viewTitle, setQuery, openAccountSettings, openSettings, clickRow, isSelected, roleOf,
-    editDraft, accountById, beginSearch, searchScopes, scopeKey, scopeLabel, setSearchScope, setView,
-    compose, toggleSidebar, aiSourceTurn, aiRunning, prewarmMessage,
+    editDraft, accountById, folderById, beginSearch, searchScopes, scopeKey, scopeLabel, setSearchScope, setView,
+    compose, toggleSidebar, aiSourceTurn, aiRunning, prewarmMessage, emptyFolderView,
   } from "../state.svelte";
   import { hint } from "../shortcuts.svelte";
   import { messageMenu } from "../menus";
@@ -135,6 +135,50 @@
   const numbered = $derived(!!sourceTurn && !sourceTurn.running);
   const running = $derived(aiRunning(ui.ai));
 
+  const FILTER_CHIPS: { token: string; label: string; toggle?: boolean }[] = [
+    { token: "is:unread", label: "Unread", toggle: true },
+    { token: "is:flagged", label: "Flagged", toggle: true },
+    { token: "has:attachment", label: "Has attachment", toggle: true },
+    { token: "from:", label: "from:" },
+    { token: "subject:", label: "subject:" },
+    { token: "after:7d", label: "Last 7d", toggle: true },
+  ];
+
+  function hasToken(tok: string): boolean {
+    return new RegExp(`(?:^|\\s)${tok.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\\s|$)`, "i").test(draft);
+  }
+
+  function applyChip(chip: { token: string; toggle?: boolean }) {
+    if (chip.toggle && hasToken(chip.token)) {
+      draft = draft
+        .replace(new RegExp(`(?:^|\\s)${chip.token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?=\\s|$)`, "gi"), "")
+        .replace(/\s+/g, " ")
+        .trim();
+    } else {
+      const base = draft.trimEnd();
+      draft = base ? `${base} ${chip.token}` : chip.token;
+    }
+    searchEl?.focus();
+    clearTimeout(timer);
+    if (chip.toggle) {
+      lastQuery = draft;
+      setQuery(draft);
+    }
+  }
+
+  const canEmpty = $derived.by(() => {
+    if (ui.query.trim() || ui.ai || !ui.list.length) return null;
+    if (ui.view.kind === "unified" && (ui.view.role === "trash" || ui.view.role === "junk")) {
+      return ui.view.role === "trash" ? "Empty Trash" : "Empty Junk";
+    }
+    if (ui.view.kind === "folder") {
+      const r = folderById(ui.view.folderId)?.role;
+      if (r === "trash") return "Empty Trash";
+      if (r === "junk") return "Empty Junk";
+    }
+    return null;
+  });
+
   function closeSearch() {
     clearTimeout(timer);
     stopAiSearch();
@@ -182,6 +226,10 @@
       </div>
     {:else}
       <h1 data-tauri-drag-region>{viewTitle()}</h1>
+      {#if canEmpty && ui.view.kind !== "outbox"}
+        {@const mv = ui.view}
+        <button type="button" class="empty-btn" title={canEmpty} onclick={() => emptyFolderView(mv)}>{canEmpty}</button>
+      {/if}
       <button type="button" class="icon-btn" title={hint("Search", "search")} aria-label="Search" onclick={focusSearch}><Icon name="search" /></button>
     {/if}
   </header>
@@ -194,6 +242,12 @@
           {#if s.kind === "account"}<span class="scope-bar" style:background={accountById(s.accountId)?.color || "var(--muted)"}></span>{/if}
           {scopeLabel(s)}
         </button>
+      {/each}
+    </div>
+    <div class="ops" aria-label="Search filters">
+      {#each FILTER_CHIPS as chip (chip.token)}
+        {@const on = !!chip.toggle && hasToken(chip.token)}
+        <button type="button" class="op" class:on onclick={() => applyChip(chip)}>{chip.label}</button>
       {/each}
     </div>
   {/if}
@@ -274,6 +328,12 @@
             class:unread={!m.seen}
             class:selected={isSelected(m.id)}
             class:multi={ui.selectedIds.length > 1}
+            draggable="true"
+            ondragstart={(e) => {
+              if (!e.dataTransfer) return;
+              e.dataTransfer.setData("application/x-mailvern-msg-id", String(m.id));
+              e.dataTransfer.effectAllowed = "copy";
+            }}
             style:transform="translateY({(start + i) * ROW}px)"
             onpointerenter={() => prewarmMessage(m.id)}
             onclick={(e) => clickRow(m, e)}
@@ -339,6 +399,18 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  .empty-btn {
+    flex: none;
+    height: 26px;
+    padding: 0 9px;
+    border: 1px solid var(--line-strong);
+    border-radius: 7px;
+    background: transparent;
+    color: var(--danger);
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .empty-btn:hover { background: var(--hover); }
   .search {
     flex: 1;
     display: flex;
@@ -381,6 +453,28 @@
   .scope:hover { background: var(--hover); color: var(--text); }
   .scope.on { background: var(--text); border-color: var(--text); color: var(--panel); }
   .scope-bar { width: 3px; height: 10px; border-radius: 2px; flex: none; }
+  .ops {
+    flex: none;
+    display: flex;
+    gap: 5px;
+    padding: 0 12px 9px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .ops::-webkit-scrollbar { display: none; }
+  .op {
+    flex: none;
+    height: 22px;
+    padding: 0 8px;
+    border: 0;
+    border-radius: 6px;
+    background: var(--hover);
+    color: var(--muted);
+    font-size: 11.5px;
+    white-space: nowrap;
+  }
+  .op:hover { color: var(--text); background: var(--active); }
+  .op.on { background: var(--accent-soft); color: var(--accent); font-weight: 500; }
   .ask {
     flex: none;
     display: flex;

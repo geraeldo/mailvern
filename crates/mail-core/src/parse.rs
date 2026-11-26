@@ -224,12 +224,14 @@ pub struct ParsedBody {
     pub html: Option<String>,
     pub text: Option<String>,
     pub attachments: Vec<AttachmentInfo>,
+    pub warnings: Vec<crate::model::SecurityWarning>,
+    pub calendar_invite: Option<crate::model::CalendarInvite>,
 }
 
 /// Prepares a stored message for display. Inline `cid:` images become data URIs.
 pub fn display(raw: &[u8]) -> ParsedBody {
     let Some(m) = MessageParser::default().parse(raw) else {
-        return ParsedBody { bcc: vec![], html: None, text: Some(String::from_utf8_lossy(raw).into()), attachments: vec![] };
+        return ParsedBody { bcc: vec![], html: None, text: Some(String::from_utf8_lossy(raw).into()), attachments: vec![], warnings: vec![], calendar_invite: None };
     };
     let original_html = html_body(&m);
     let mut html = original_html.clone();
@@ -264,7 +266,14 @@ pub fn display(raw: &[u8]) -> ParsedBody {
             size: p.contents().len(),
         })
         .collect();
-    ParsedBody { bcc: addrs(m.bcc()), html, text, attachments }
+    let from = addrs(m.from()).into_iter().next();
+    let from_name = from.as_ref().and_then(|f| f.name.as_deref()).unwrap_or("");
+    let from_addr = from.as_ref().map(|f| f.email.as_str()).unwrap_or("");
+    let reply_to = addrs(m.reply_to());
+    let list_id = m.header_raw("List-Id").map(unfold).filter(|s| !s.is_empty());
+    let warnings = crate::security::analyze_headers(&m, from_name, from_addr, &reply_to, list_id.as_deref());
+    let calendar_invite = crate::ics::parse_from_message(&m);
+    ParsedBody { bcc: addrs(m.bcc()), html, text, attachments, warnings, calendar_invite }
 }
 
 /// Returns (filename, bytes) for attachment `index` (as numbered by `display`).

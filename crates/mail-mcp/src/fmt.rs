@@ -201,6 +201,7 @@ mod tests {
             signature: String::new(),
             position: id,
             label: String::new(),
+            ..Default::default()
         };
         let folder = |id: i64, account_id: i64| Folder { id, account_id, path: "INBOX".into(), name: "Inbox".into(), role: Some("inbox".into()), unread: 2, position: None };
         let mut names = Names {

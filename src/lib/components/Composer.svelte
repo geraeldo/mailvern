@@ -9,20 +9,56 @@
   import WhenPicker from "./WhenPicker.svelte";
   import Rephrase from "./Rephrase.svelte";
   import type { RephraseContext } from "../ai/rephrase";
-  import { ui, toast, folderById, editQueued, loadOutbox, noteSentRecipients, type ComposeInit } from "../state.svelte";
+  import {
+    ui, toast, folderById, editQueued, loadOutbox, noteSentRecipients, closeComposer, focusComposer,
+    toggleMinimizeComposer, toggleExpandComposer, type ComposeSession,
+  } from "../state.svelte";
   import { api, type FileInfo, type Outgoing } from "../api";
   import { sendPresets, toUnix, whenLabel } from "../when";
   import { formatAddr, fileSize } from "../format";
   import { htmlToText, prefixed, quoteForward, quoteReply, emailWrap, sanitize } from "../html";
+  import { mentionsAttachment } from "../attachment-check";
   import { comboOf, match, hint } from "../shortcuts.svelte";
 
-  let props: { init: ComposeInit } = $props();
+  let props: { session: ComposeSession } = $props();
   // The composer is keyed per open, so its setup is read once.
-  const init = untrack(() => props.init);
+  const init = untrack(() => props.session);
+  const minimized = $derived(props.session.minimized);
+  const expanded = $derived(props.session.expanded);
+  const isActive = $derived(ui.activeComposerKey === props.session.key);
   const src = init.source;
   const restore = init.restore;
-  const myEmails = new Set(ui.accounts.map((a) => a.email.toLowerCase()));
+  const myEmails = new Set(
+    ui.accounts.flatMap((a) => [a.email.toLowerCase(), ...(a.aliases ?? []).map((x) => x.email.toLowerCase())]),
+  );
   const notMe = (e: string) => !myEmails.has(e.toLowerCase());
+
+  type IdentityOption = { value: string; accountId: number; email: string; name: string; label: string; detail: string };
+  const identities = $derived.by<IdentityOption[]>(() => {
+    const opts: IdentityOption[] = [];
+    for (const a of ui.accounts) {
+      opts.push({
+        value: `${a.id}:${a.email}`,
+        accountId: a.id,
+        email: a.email,
+        name: a.name,
+        label: a.name || a.email,
+        detail: a.name ? a.email : "",
+      });
+      for (const al of a.aliases ?? []) {
+        const displayName = al.name || a.name;
+        opts.push({
+          value: `${a.id}:${al.email}`,
+          accountId: a.id,
+          email: al.email,
+          name: displayName,
+          label: displayName || al.email,
+          detail: displayName ? al.email : "",
+        });
+      }
+    }
+    return opts;
+  });
 
   function defaultAccount(): number {
     if (restore) return restore.message.accountId;
@@ -33,6 +69,19 @@
       if (f) return f.accountId;
     }
     return ui.accounts[0].id;
+  }
+
+  function defaultFromEmail(accId: number): string {
+    const acc = ui.accounts.find((a) => a.id === accId);
+    if (!acc) return "";
+    if (restore?.message.fromEmail) return restore.message.fromEmail;
+    // When replying to a message sent to one of this account's aliases, default to that alias.
+    if (src && (init.mode === "reply" || init.mode === "replyAll") && acc.aliases?.length) {
+      const recipients = new Set([...src.to, ...src.cc].map((a) => a.email.toLowerCase()));
+      const hit = acc.aliases.find((al) => recipients.has(al.email.toLowerCase()));
+      if (hit) return hit.email;
+    }
+    return acc.email;
   }
 
   let initTo: string[] = [];
@@ -63,6 +112,9 @@
     }
   }
   if (init.to) initTo = init.to;
+  if (init.cc?.length) initCc = init.cc;
+  if (init.bcc?.length) initBcc = init.bcc;
+  if (init.subject) initSubject = init.subject;
   if (restore) {
     initTo = restore.message.to;
     initCc = restore.message.cc;
@@ -70,6 +122,11 @@
     initSubject = restore.message.subject;
   }
   const initAccount = defaultAccount();
+  const initFromEmail = defaultFromEmail(initAccount);
+  const initReplyTo =
+    restore?.message.replyTo !== undefined && restore.message.replyTo !== null
+      ? restore.message.replyTo
+      : (ui.accounts.find((a) => a.id === initAccount)?.replyTo ?? "");
   /** Where typing starts: "To" for a fresh message, else the body. */
   const focusTo = init.mode === "new" || init.mode === "forward" || (init.mode === "draft" && !initTo.length);
   const inReplyTo = restore ? restore.message.inReplyTo : init.mode === "forward" ? null : (src?.messageId ?? null);
@@ -80,12 +137,15 @@
       : null;
 
   let accountId = $state(initAccount);
+  let fromEmail = $state(initFromEmail);
+  let replyTo = $state(initReplyTo);
+  let showReplyTo = $state(!!initReplyTo.trim());
   let to = $state<string[]>(initTo);
   let cc = $state<string[]>(initCc);
   let bcc = $state<string[]>(initBcc);
   let showCc = $state(initCc.length > 0 || initBcc.length > 0);
   let subject = $state(initSubject);
-  let files = $state<FileInfo[]>(restore?.attachments ?? []);
+  let files = $state<FileInfo[]>(restore?.attachments ?? init.attachments ?? []);
   let sending = $state(false);
   /** Something was typed or changed since the composer opened. */
   let dirty = $state(!!restore?.unsaved);
@@ -112,6 +172,21 @@
   let bccField = $state<RecipientField>();
 
   const account = $derived(ui.accounts.find((a) => a.id === accountId)!);
+  const selectedIdentity = $derived(`${accountId}:${fromEmail || account?.email || ""}`);
+
+  function pickIdentity(val: string) {
+    const hit = identities.find((o) => o.value === val);
+    if (!hit) return;
+    const prevAccountId = accountId;
+    const prevDefaultReplyTo = ui.accounts.find((a) => a.id === prevAccountId)?.replyTo ?? "";
+    accountId = hit.accountId;
+    fromEmail = hit.email;
+    if (hit.accountId !== prevAccountId && replyTo === prevDefaultReplyTo) {
+      const nextDefault = ui.accounts.find((a) => a.id === hit.accountId)?.replyTo ?? "";
+      replyTo = nextDefault;
+      if (nextDefault) showReplyTo = true;
+    }
+  }
 
   function sigBlock(sig: string) {
     const clean = sig ? sanitize(sig) : "";
@@ -120,7 +195,8 @@
 
   const signature = ui.accounts.find((a) => a.id === initAccount)?.signature ?? "";
   const quote = src ? (init.mode === "forward" ? quoteForward(src) : quoteReply(src)) : "";
-  const initialHtml = restore ? restore.message.html : `<div><br></div>${sigBlock(signature)}${quote ? `<br>${quote}` : ""}`;
+  const bodySeed = init.bodyText ? `<div>${init.bodyText.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, "<br>")}</div>` : "<div><br></div>";
+  const initialHtml = restore ? restore.message.html : `${bodySeed}${sigBlock(signature)}${quote ? `<br>${quote}` : ""}`;
 
   onMount(() => {
     if (src && init.mode === "forward" && src.attachments.length) {
@@ -150,6 +226,11 @@
       });
     }
     const un = getCurrentWebview().onDragDropEvent(async (e) => {
+      if (props.session.minimized) return;
+      // When multiple composers are open, only the active one receives OS file drops.
+      const openKeys = ui.composers.filter((c) => !c.minimized).map((c) => c.key);
+      const targetKey = ui.activeComposerKey != null && openKeys.includes(ui.activeComposerKey) ? ui.activeComposerKey : openKeys[openKeys.length - 1];
+      if (targetKey !== props.session.key) return;
       if (e.payload.type === "over" || e.payload.type === "enter") dropping = true;
       else if (e.payload.type === "leave") dropping = false;
       else if (e.payload.type === "drop") {
@@ -177,7 +258,7 @@
   // Recipients and the sending account count as edits too.
   let watching = false;
   $effect(() => {
-    JSON.stringify([to, cc, bcc, accountId]);
+    JSON.stringify([to, cc, bcc, accountId, fromEmail, replyTo]);
     if (!watching) {
       watching = true;
       return;
@@ -195,6 +276,8 @@
 
   function outgoing(): Outgoing {
     const html = emailWrap(editorEl?.innerHTML ?? "");
+    const identity = identities.find((o) => o.value === selectedIdentity);
+    const isAlias = identity && account && identity.email.toLowerCase() !== account.email.toLowerCase();
     return {
       accountId,
       to,
@@ -207,6 +290,9 @@
       inReplyTo,
       references,
       messageId,
+      fromEmail: isAlias ? identity.email : null,
+      fromName: isAlias ? (identity.name || null) : null,
+      replyTo: replyTo.trim(),
     };
   }
 
@@ -269,7 +355,7 @@
     }
     finished = true;
     clearTimeout(saveTimer);
-    ui.compose = null;
+    closeComposer(init.key);
   }
 
   async function discard() {
@@ -279,7 +365,47 @@
     clearTimeout(saveTimer);
     while (savePromise) await savePromise;
     if (messageId && draftAccount != null) api.deleteDraft(draftAccount, messageId).catch((e) => toast(String(e)));
-    ui.compose = null;
+    closeComposer(init.key);
+  }
+
+  function onDragOverSheet(e: DragEvent) {
+    const types = e.dataTransfer?.types ?? [];
+    if (types.includes("application/x-mailvern-msg-id") || types.includes("application/x-mailvern-file")) {
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+      dropping = true;
+    }
+  }
+
+  function onDragLeaveSheet(e: DragEvent) {
+    if (!e.currentTarget || !(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node | null)) {
+      dropping = false;
+    }
+  }
+
+  async function onDropSheet(e: DragEvent) {
+    dropping = false;
+    const msgId = e.dataTransfer?.getData("application/x-mailvern-msg-id");
+    if (msgId) {
+      e.preventDefault();
+      try {
+        const f = await api.stageEml(Number(msgId));
+        addFiles([f]);
+        toast(`Attached ${f.name}`);
+      } catch (err) {
+        toast(String(err));
+      }
+      return;
+    }
+    const filePath = e.dataTransfer?.getData("application/x-mailvern-file");
+    if (filePath) {
+      e.preventDefault();
+      try {
+        addFiles(await api.fileInfo([filePath]));
+      } catch (err) {
+        toast(String(err));
+      }
+    }
   }
 
   /** Queues the message: now (with a moment to undo) or at `at`. */
@@ -305,6 +431,18 @@
     try {
       if (!subject.trim() && !(await ask("Send without a subject?", { title: "Mailvern", okLabel: "Send", cancelLabel: "Cancel" }))) return;
       if (attachmentsLoading) await attachmentsLoading;
+      if (
+        !files.length &&
+        mentionsAttachment(editorEl?.innerHTML ?? "") &&
+        !(await ask("Your message mentions an attachment, but no files are attached. Send anyway?", {
+          title: "Missing attachment?",
+          kind: "warning",
+          okLabel: "Send anyway",
+          cancelLabel: "Go back",
+        }))
+      ) {
+        return;
+      }
       const total = files.reduce((n, f) => n + f.size, 0);
       if (total > 24 * 1024 * 1024) {
         toast("Attachments are over 24 MB");
@@ -318,7 +456,7 @@
       if (draftAccount != null && draftAccount !== accountId && messageId) api.deleteDraft(draftAccount, messageId).catch(() => {});
       const id = await api.send(out, at ? toUnix(at) : null);
       noteSentRecipients([...out.to, ...out.cc, ...out.bcc]);
-      ui.compose = null;
+      closeComposer(init.key);
       loadOutbox();
       if (at) toast(`Scheduled for ${whenLabel(at)}`);
       else if (ui.undoSend > 0) toast("Sending…", { undo: () => editQueued(id), ms: ui.undoSend * 1000 });
@@ -342,6 +480,9 @@
     };
   }
 
+  const defaultTitle = ({ new: "New message", reply: "Reply", replyAll: "Reply all", forward: "Forward", draft: "Draft" } as const)[init.mode];
+  const headerTitle = $derived(subject.trim() || defaultTitle);
+
   function onKey(e: KeyboardEvent) {
     if (laterOpen) return;
     const combo = comboOf(e);
@@ -350,43 +491,88 @@
       send();
     } else if (e.key === "Escape" && !e.defaultPrevented) {
       e.preventDefault();
-      close();
+      if (expanded) toggleExpandComposer(init.key);
+      else toggleMinimizeComposer(init.key);
     }
   }
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="scrim" onkeydown={onKey}>
-  <div class="sheet" class:dropping role="dialog" aria-label="New message">
-    <header>
-      <span class="title">{({ new: "New message", reply: "Reply", replyAll: "Reply all", forward: "Forward", draft: "Draft" } as const)[init.mode]}</span>
-      <span class="saved">{saving ? "Saving…" : savedAt ? "Saved to Drafts" : ""}</span>
-      <button class="icon-btn" title="Delete draft" onclick={discard}><Icon name="trash" size={16} /></button>
-      <button class="icon-btn" title="Close  Esc" onclick={close}><Icon name="x" /></button>
+<div class="wrap" class:expanded class:minimized onmousedown={() => focusComposer(init.key)} onkeydown={onKey}>
+  <div
+    class="sheet"
+    class:dropping
+    class:active={isActive}
+    class:minimized
+    class:expanded
+    role="dialog"
+    tabindex="-1"
+    aria-label={headerTitle}
+    ondragover={onDragOverSheet}
+    ondragleave={onDragLeaveSheet}
+    ondrop={onDropSheet}>
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <header onclick={(e) => { if (minimized && !(e.target as HTMLElement).closest("button")) toggleMinimizeComposer(init.key); }}>
+      <span class="title" title={headerTitle}>{headerTitle}</span>
+      {#if !minimized}
+        <span class="saved">{saving ? "Saving…" : savedAt ? "Saved" : ""}</span>
+      {/if}
+      <button
+        type="button"
+        class="icon-btn"
+        title={minimized ? "Restore draft" : "Minimize"}
+        aria-label={minimized ? "Restore draft" : "Minimize"}
+        onclick={() => toggleMinimizeComposer(init.key)}>
+        <Icon name="minus" size={15} />
+      </button>
+      {#if !minimized}
+        <button
+          type="button"
+          class="icon-btn"
+          title={expanded ? "Dock composer" : "Expand composer"}
+          aria-label={expanded ? "Dock composer" : "Expand composer"}
+          onclick={() => toggleExpandComposer(init.key)}>
+          <Icon name={expanded ? "minimize" : "maximize"} size={14} />
+        </button>
+        <button type="button" class="icon-btn" title="Delete draft" aria-label="Delete draft" onclick={discard}><Icon name="trash" size={15} /></button>
+      {/if}
+      <button type="button" class="icon-btn" title="Save & close" aria-label="Save and close" onclick={close}><Icon name="x" size={15} /></button>
     </header>
 
+    <div class="compose-content" class:hidden={minimized}>
     <div class="fields">
-      {#if ui.accounts.length > 1}
+      {#if identities.length > 1}
         <div class="from">
           <span class="label">From</span>
           <Select
             plain
             label="From"
-            value={accountId}
-            options={ui.accounts.map((a) => (a.name ? { value: a.id, label: a.name, detail: a.email } : { value: a.id, label: a.email }))}
-            onchange={(id) => (accountId = id)} />
+            value={selectedIdentity}
+            options={identities.map((o) => ({ value: o.value, label: o.label, detail: o.detail }))}
+            onchange={pickIdentity} />
         </div>
       {/if}
       <RecipientField bind:this={toField} label="To" bind:value={to} autofocus={focusTo}>
         {#snippet trailing()}
-          {#if !showCc}
-            <button type="button" class="cc-toggle" onclick={() => (showCc = true)}>Cc Bcc</button>
-          {/if}
+          <span class="field-toggles">
+            {#if !showCc}
+              <button type="button" class="cc-toggle" onclick={() => (showCc = true)}>Cc Bcc</button>
+            {/if}
+            {#if !showReplyTo}
+              <button type="button" class="cc-toggle" onclick={() => (showReplyTo = true)}>Reply-To</button>
+            {/if}
+          </span>
         {/snippet}
       </RecipientField>
       {#if showCc}
         <RecipientField bind:this={ccField} label="Cc" bind:value={cc} />
         <RecipientField bind:this={bccField} label="Bcc" bind:value={bcc} />
+      {/if}
+      {#if showReplyTo}
+        <div class="reply-to">
+          <span class="label">Reply-To</span>
+          <input bind:value={replyTo} oninput={changed} placeholder="replies@example.com" spellcheck="false" />
+        </div>
       {/if}
       <div class="subject">
         <input placeholder="Subject" bind:value={subject} oninput={changed} spellcheck="true" />
@@ -427,10 +613,11 @@
       <div class="drop-overlay" aria-hidden="true">
         <div class="drop-box">
           <Icon name="clip" size={22} />
-          <span>Drop files to attach</span>
+          <span>Drop files or emails to attach</span>
         </div>
       </div>
     {/if}
+    </div>
   </div>
 </div>
 
@@ -439,10 +626,15 @@
 {/if}
 
 <style>
-  .scrim {
+  .wrap {
+    pointer-events: auto;
+    display: flex;
+    align-items: flex-end;
+  }
+  .wrap.expanded {
     position: fixed;
     inset: 0;
-    z-index: 50;
+    z-index: 55;
     display: grid;
     place-items: center;
     background: rgba(20, 18, 14, 0.18);
@@ -452,17 +644,47 @@
     position: relative;
     display: flex;
     flex-direction: column;
-    width: min(760px, calc(100vw - 48px));
-    height: min(720px, calc(100vh - 64px));
-    padding: 0 24px 18px;
+    width: min(540px, calc(100vw - 32px));
+    height: min(560px, calc(100vh - 56px));
+    padding: 0 18px 14px;
     background: var(--panel);
     border: 1px solid var(--sheet-border);
-    border-radius: 14px;
-    box-shadow: var(--shadow);
-    animation: rise 0.16s cubic-bezier(0.2, 0.8, 0.2, 1);
+    border-bottom: 0;
+    border-radius: 12px 12px 0 0;
+    box-shadow: 0 12px 36px rgba(0, 0, 0, 0.2), 0 2px 8px rgba(0, 0, 0, 0.08);
+    animation: rise 0.14s cubic-bezier(0.2, 0.8, 0.2, 1);
     outline: 2px solid transparent;
     transition: outline-color 0.12s;
   }
+  .sheet.active:not(.expanded):not(.minimized) {
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--sheet-border));
+  }
+  .sheet.expanded {
+    width: min(780px, calc(100vw - 48px));
+    height: min(740px, calc(100vh - 64px));
+    padding: 0 24px 18px;
+    border-bottom: 1px solid var(--sheet-border);
+    border-radius: 14px;
+    box-shadow: var(--shadow);
+  }
+  .sheet.minimized {
+    width: 260px;
+    height: 42px;
+    padding: 0 10px 0 14px;
+    cursor: pointer;
+  }
+  .sheet.minimized header {
+    height: 42px;
+    margin-right: 0;
+  }
+  .sheet.minimized header:hover { opacity: 0.9; }
+  .compose-content {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .compose-content.hidden { display: none; }
   .sheet.dropping { outline-color: var(--accent); }
   .drop-overlay {
     position: absolute;
@@ -470,7 +692,7 @@
     z-index: 30;
     display: grid;
     place-items: center;
-    border-radius: 14px;
+    border-radius: 12px;
     background: color-mix(in srgb, var(--panel) 84%, transparent);
     backdrop-filter: blur(2px);
     pointer-events: none;
@@ -488,9 +710,9 @@
     font-size: 14px;
     font-weight: 550;
   }
-  header { display: flex; align-items: center; gap: 2px; height: 52px; margin-right: -10px; }
-  .title { font-weight: 600; font-size: 15px; }
-  .saved { flex: 1; margin-left: 10px; color: var(--muted); font-size: 12.5px; }
+  header { display: flex; align-items: center; gap: 2px; height: 46px; margin-right: -6px; flex: none; }
+  .title { font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+  .saved { flex: none; margin: 0 6px; color: var(--muted); font-size: 12px; }
   .fields { flex: none; }
   .from {
     display: flex;
@@ -510,6 +732,23 @@
     white-space: nowrap;
   }
   .cc-toggle:hover { color: var(--text); background: var(--hover); }
+  .field-toggles { display: inline-flex; align-items: center; gap: 2px; flex: none; }
+  .reply-to {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    height: 40px;
+    border-bottom: 1px solid var(--line);
+  }
+  .reply-to input {
+    flex: 1;
+    min-width: 0;
+    border: 0;
+    outline: none;
+    background: transparent;
+    color: var(--text);
+    font-size: 13.5px;
+  }
   .subject { border-bottom: 1px solid var(--line); }
   .subject input {
     width: 100%;

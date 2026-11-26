@@ -7,6 +7,7 @@
   import {
     ui, compose, archiveSelected, trashSelected, toggleJunk, toggleSeen, toggleFlag, selectedRows, roleOf, clearSelection,
     snoozeSelected, unsnoozeSelected, moveSelected, accountById, editQueued, deleteQueued, sendQueuedNow, copyThread, openMessage,
+    printOpenThread,
   } from "../state.svelte";
   import { hint, keymap, display } from "../shortcuts.svelte";
   import { whenLabel } from "../when";
@@ -110,6 +111,7 @@
         {#if !multi}
           <span class="sep"></span>
           <button type="button" class="icon-btn" title={hint(ui.thread.length > 1 ? "Copy conversation as text" : "Copy message as text", "copyThread")} aria-label="Copy as text" onclick={copyThread}><Icon name="copy" size={17} /></button>
+          <button type="button" class="icon-btn" title="Print  ⌘P" aria-label="Print" onclick={printOpenThread}><Icon name="print" size={17} /></button>
         {/if}
       </div>
     {/if}

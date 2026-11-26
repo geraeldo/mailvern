@@ -410,6 +410,31 @@ pub async fn list_folders<T: Wire>(session: &mut async_imap::Session<T>) -> Resu
     list_folders_with_status(session, false, false).await
 }
 
+/// Creates a mailbox on the server (`CREATE`).
+pub async fn create_folder<T: Wire>(session: &mut async_imap::Session<T>, path: &str) -> Result<()> {
+    run_checked(session, CMD_TIMEOUT, &format!("creating folder {path}"), &format!("CREATE {}", quote(path)), |_| {}).await?;
+    Ok(())
+}
+
+/// Renames a mailbox on the server (`RENAME`).
+pub async fn rename_folder<T: Wire>(session: &mut async_imap::Session<T>, from: &str, to: &str) -> Result<()> {
+    run_checked(
+        session,
+        CMD_TIMEOUT,
+        &format!("renaming folder {from}"),
+        &format!("RENAME {} {}", quote(from), quote(to)),
+        |_| {},
+    )
+    .await?;
+    Ok(())
+}
+
+/// Deletes a mailbox on the server (`DELETE`).
+pub async fn delete_folder<T: Wire>(session: &mut async_imap::Session<T>, path: &str) -> Result<()> {
+    run_checked(session, CMD_TIMEOUT, &format!("deleting folder {path}"), &format!("DELETE {}", quote(path)), |_| {}).await?;
+    Ok(())
+}
+
 /// Fetches STATUS metadata for a single mailbox without changing the selected mailbox.
 pub async fn status<T: Wire>(session: &mut async_imap::Session<T>, path: &str, condstore: bool) -> Result<FolderStatus> {
     let items = if condstore {

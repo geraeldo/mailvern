@@ -155,6 +155,7 @@ async fn per_account_permissions_allow_auto_on_one_account_while_protecting_anot
         signature: "— Alex".into(),
         position: 1,
         label: "Personal".into(),
+        ..Default::default()
     };
     let msg_inbox = b"From: Friend <friend@example.org>\r\nTo: alex@rivera.me\r\nSubject: Weekend hike\r\nMessage-ID: <p1@example.org>\r\n\r\nAre you in?";
     let msg_trash = b"From: Promo <promo@shop.example>\r\nTo: alex@rivera.me\r\nSubject: Old promo\r\nMessage-ID: <p2@shop.example>\r\n\r\nSale!";

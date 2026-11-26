@@ -25,6 +25,7 @@ pub fn account() -> Account {
         signature: "<b>Alex Rivera</b><br>Acme Co.".into(),
         position: 0,
         label: "Acme".into(),
+        ..Default::default()
     }
 }
 

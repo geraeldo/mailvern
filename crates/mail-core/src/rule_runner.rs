@@ -502,6 +502,7 @@ mod tests {
             signature: String::new(),
             position: 0,
             label: String::new(),
+            ..Default::default()
         }
     }
 
