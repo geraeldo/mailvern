@@ -105,15 +105,19 @@
   }
 
   onMount(() => {
+    let postBootTimer: ReturnType<typeof setTimeout> | undefined;
     (async () => {
       try {
         await bootstrapApp();
       } catch (e) {
         toast(String(e));
       }
-      refreshBadge();
       if (!ui.accounts.length) openAccountSettings("new");
-      notify = (await isPermissionGranted()) || (await requestPermission()) === "granted";
+      // Defer non-visual OS IPCs (Dock badge + notification permission) past first interactive frame.
+      postBootTimer = setTimeout(async () => {
+        refreshBadge();
+        notify = (await isPermissionGranted()) || (await requestPermission()) === "granted";
+      }, 300);
     })();
 
     const un = listen<MailEvent>("mail-event", ({ payload: e }) => {
@@ -178,6 +182,7 @@
     const onUnload = () => commitPending();
     window.addEventListener("beforeunload", onUnload);
     return () => {
+      clearTimeout(postBootTimer);
       commitPending();
       window.removeEventListener("beforeunload", onUnload);
       un.then((f) => f());

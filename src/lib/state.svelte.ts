@@ -71,6 +71,8 @@ export type FolderPrompt =
   | { kind: "rename"; folder: Folder };
 
 const PAGE = 100;
+/** Initial boot page size (matches Rust preboot snapshot; covers ~4 viewports). */
+const BOOT_PAGE = 40;
 
 const STARTUP_SETTING_KEYS = [
   "theme",
@@ -297,32 +299,42 @@ export async function loadPrefs() {
   applyPrefs(settings);
 }
 
-/** Loads all initial UI state in a single IPC round-trip and defers secondary lookups past first paint. */
-export async function bootstrapApp() {
-  const initialView: MailView = ui.view.kind === "outbox" ? { kind: "unified", role: "inbox" } : ui.view;
-  const data = await api.bootstrap(initialView, PAGE, STARTUP_SETTING_KEYS);
-  ui.accounts = data.accounts;
-  ui.folders = data.folders;
-  ui.smartCounts = data.smartCounts;
-  ui.outbox = data.outbox;
-  ui.pendingAgentActions = data.pendingAgentActions;
-  applyPrefs(data.settings);
-  hydrateTheme(data.settings);
-  hydrateBadgeMode(data.settings);
-  hydrateShortcuts(data.settings);
-  hydrateAi(data.settings);
-  try {
-    ui.trustedSenders = JSON.parse(data.settings["trusted_senders"] || "[]");
-  } catch {
-    ui.trustedSenders = [];
-  }
-  ui.list = data.messages;
-  ui.hasMore = data.messages.length === PAGE;
-  ui.listReady = true;
-  prewarmAround(ui.selectedId);
-  if (ui.autoTrustSent) {
-    setTimeout(() => { loadSentRecipients(); }, 250);
-  }
+let bootPromise: Promise<void> | null = null;
+
+/** Loads all initial UI state in a single IPC round-trip (consuming Rust's parallel preboot snapshot). */
+export function bootstrapApp(): Promise<void> {
+  if (bootPromise) return bootPromise;
+  bootPromise = (async () => {
+    const initialView: MailView = ui.view.kind === "outbox" ? { kind: "unified", role: "inbox" } : ui.view;
+    const data = await api.bootstrap(initialView, BOOT_PAGE, STARTUP_SETTING_KEYS);
+    ui.accounts = data.accounts;
+    ui.folders = data.folders;
+    ui.smartCounts = data.smartCounts;
+    ui.outbox = data.outbox;
+    ui.pendingAgentActions = data.pendingAgentActions;
+    applyPrefs(data.settings);
+    hydrateTheme(data.settings);
+    hydrateBadgeMode(data.settings);
+    hydrateShortcuts(data.settings);
+    hydrateAi(data.settings);
+    try {
+      ui.trustedSenders = JSON.parse(data.settings["trusted_senders"] || "[]");
+    } catch {
+      ui.trustedSenders = [];
+    }
+    ui.list = data.messages;
+    ui.hasMore = data.messages.length === BOOT_PAGE;
+    ui.listReady = true;
+    // Defer background prewarming and sent-recipients lookup until after the first interactive second.
+    prewarmAround(ui.selectedId, 700);
+    if (ui.autoTrustSent) {
+      setTimeout(() => { loadSentRecipients(); }, 500);
+    }
+  })().catch((e) => {
+    bootPromise = null;
+    throw e;
+  });
+  return bootPromise;
 }
 
 export function setPaneWidths(side: number, list: number) {
@@ -650,7 +662,7 @@ async function drainPrewarm() {
 }
 
 /** Schedules low-priority prewarming for the rows around `selectedId` (or the top of the list). */
-function prewarmAround(selectedId: number | null) {
+function prewarmAround(selectedId: number | null, delayMs = 40) {
   clearTimeout(prewarmTimer);
   prewarmTimer = setTimeout(() => {
     const list = ui.list;
@@ -671,7 +683,7 @@ function prewarmAround(selectedId: number | null) {
     if (!ids.length) return;
     prewarmQueue = ids;
     drainPrewarm();
-  }, 40);
+  }, delayMs);
 }
 
 function markRowReadIfNeeded(id: number, my: number) {

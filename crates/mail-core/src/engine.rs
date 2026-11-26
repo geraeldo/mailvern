@@ -154,10 +154,11 @@ impl Engine {
         self.events.subscribe()
     }
 
-    /// Starts a worker for every account. Must be called inside a Tokio runtime.
+    /// Starts a worker for every account (staggered so multi-account launches don't storm
+    /// Keychain, TLS, SQLite, and UI events simultaneously). Must be called inside a Tokio runtime.
     pub fn start(&self) -> Result<()> {
-        for acc in self.db.accounts()? {
-            self.start_account(acc);
+        for (i, acc) in self.db.accounts()?.into_iter().enumerate() {
+            self.start_account_delayed(acc, Duration::from_millis(i as u64 * 150));
         }
         tokio::spawn(scheduler(self.db.clone(), self.events.clone(), self.workers.clone(), self.wake.clone()));
         tokio::spawn(self.clone().rule_runner());
@@ -165,6 +166,11 @@ impl Engine {
     }
 
     fn start_account(&self, acc: Account) {
+        self.start_account_delayed(acc, Duration::ZERO);
+    }
+
+    fn start_account_delayed(&self, acc: Account, delay: Duration) {
+        let acc_id = acc.id;
         let (tx, rx) = mpsc::unbounded_channel();
         let last_inbox_write_ms = Arc::new(AtomicI64::new(0));
         let worker = Worker::new(
@@ -175,12 +181,25 @@ impl Engine {
             last_inbox_write_ms.clone(),
             rx,
         );
-        let _ = tx.send(Cmd::SyncAll { force: false });
-        let tasks = vec![
-            tokio::spawn(worker.run()),
-            tokio::spawn(idle_loop(acc.clone(), self.db.clone(), last_inbox_write_ms, tx.clone())),
-        ];
-        self.workers.lock().unwrap_or_else(|e| e.into_inner()).insert(acc.id, Handle { tx, tasks });
+        let mut tasks = vec![tokio::spawn(worker.run())];
+        if delay.is_zero() {
+            let _ = tx.send(Cmd::SyncAll { force: false });
+            tasks.push(tokio::spawn(idle_loop(acc, self.db.clone(), last_inbox_write_ms, tx.clone())));
+        } else {
+            let tx_sync = tx.clone();
+            tasks.push(tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let _ = tx_sync.send(Cmd::SyncAll { force: false });
+            }));
+            let db = self.db.clone();
+            let tx_idle = tx.clone();
+            let idle_delay = delay + Duration::from_millis(250);
+            tasks.push(tokio::spawn(async move {
+                tokio::time::sleep(idle_delay).await;
+                idle_loop(acc, db, last_inbox_write_ms, tx_idle).await;
+            }));
+        }
+        self.workers.lock().unwrap_or_else(|e| e.into_inner()).insert(acc_id, Handle { tx, tasks });
     }
 
     fn send_cmd(&self, account_id: i64, cmd: Cmd) -> Result<()> {

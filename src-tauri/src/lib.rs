@@ -201,10 +201,103 @@ fn set_ai_key(engine: E, key: String) -> R<()> {
     }
 }
 
+/// Initial inbox page size precomputed during parallel preboot (covers ~4 viewports).
+const BOOT_PAGE_LIMIT: i64 = 40;
+
+const STARTUP_SETTING_KEYS: &[&str] = &[
+    "theme",
+    "undo_send",
+    "threads",
+    "sender_icons",
+    "side_width",
+    "list_width",
+    "sidebar_collapsed",
+    "remote_images",
+    "auto_trust_sent",
+    "trusted_senders",
+    "shortcuts",
+    "badge_mode",
+    "ai_search_model",
+    "ai_write_model",
+    "ai_private",
+    "ai_configured",
+];
+
+/// Holds a single-use `BootstrapData` computed on a background thread while WKWebView spawns.
+struct PrebootBootstrap {
+    rx: std::sync::Mutex<Option<std::sync::mpsc::Receiver<R<BootstrapData>>>>,
+}
+
+impl PrebootBootstrap {
+    fn new(rx: std::sync::mpsc::Receiver<R<BootstrapData>>) -> Self {
+        Self { rx: std::sync::Mutex::new(Some(rx)) }
+    }
+
+    fn empty() -> Self {
+        Self { rx: std::sync::Mutex::new(None) }
+    }
+
+    fn take(&self) -> Option<R<BootstrapData>> {
+        let rx = self.rx.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+        rx.recv().ok()
+    }
+}
+
+/// Releases background account syncing & MCP startup once the first bootstrap snapshot has been delivered.
+struct StartGate {
+    opened: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl StartGate {
+    fn new() -> Self {
+        Self {
+            opened: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn open(&self) {
+        if !self.opened.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    async fn wait(&self) {
+        if self.opened.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let notified = self.notify.notified();
+        if self.opened.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
+    }
+}
+
 #[tauri::command(async)]
-fn bootstrap(engine: E, view: View, limit: i64, setting_keys: Vec<String>) -> R<BootstrapData> {
-    let keys: Vec<&str> = setting_keys.iter().map(String::as_str).filter(|k| !is_restricted_setting(k)).collect();
-    engine.bootstrap(&view, limit, &keys).map_err(err)
+fn bootstrap(
+    engine: E,
+    preboot: State<'_, PrebootBootstrap>,
+    start_gate: State<'_, Arc<StartGate>>,
+    view: View,
+    limit: i64,
+    setting_keys: Vec<String>,
+) -> R<BootstrapData> {
+    let is_default_boot = matches!(&view, View::Unified { role } if role == "inbox") && limit == BOOT_PAGE_LIMIT;
+    let res = if is_default_boot {
+        if let Some(pre) = preboot.take() {
+            pre
+        } else {
+            let keys: Vec<&str> = setting_keys.iter().map(String::as_str).filter(|k| !is_restricted_setting(k)).collect();
+            engine.bootstrap(&view, limit, &keys).map_err(err)
+        }
+    } else {
+        let keys: Vec<&str> = setting_keys.iter().map(String::as_str).filter(|k| !is_restricted_setting(k)).collect();
+        engine.bootstrap(&view, limit, &keys).map_err(err)
+    };
+    start_gate.open();
+    res
 }
 
 #[tauri::command(async)]
@@ -878,11 +971,48 @@ fn cleanup_temp_dir() {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn default_app_data_dir() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join("app.mailvern"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_app_data_dir() -> Option<PathBuf> {
+    None
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     if let Ok(exe) = std::env::current_exe() {
         mail_core::extract::enable_subprocess_worker(exe);
     }
+
+    // Start opening SQLite + precomputing the initial inbox snapshot BEFORE AppKit / WKWebView
+    // initialize so cold SSD reads and query time overlap completely with WebKit XPC process boot.
+    let early_preboot = default_app_data_dir().map(|dir| {
+        let (eng_tx, eng_rx) = std::sync::mpsc::sync_channel::<anyhow::Result<Arc<Engine>>>(1);
+        let (boot_tx, boot_rx) = std::sync::mpsc::sync_channel::<R<BootstrapData>>(1);
+        let dir_bg = dir.clone();
+        std::thread::spawn(move || {
+            let opened = std::fs::create_dir_all(&dir_bg)
+                .map_err(anyhow::Error::from)
+                .and_then(|_| Engine::open(&dir_bg.join("mailvern.db")).map(Arc::new));
+            match opened {
+                Ok(engine) => {
+                    let _ = eng_tx.send(Ok(engine.clone()));
+                    let boot = engine
+                        .bootstrap(&View::Unified { role: "inbox".into() }, BOOT_PAGE_LIMIT, STARTUP_SETTING_KEYS)
+                        .map_err(err);
+                    let _ = boot_tx.send(boot);
+                }
+                Err(e) => {
+                    let _ = eng_tx.send(Err(e));
+                }
+            }
+        });
+        (dir, eng_rx, boot_rx)
+    });
+
     tauri::Builder::default()
         .register_asynchronous_uri_scheme_protocol("mailvern-cid", |ctx, request, responder| {
             if request.method() != tauri::http::Method::GET {
@@ -953,11 +1083,22 @@ pub fn run() {
                 })
                 .build(),
         )
-        .setup(|app| {
+        .setup(move |app| {
             let dir = app.path().app_data_dir()?;
-            std::fs::create_dir_all(&dir)?;
-            let engine = match Engine::open(&dir.join("mailvern.db")) {
-                Ok(e) => Arc::new(e),
+            let (engine_res, preboot) = match early_preboot {
+                Some((pre_dir, eng_rx, boot_rx)) if pre_dir == dir => {
+                    let eng = eng_rx
+                        .recv()
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("Database startup thread exited unexpectedly")));
+                    (eng, PrebootBootstrap::new(boot_rx))
+                }
+                _ => {
+                    std::fs::create_dir_all(&dir)?;
+                    (Engine::open(&dir.join("mailvern.db")).map(Arc::new), PrebootBootstrap::empty())
+                }
+            };
+            let engine = match engine_res {
+                Ok(e) => e,
                 Err(e) => {
                     use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
                     app.dialog()
@@ -968,24 +1109,46 @@ pub fn run() {
                     std::process::exit(1);
                 }
             };
+            let start_gate = Arc::new(StartGate::new());
             app.manage(engine.clone());
+            app.manage(preboot);
+            app.manage(start_gate.clone());
             app.manage(agents::Agents::default());
-            // Apply the saved appearance before the page loads, so the window doesn't flash the system theme.
-            match engine.setting("theme").ok().flatten().as_deref() {
+            // Apply the saved appearance and native window background before the page paints,
+            // eliminating the bright-white flash in dark mode while WebKit finishes loading.
+            let saved_theme = engine.setting("theme").ok().flatten();
+            match saved_theme.as_deref() {
                 Some("light") => app.set_theme(Some(tauri::Theme::Light)),
                 Some("dark") => app.set_theme(Some(tauri::Theme::Dark)),
                 _ => {}
             }
+            if let Some(w) = app.get_webview_window("main") {
+                let dark = match saved_theme.as_deref() {
+                    Some("dark") => true,
+                    Some("light") => false,
+                    _ => matches!(w.theme(), Ok(tauri::Theme::Dark)),
+                };
+                let bg = if dark {
+                    tauri::window::Color(27, 27, 26, 255)
+                } else {
+                    tauri::window::Color(255, 255, 255, 255)
+                };
+                let _ = w.set_background_color(Some(bg));
+            }
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                // Clean stale temp files concurrently so startup never waits on disk traversal.
+                let mut rx = engine.subscribe();
+                // Wait until the first bootstrap snapshot is delivered (or 800ms fallback), plus a
+                // short settle window so WebKit finishes frame-1 layout/paint without Keychain,
+                // TLS, SQLite, or IPC contention from all accounts starting at t=0.
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(800), start_gate.wait()).await;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 tokio::task::spawn_blocking(cleanup_temp_dir);
                 if let Err(e) = engine.start() {
                     eprintln!("start failed: {e:#}");
                 }
                 handle.state::<agents::Agents>().apply(&engine).await;
-                let mut rx = engine.subscribe();
                 loop {
                     match rx.recv().await {
                         Ok(ev) => {

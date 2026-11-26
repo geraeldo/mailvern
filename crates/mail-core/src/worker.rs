@@ -445,11 +445,14 @@ impl Worker {
         self.status("error", Some(format!("{e:#}")));
     }
 
-    fn password(&mut self) -> Result<String> {
+    async fn password(&mut self) -> Result<String> {
         if let Some(pw) = &self.cached_password {
             return Ok(pw.clone());
         }
-        let pw = secrets::get(&self.account.email)?;
+        let email = self.account.email.clone();
+        let pw = tokio::task::spawn_blocking(move || secrets::get(&email))
+            .await
+            .map_err(|_| anyhow!("Keychain lookup failed"))??;
         self.cached_password = Some(pw.clone());
         Ok(pw)
     }
@@ -469,7 +472,7 @@ impl Worker {
             }
         }
         if self.session.is_none() {
-            let pw = self.password()?;
+            let pw = self.password().await?;
             let mut s = match imap::connect(&self.account.imap_host, self.account.imap_port, &self.account.email, &pw).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -1624,7 +1627,10 @@ async fn idle_once(
     let pw = match cached_password {
         Some(p) => p.clone(),
         None => {
-            let p = secrets::get(&account.email)?;
+            let email = account.email.clone();
+            let p = tokio::task::spawn_blocking(move || secrets::get(&email))
+                .await
+                .map_err(|_| anyhow!("Keychain lookup failed"))??;
             *cached_password = Some(p.clone());
             p
         }
