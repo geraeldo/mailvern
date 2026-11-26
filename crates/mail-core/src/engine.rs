@@ -227,6 +227,16 @@ impl Engine {
         self.db.reorder_accounts(ids)
     }
 
+    /// Updates an account's desktop notification toggle and Dock badge override immediately
+    /// (without re-testing IMAP/SMTP credentials).
+    pub fn set_account_alerts(&self, account_id: i64, notify: bool, badge_mode: &str) -> Result<()> {
+        let mode = match badge_mode.trim() {
+            "" | "new" | "all" | "off" => badge_mode.trim(),
+            other => return Err(anyhow!("Unknown badge mode {other:?}")),
+        };
+        self.db.set_account_alerts(account_id, notify, mode)
+    }
+
     pub fn reorder_folders(&self, account_id: i64, ids: &[i64]) -> Result<()> {
         self.db.reorder_folders(account_id, ids)
     }
@@ -527,29 +537,52 @@ impl Engine {
             .map_err(|_| anyhow!("Reading the attachment failed"))?
     }
 
-    /// The Dock badge number, per the "badge_mode" setting:
+    /// The Dock badge number, per the global "badge_mode" default and each account's override:
     /// "new" (default) counts unread inbox mail that arrived since the app was last focused,
     /// so mail you mark unread to handle later doesn't badge; "all" counts all unread inbox
     /// mail; "off" shows nothing.
     pub fn badge_count(&self) -> Result<i64> {
-        match self.db.setting(BADGE_MODE)?.as_deref() {
-            Some("off") => Ok(0),
-            Some("all") => self.db.unified_unread(),
-            _ => {
-                let max = self.db.max_message_id()?;
-                let seen = self.db.setting(BADGE_SEEN)?.and_then(|s| s.parse::<i64>().ok());
-                // No mark yet (first run): count only mail from here on. Ids can be reused
-                // after the newest row is deleted, so pull the mark back down to match.
-                let seen = match seen {
-                    Some(s) if s <= max => s,
-                    _ => {
-                        self.db.set_setting(BADGE_SEEN, &max.to_string())?;
-                        max
-                    }
-                };
-                self.db.unified_unread_after(seen)
+        let default_mode = match self.db.setting(BADGE_MODE)?.as_deref() {
+            Some("all") => "all",
+            Some("off") => "off",
+            _ => "new",
+        };
+        let accounts = self.db.accounts()?;
+        if accounts.is_empty() {
+            return Ok(0);
+        }
+        let mut seen_mark: Option<i64> = None;
+        let mut total = 0i64;
+        for acc in accounts {
+            let mode = match acc.badge_mode.as_str() {
+                "new" | "all" | "off" => acc.badge_mode.as_str(),
+                _ => default_mode,
+            };
+            match mode {
+                "off" => {}
+                "all" => total += self.db.account_inbox_unread(acc.id)?,
+                _ => {
+                    let seen = match seen_mark {
+                        Some(s) => s,
+                        None => {
+                            let max = self.db.max_message_id()?;
+                            let saved = self.db.setting(BADGE_SEEN)?.and_then(|s| s.parse::<i64>().ok());
+                            let s = match saved {
+                                Some(v) if v <= max => v,
+                                _ => {
+                                    self.db.set_setting(BADGE_SEEN, &max.to_string())?;
+                                    max
+                                }
+                            };
+                            seen_mark = Some(s);
+                            s
+                        }
+                    };
+                    total += self.db.account_inbox_unread_after(acc.id, seen)?;
+                }
             }
         }
+        Ok(total)
     }
 
     /// Records that the user has looked at the app: everything stored so far stops being "new".

@@ -3,8 +3,11 @@
   import Icon from "./Icon.svelte";
   import Editor from "./Editor.svelte";
   import MailFrame from "./MailFrame.svelte";
+  import Select from "./Select.svelte";
+  import Switch from "./Switch.svelte";
+  import { BADGE_MODES, badge, refreshBadge } from "../badge.svelte";
   import { ui, loadAccounts, loadFolders, setView, toast, checkAccountForMail } from "../state.svelte";
-  import { api, type Account } from "../api";
+  import { api, type Account, type AccountBadgeMode } from "../api";
   import { accountColors } from "../format";
   import { detectProvider, guessServers } from "../providers";
   import { sanitize } from "../html";
@@ -36,13 +39,23 @@
       position: 0,
       aliases: [],
       replyTo: "",
+      notify: true,
+      badgeMode: "",
     };
   }
 
   function fromTarget(t: number | "new"): Account {
     if (typeof t === "number") {
       const a = ui.accounts.find((x) => x.id === t);
-      if (a) return { ...a, aliases: (a.aliases ?? []).map((x) => ({ ...x })), replyTo: a.replyTo ?? "" };
+      if (a) {
+        return {
+          ...a,
+          aliases: (a.aliases ?? []).map((x) => ({ ...x })),
+          replyTo: a.replyTo ?? "",
+          notify: a.notify ?? true,
+          badgeMode: a.badgeMode ?? "",
+        };
+      }
     }
     return blank();
   }
@@ -65,6 +78,13 @@
   let loadedTarget: number | "new" | null = null;
 
   const provider = $derived(detectProvider(draft.email));
+  const defaultBadgeLabel = $derived(BADGE_MODES.find((m) => m.id === badge.mode)?.label ?? "New messages");
+  const badgeOptions = $derived<{ value: AccountBadgeMode; label: string }[]>([
+    { value: "", label: `Follow default (${defaultBadgeLabel})` },
+    { value: "new", label: "New messages" },
+    { value: "all", label: "All unread messages" },
+    { value: "off", label: "Off" },
+  ]);
 
   function snapshotOf(a: Account, sig: string): string {
     return JSON.stringify({
@@ -79,6 +99,8 @@
       signature: sig,
       aliases: a.aliases,
       replyTo: a.replyTo,
+      notify: a.notify,
+      badgeMode: a.badgeMode,
     });
   }
 
@@ -197,6 +219,7 @@
       const keepHtml = sigHtml;
       await loadAccounts();
       await loadFolders();
+      await refreshBadge();
       loadTarget(saved.id);
       if (keepMode === "html") {
         sigMode = "html";
@@ -323,6 +346,26 @@
               {/each}
             </div>
           </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="sec-title">Notifications &amp; Dock badge</div>
+      <div class="card alerts-card">
+        <label class="alert-row interactive">
+          <span class="alert-text">
+            <span class="alert-label">Desktop notifications</span>
+            <span class="alert-detail">Show macOS alerts when new mail arrives in this account</span>
+          </span>
+          <Switch checked={draft.notify} label="Desktop notifications" onchange={(v) => (draft.notify = v)} />
+        </label>
+        <div class="alert-row">
+          <span class="alert-text">
+            <span class="alert-label">Dock badge</span>
+            <span class="alert-detail">How this account contributes to Mailvern's Dock count</span>
+          </span>
+          <Select label="Dock badge" value={draft.badgeMode} options={badgeOptions} onchange={(v) => (draft.badgeMode = v)} />
         </div>
       </div>
     </section>
@@ -563,6 +606,19 @@
   .alias-info { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .alias-mail { color: var(--muted); }
   .icon-btn.sm { width: 26px; height: 26px; flex: none; }
+  .alerts-card { padding: 0; overflow: hidden; }
+  .alert-row {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 12px;
+    padding: 11px 14px;
+  }
+  .alert-row + .alert-row { border-top: 1px solid var(--line); }
+  .alert-row.interactive:hover { background: var(--hover); }
+  .alert-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .alert-label { font-size: 13.5px; font-weight: 450; color: var(--text); }
+  .alert-detail { font-size: 12px; font-weight: 400; color: var(--muted); }
   .grow { flex: 1; }
   footer {
     display: flex;

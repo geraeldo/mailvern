@@ -114,7 +114,13 @@ CREATE TABLE IF NOT EXISTS moved_bodies (
 /// Rules: never edit or reorder a shipped entry. To change the schema, append a new
 /// entry (e.g. `ALTER TABLE messages ADD COLUMN ...`). Each one runs once, in a
 /// transaction, and the database is backed up before any upgrade.
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10];
+
+/// v10: per-account desktop notification toggle and Dock badge override.
+const V10: &str = r#"
+ALTER TABLE accounts ADD COLUMN notify INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE accounts ADD COLUMN badge_mode TEXT NOT NULL DEFAULT '';
+"#;
 
 /// v9: send-as aliases and default Reply-To per account, flagged message index for smart views,
 /// and persisted calendar invite (ICS) RSVP responses.
@@ -516,6 +522,8 @@ fn row_to_account(r: &rusqlite::Row) -> rusqlite::Result<Account> {
         label: r.get(10)?,
         aliases: serde_json::from_str(&aliases_json).unwrap_or_default(),
         reply_to: r.get(12)?,
+        notify: r.get(13)?,
+        badge_mode: r.get(14)?,
     })
 }
 
@@ -707,7 +715,7 @@ impl Db {
     pub fn accounts(&self) -> Result<Vec<Account>> {
         let c = self.r();
         let mut st = c.prepare(
-            "SELECT id, name, email, imap_host, imap_port, smtp_host, smtp_port, color, signature, position, label, aliases_json, reply_to
+            "SELECT id, name, email, imap_host, imap_port, smtp_host, smtp_port, color, signature, position, label, aliases_json, reply_to, notify, badge_mode
              FROM accounts ORDER BY position, id",
         )?;
         let rows = st.query_map([], row_to_account)?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -717,7 +725,7 @@ impl Db {
     pub fn account(&self, id: i64) -> Result<Account> {
         let c = self.r();
         Ok(c.query_row(
-            "SELECT id, name, email, imap_host, imap_port, smtp_host, smtp_port, color, signature, position, label, aliases_json, reply_to
+            "SELECT id, name, email, imap_host, imap_port, smtp_host, smtp_port, color, signature, position, label, aliases_json, reply_to, notify, badge_mode
              FROM accounts WHERE id = ?",
             [id],
             row_to_account,
@@ -729,19 +737,28 @@ impl Db {
         let aliases_json = serde_json::to_string(&a.aliases)?;
         if a.id > 0 {
             c.execute(
-                "UPDATE accounts SET name=?, email=?, imap_host=?, imap_port=?, smtp_host=?, smtp_port=?, color=?, signature=?, label=?, aliases_json=?, reply_to=? WHERE id=?",
-                params![a.name, a.email, a.imap_host, a.imap_port, a.smtp_host, a.smtp_port, a.color, a.signature, a.label, aliases_json, a.reply_to, a.id],
+                "UPDATE accounts SET name=?, email=?, imap_host=?, imap_port=?, smtp_host=?, smtp_port=?, color=?, signature=?, label=?, aliases_json=?, reply_to=?, notify=?, badge_mode=? WHERE id=?",
+                params![a.name, a.email, a.imap_host, a.imap_port, a.smtp_host, a.smtp_port, a.color, a.signature, a.label, aliases_json, a.reply_to, a.notify, a.badge_mode, a.id],
             )?;
             Ok(a.id)
         } else {
             let pos: i64 = c.query_row("SELECT COALESCE(MAX(position), 0) + 1 FROM accounts", [], |r| r.get(0))?;
             c.execute(
-                "INSERT INTO accounts (name, email, imap_host, imap_port, smtp_host, smtp_port, color, signature, position, label, aliases_json, reply_to)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                params![a.name, a.email, a.imap_host, a.imap_port, a.smtp_host, a.smtp_port, a.color, a.signature, pos, a.label, aliases_json, a.reply_to],
+                "INSERT INTO accounts (name, email, imap_host, imap_port, smtp_host, smtp_port, color, signature, position, label, aliases_json, reply_to, notify, badge_mode)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![a.name, a.email, a.imap_host, a.imap_port, a.smtp_host, a.smtp_port, a.color, a.signature, pos, a.label, aliases_json, a.reply_to, a.notify, a.badge_mode],
             )?;
             Ok(c.last_insert_rowid())
         }
+    }
+
+    pub fn set_account_alerts(&self, account_id: i64, notify: bool, badge_mode: &str) -> Result<()> {
+        let c = self.c();
+        c.execute(
+            "UPDATE accounts SET notify = ?, badge_mode = ? WHERE id = ?",
+            params![notify, badge_mode, account_id],
+        )?;
+        Ok(())
     }
 
     pub fn reorder_accounts(&self, ids: &[i64]) -> Result<()> {
@@ -1944,6 +1961,7 @@ impl Db {
         Ok(n > 0)
     }
 
+    #[cfg(test)]
     pub fn unified_unread(&self) -> Result<i64> {
         let c = self.r();
         Ok(c.query_row(
@@ -1960,11 +1978,30 @@ impl Db {
     }
 
     /// Unread inbox messages stored after the given id (excluding messages silenced by SkipNotification).
+    #[cfg(test)]
     pub fn unified_unread_after(&self, after_id: i64) -> Result<i64> {
         let c = self.r();
         Ok(c.query_row(
             "SELECT COUNT(*) FROM messages WHERE seen = 0 AND quiet = 0 AND id > ?1 AND folder_id IN (SELECT id FROM folders WHERE role = 'inbox')",
             [after_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn account_inbox_unread(&self, account_id: i64) -> Result<i64> {
+        let c = self.r();
+        Ok(c.query_row(
+            "SELECT COUNT(*) FROM messages WHERE account_id = ?1 AND seen = 0 AND folder_id IN (SELECT id FROM folders WHERE account_id = ?1 AND role = 'inbox')",
+            [account_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn account_inbox_unread_after(&self, account_id: i64, after_id: i64) -> Result<i64> {
+        let c = self.r();
+        Ok(c.query_row(
+            "SELECT COUNT(*) FROM messages WHERE account_id = ?1 AND seen = 0 AND quiet = 0 AND id > ?2 AND folder_id IN (SELECT id FROM folders WHERE account_id = ?1 AND role = 'inbox')",
+            params![account_id, after_id],
             |r| r.get(0),
         )?)
     }

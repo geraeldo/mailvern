@@ -8,7 +8,7 @@ pub struct Alias {
     pub email: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Account {
     #[serde(default)]
@@ -34,6 +34,34 @@ pub struct Account {
     /// Default custom Reply-To address for outgoing mail (empty = none).
     #[serde(default)]
     pub reply_to: String,
+    /// Whether new mail in this account triggers desktop notifications.
+    #[serde(default = "yes")]
+    pub notify: bool,
+    /// Dock badge override for this account: "" (follow default), "new", "all", or "off".
+    #[serde(default)]
+    pub badge_mode: String,
+}
+
+impl Default for Account {
+    fn default() -> Self {
+        Account {
+            id: 0,
+            name: String::new(),
+            email: String::new(),
+            imap_host: String::new(),
+            imap_port: 0,
+            smtp_host: String::new(),
+            smtp_port: 0,
+            color: String::new(),
+            signature: String::new(),
+            position: 0,
+            label: String::new(),
+            aliases: Vec::new(),
+            reply_to: String::new(),
+            notify: true,
+            badge_mode: String::new(),
+        }
+    }
 }
 
 #[derive(Serialize, Clone, Debug)]

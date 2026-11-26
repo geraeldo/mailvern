@@ -305,12 +305,15 @@ impl Engine {
                 }
             }
             if let Some(last) = announce.iter().max_by_key(|f| f.date) {
-                let _ = self.events.send(Event::NewMail {
-                    account_id,
-                    from: if last.from_name.is_empty() { last.from_addr.clone() } else { last.from_name.clone() },
-                    subject: last.subject.clone(),
-                    count: announce.len(),
-                });
+                let allow_notify = self.db.account(account_id).map(|a| a.notify).unwrap_or(true);
+                if allow_notify {
+                    let _ = self.events.send(Event::NewMail {
+                        account_id,
+                        from: if last.from_name.is_empty() { last.from_addr.clone() } else { last.from_name.clone() },
+                        subject: last.subject.clone(),
+                        count: announce.len(),
+                    });
+                }
             }
         });
         futures::future::join_all(futs).await;
@@ -743,5 +746,62 @@ mod tests {
         let ids = s.engine.db.insert_messages(s.account, inbox, &[crate::parse::parse_header(1, &raw, false, false, 10, now())]).unwrap();
         run_queue(&s, &ids).await;
         assert_eq!(s.engine.badge_count().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn per_account_notifications_and_badge_modes() {
+        let s = setup(vec![]);
+        let inbox1 = s.engine.db.folder_by_role(s.account, "inbox").unwrap().unwrap().0;
+        let a2 = s
+            .engine
+            .seed(
+                &Account {
+                    email: "noisy@example.com".into(),
+                    notify: false,
+                    badge_mode: "off".into(),
+                    ..account()
+                },
+                &[("INBOX", Some("inbox"), vec![])],
+            )
+            .unwrap();
+        let inbox2 = s.engine.db.folder_by_role(a2, "inbox").unwrap().unwrap().0;
+
+        // Default global mode is "new"; mark current max as seen first.
+        s.engine.mark_badge_seen().unwrap();
+        assert_eq!(s.engine.badge_count().unwrap(), 0);
+
+        // Insert 1 unread in account 1 (default "new") and 2 unread in account 2 (badge_mode "off", notify false).
+        let mut rx = s.engine.subscribe();
+        let m1 = mail("Alice <a@x.com>", "Work", "w1@x", "");
+        let m2 = mail("News <n@x.com>", "Noise 1", "n1@x", "");
+        let m3 = mail("News <n@x.com>", "Noise 2", "n2@x", "");
+        let ids1 = s.engine.db.insert_messages(s.account, inbox1, &[crate::parse::parse_header(10, &m1, false, false, 10, now())]).unwrap();
+        let ids2 = s.engine.db.insert_messages(a2, inbox2, &[
+            crate::parse::parse_header(1, &m2, false, false, 10, now()),
+            crate::parse::parse_header(2, &m3, false, false, 10, now() + 1),
+        ]).unwrap();
+        let t = now();
+        s.engine.db.queue_for_rules(s.account, &ids1, t).unwrap();
+        s.engine.db.queue_for_rules(a2, &ids2, t).unwrap();
+        let batch = s.engine.db.rule_queue(100).unwrap();
+        s.engine.process_queue(batch).await;
+
+        // Only account 1 emits NewMail (account 2 has notify = false).
+        let mut notified_accounts = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let Event::NewMail { account_id, .. } = ev {
+                notified_accounts.push(account_id);
+            }
+        }
+        assert_eq!(notified_accounts, vec![s.account]);
+
+        // Badge counts only account 1's new unread (1); account 2 is "off".
+        assert_eq!(s.engine.badge_count().unwrap(), 1);
+
+        // Switching account 2 to "all" adds its 2 unread messages even after mark_badge_seen().
+        s.engine.mark_badge_seen().unwrap();
+        assert_eq!(s.engine.badge_count().unwrap(), 0);
+        s.engine.set_account_alerts(a2, false, "all").unwrap();
+        assert_eq!(s.engine.badge_count().unwrap(), 2);
     }
 }

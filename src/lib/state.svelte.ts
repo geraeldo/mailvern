@@ -1,6 +1,7 @@
 import {
-  api, type Account, type Detail, type FileInfo, type Folder, type MailView, type OutboxItem, type Outgoing, type SearchScope, type SmartCounts, type Summary, type View,
+  api, type Account, type AccountBadgeMode, type Detail, type FileInfo, type Folder, type MailView, type OutboxItem, type Outgoing, type SearchScope, type SmartCounts, type Summary, type View,
 } from "./api";
+import { refreshBadge } from "./badge.svelte";
 import { formatAddr } from "./format";
 import { threadText } from "./copy";
 import { extractRemoteImageUrls, textToHtml, unwrapEmail } from "./html";
@@ -309,6 +310,21 @@ export async function reorderAccounts(ids: number[]) {
     toast(String(e));
   }
   await loadAccounts();
+}
+
+export async function setAccountAlerts(accountId: number, notify: boolean, badgeMode: AccountBadgeMode) {
+  const acc = ui.accounts.find((a) => a.id === accountId);
+  if (acc) {
+    acc.notify = notify;
+    acc.badgeMode = badgeMode;
+  }
+  try {
+    await api.setAccountAlerts(accountId, notify, badgeMode);
+    await refreshBadge();
+  } catch (e) {
+    toast(String(e));
+    await loadAccounts();
+  }
 }
 
 /** `visibleIds` is the new order of the folders on screen; hidden ones keep their slots. */

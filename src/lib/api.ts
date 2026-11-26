@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export type Alias = { name: string; email: string };
+export type AccountBadgeMode = "" | "new" | "all" | "off";
 
 export type Account = {
   id: number;
@@ -16,6 +17,8 @@ export type Account = {
   label: string;
   aliases: Alias[];
   replyTo: string;
+  notify: boolean;
+  badgeMode: AccountBadgeMode;
 };
 
 export type Folder = {
@@ -302,6 +305,8 @@ export const api = {
   saveAccount: (account: Account, password: string | null) => invoke<Account>("save_account", { account, password }),
   deleteAccount: (id: number) => invoke<void>("delete_account", { id }),
   reorderAccounts: (ids: number[]) => invoke<void>("reorder_accounts", { ids }),
+  setAccountAlerts: (accountId: number, notify: boolean, badgeMode: AccountBadgeMode) =>
+    invoke<void>("set_account_alerts", { accountId, notify, badgeMode }),
   folders: () => invoke<Folder[]>("folders"),
   smartCounts: () => invoke<SmartCounts>("smart_counts"),
   reorderFolders: (accountId: number, ids: number[]) => invoke<void>("reorder_folders", { accountId, ids }),

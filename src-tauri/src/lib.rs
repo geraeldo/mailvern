@@ -47,6 +47,11 @@ fn reorder_accounts(engine: E, ids: Vec<i64>) -> R<()> {
 }
 
 #[tauri::command(async)]
+fn set_account_alerts(engine: E, account_id: i64, notify: bool, badge_mode: String) -> R<()> {
+    engine.set_account_alerts(account_id, notify, &badge_mode).map_err(err)
+}
+
+#[tauri::command(async)]
 fn reorder_folders(engine: E, account_id: i64, ids: Vec<i64>) -> R<()> {
     engine.reorder_folders(account_id, &ids).map_err(err)
 }
@@ -821,6 +826,7 @@ pub fn run() {
             save_account,
             delete_account,
             reorder_accounts,
+            set_account_alerts,
             reorder_folders,
             create_folder,
             rename_folder,

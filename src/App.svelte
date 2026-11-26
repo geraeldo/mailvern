@@ -118,6 +118,7 @@
       else if (e.kind === "status") ui.status[e.accountId] = { state: e.state, message: e.message };
       else if (e.kind === "newMail" && notify) {
         const acc = accountById(e.accountId);
+        if (acc && acc.notify === false) return;
         sendNotification({
           title: e.count > 1 ? `${e.count} new messages` : e.from,
           body: e.count > 1 ? `${e.from} · ${e.subject}` : e.subject || "(no subject)",

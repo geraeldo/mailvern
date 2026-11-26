@@ -3,9 +3,9 @@
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 
 const accounts = [
-  { id: 1, label: "Acme", name: "Alex Rivera", email: "hello@acme.co", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465, color: "#2F6BFF", signature: "<b>Alex Rivera</b><br>Acme Co.", position: 0, aliases: [{ name: "Acme Support", email: "support@acme.co" }], replyTo: "" },
-  { id: 2, label: "Personal", name: "Alex Rivera", email: "alex@rivera.me", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465, color: "#4FA05A", signature: "— Alex", position: 1, aliases: [], replyTo: "" },
-  { id: 3, label: "", name: "Acme Billing", email: "billing@acme.co", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465, color: "#D9A21B", signature: "", position: 2, aliases: [], replyTo: "" },
+  { id: 1, label: "Acme", name: "Alex Rivera", email: "hello@acme.co", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465, color: "#2F6BFF", signature: "<b>Alex Rivera</b><br>Acme Co.", position: 0, aliases: [{ name: "Acme Support", email: "support@acme.co" }], replyTo: "", notify: true, badgeMode: "" },
+  { id: 2, label: "Personal", name: "Alex Rivera", email: "alex@rivera.me", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465, color: "#4FA05A", signature: "— Alex", position: 1, aliases: [], replyTo: "", notify: true, badgeMode: "" },
+  { id: 3, label: "", name: "Acme Billing", email: "billing@acme.co", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465, color: "#D9A21B", signature: "", position: 2, aliases: [], replyTo: "", notify: false, badgeMode: "off" },
 ];
 
 const roles = ["inbox", "drafts", "sent", "archive", "junk", "trash", "snoozed"];
@@ -498,6 +498,11 @@ export function installMock() {
         const i = accounts.findIndex((a) => a.id === args.account.id);
         if (i >= 0) accounts[i] = { ...args.account };
         return args.account;
+      }
+      case "set_account_alerts": {
+        const a = accounts.find((x) => x.id === args.accountId);
+        if (a) { a.notify = args.notify; a.badgeMode = args.badgeMode; }
+        return null;
       }
       case "plugin:notification|is_permission_granted": return false;
       case "plugin:notification|request_permission": return "denied";
