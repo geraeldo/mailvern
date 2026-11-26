@@ -129,7 +129,7 @@
     sigHtml = next.signature;
     sigKey++;
     hostsTouched = next.id !== 0;
-    originSnapshot = snapshotOf(next, next.signature);
+    originSnapshot = snapshotOf(next, normalizeSignature(next.signature));
     loadedTarget = t;
   }
 
@@ -137,12 +137,17 @@
     if (target !== loadedTarget) loadTarget(target);
   });
 
+  function normalizeSignature(html: string): string {
+    return sanitize(html).trim().replace(/^(<br\s*\/?>|\s|<div><br\s*\/?><\/div>)+$/i, "");
+  }
+
   function currentSignature(): string {
-    const html = sigMode === "html" ? sanitize(sigHtml) : (sigEl?.innerHTML ?? draft.signature);
-    return html.trim().replace(/^(<br\s*\/?>|\s|<div><br\s*\/?><\/div>)+$/i, "");
+    const html = sigMode === "html" ? sigHtml : (sigEl?.dataset.ready ? sigEl.innerHTML : draft.signature);
+    return normalizeSignature(html);
   }
 
   export function isDirty(): boolean {
+    if (loadedTarget === null) return false;
     if (password.length > 0) return true;
     return snapshotOf(draft, currentSignature()) !== originSnapshot;
   }
