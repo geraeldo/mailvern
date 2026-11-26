@@ -609,6 +609,16 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(external_links())
+        // Reopen the window at the size and place it had when the app quit.
+        // Visibility is left out: quitting while the window is hidden must not reopen it hidden.
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags({
+                    use tauri_plugin_window_state::StateFlags;
+                    StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED | StateFlags::FULLSCREEN
+                })
+                .build(),
+        )
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
