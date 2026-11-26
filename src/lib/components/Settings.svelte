@@ -4,6 +4,7 @@
   import Modal from "./Modal.svelte";
   import Shortcuts from "./Shortcuts.svelte";
   import General from "./General.svelte";
+  import NotificationsSettings from "./NotificationsSettings.svelte";
   import AISettings from "./AISettings.svelte";
   import AgentSettings from "./AgentSettings.svelte";
   import RulesSettings from "./RulesSettings.svelte";
@@ -13,6 +14,7 @@
 
   const sections: { id: Exclude<SettingsSection, "accounts">; label: string; icon: string }[] = [
     { id: "general", label: "General", icon: "settings" },
+    { id: "notifications", label: "Notifications", icon: "bell" },
     { id: "rules", label: "Rules", icon: "filter" },
     { id: "ai", label: "Models", icon: "sparkle" },
     { id: "agents", label: "Agent access", icon: "code" },
@@ -147,6 +149,8 @@
     <main class="scroll">
       {#if section === "general"}
         <General />
+      {:else if section === "notifications"}
+        <NotificationsSettings />
       {:else if section === "accounts"}
         <AccountSettings
           bind:this={accountPane}

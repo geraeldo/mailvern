@@ -1,7 +1,5 @@
 <script lang="ts">
-  import { BADGE_MODES, badge, setBadgeMode } from "../badge.svelte";
-  import { ui, accountLabel, setAccountAlerts, setUndoSend, setThreaded, setSenderIcons, setRemoteImages, setAutoTrustSent, trustSender, untrustSender, type RemoteImagesMode } from "../state.svelte";
-  import type { AccountBadgeMode } from "../api";
+  import { ui, setUndoSend, setThreaded, setSenderIcons, setRemoteImages, setAutoTrustSent, trustSender, untrustSender, type RemoteImagesMode } from "../state.svelte";
   import { THEME_MODES, theme, setThemeMode } from "../theme.svelte";
   import Select from "./Select.svelte";
   import Switch from "./Switch.svelte";
@@ -13,13 +11,6 @@
     { value: "strip_trackers", label: "Block trackers only" },
     { value: "always", label: "Always load" },
   ];
-  const defaultBadgeLabel = $derived(BADGE_MODES.find((m) => m.id === badge.mode)?.label ?? "New messages");
-  const accountBadgeOptions = $derived<{ value: AccountBadgeMode; label: string }[]>([
-    { value: "", label: `Default (${defaultBadgeLabel})` },
-    { value: "new", label: "New messages" },
-    { value: "all", label: "All unread" },
-    { value: "off", label: "Off" },
-  ]);
 
   let newTrust = $state("");
   let trustError = $state("");
@@ -85,47 +76,6 @@
 </div>
 
 <div class="group">
-  <div class="gname">Dock badge &amp; notifications</div>
-  <div class="card">
-    {#each BADGE_MODES as m (m.id)}
-      <label class="row interactive">
-        <input type="radio" name="badge" value={m.id} checked={badge.mode === m.id} onchange={() => setBadgeMode(m.id)} />
-        <span class="text">
-          <span class="label">{m.label}</span>
-          {#if m.detail}<span class="detail">{m.detail}</span>{/if}
-        </span>
-      </label>
-    {/each}
-  </div>
-  {#if ui.accounts.length}
-    <div class="subname">Per account</div>
-    <div class="card">
-      {#each ui.accounts as acc (acc.id)}
-        <div class="row acc-alert">
-          <span class="acc-bar" style:background={acc.color || "var(--muted)"}></span>
-          <span class="text">
-            <span class="label">{accountLabel(acc)}</span>
-            <span class="detail">{acc.email}</span>
-          </span>
-          <Select
-            label={`Dock badge for ${acc.email}`}
-            value={acc.badgeMode ?? ""}
-            options={accountBadgeOptions}
-            onchange={(v) => setAccountAlerts(acc.id, acc.notify ?? true, v)} />
-          <label class="notif-toggle" title="Desktop notifications">
-            <span class="notif-lbl">Alerts</span>
-            <Switch
-              checked={acc.notify ?? true}
-              label={`Notifications for ${acc.email}`}
-              onchange={(on) => setAccountAlerts(acc.id, on, acc.badgeMode ?? "")} />
-          </label>
-        </div>
-      {/each}
-    </div>
-  {/if}
-</div>
-
-<div class="group">
   <div class="gname">Remote images</div>
   <div class="card">
     <div class="row">
@@ -180,12 +130,7 @@
 
 <style>
   .gname { font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 8px; }
-  .subname { font-size: 11.5px; font-weight: 600; color: var(--muted); margin: 14px 0 7px; }
   .group + .group { margin-top: 24px; }
-  .acc-bar { width: 3px; height: 24px; border-radius: 2px; flex: none; }
-  .acc-alert { gap: 10px; }
-  .notif-toggle { display: inline-flex; align-items: center; gap: 6px; flex: none; }
-  .notif-lbl { font-size: 12px; color: var(--muted); }
   .card {
     border: 1px solid var(--line);
     border-radius: var(--radius);
@@ -228,7 +173,6 @@
   }
   .btn-add:hover:not(:disabled) { background: var(--hover); }
   .btn-add:disabled { opacity: 0.45; }
-  input[type="radio"] { margin: 0; accent-color: var(--accent); flex: none; }
   .text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
   .label { font-size: 13.5px; color: var(--text); }
   .addr { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

@@ -30,7 +30,7 @@ export type ComposeInit = {
   key: number;
 };
 export type ComposeSession = ComposeInit & { minimized: boolean; expanded: boolean };
-export type SettingsSection = "general" | "accounts" | "rules" | "ai" | "agents" | "shortcuts";
+export type SettingsSection = "general" | "notifications" | "accounts" | "rules" | "ai" | "agents" | "shortcuts";
 export type RemoteImagesMode = "ask" | "strip_trackers" | "always";
 export type SyncStatus = { state: "syncing" | "idle" | "error"; message: string | null };
 /** One thing AI search did, shown while it works. */
