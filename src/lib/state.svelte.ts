@@ -1,16 +1,19 @@
 import {
   api, type Account, type AccountBadgeMode, type Detail, type FileInfo, type Folder, type MailView, type OutboxItem, type Outgoing, type SearchScope, type SmartCounts, type Summary, type View,
 } from "./api";
-import { refreshBadge } from "./badge.svelte";
+import { hydrateAi } from "./ai/config.svelte";
+import { hydrateBadgeMode, refreshBadge } from "./badge.svelte";
 import { formatAddr } from "./format";
 import { threadText } from "./copy";
-import { extractRemoteImageUrls, textToHtml, unwrapEmail } from "./html";
+import { textToHtml, unwrapEmail } from "./html";
+import { hydrateShortcuts } from "./shortcuts.svelte";
+import { hydrateTheme } from "./theme.svelte";
 import { extractEmailAddress, isRemoteImageAllowed, validateTrustEntry, type TrustEntryResult } from "./trust";
 import { toUnix, whenLabel } from "./when";
 import {
-  cachedDetailsFor, cachedFrameDoc, clearMailCache, evictMessages, getCachedDetail, getCachedThread, hasShownImages,
-  markCachedFolderRead, peekCachedDetail, preloadRemoteImages, putDetail, putThread, updateCachedFlagged,
-  updateCachedSeen, updatePaneThread, upsertReaderPane,
+  cachedDetailsFor, cachedFrameDoc, cachedRemoteImageUrls, clearMailCache, evictMessages, getCachedDetail,
+  getCachedThread, hasShownImages, markCachedFolderRead, peekCachedDetail, preloadRemoteImages, putDetail,
+  putThread, updateCachedFlagged, updateCachedSeen, updatePaneThread, upsertReaderPane,
 } from "./mail-cache.svelte";
 
 export type ComposeMode = "new" | "reply" | "replyAll" | "forward" | "draft";
@@ -67,7 +70,26 @@ export type FolderPrompt =
   | { kind: "create"; accountId: number; parentId: number | null; parentName?: string }
   | { kind: "rename"; folder: Folder };
 
-const PAGE = 200;
+const PAGE = 100;
+
+const STARTUP_SETTING_KEYS = [
+  "theme",
+  "undo_send",
+  "threads",
+  "sender_icons",
+  "side_width",
+  "list_width",
+  "sidebar_collapsed",
+  "remote_images",
+  "auto_trust_sent",
+  "trusted_senders",
+  "shortcuts",
+  "badge_mode",
+  "ai_search_model",
+  "ai_write_model",
+  "ai_private",
+  "ai_configured",
+];
 
 export const ui = $state({
   accounts: [] as Account[],
@@ -249,28 +271,58 @@ export async function loadAccounts() {
   ui.accounts = next;
 }
 
-export async function loadPrefs() {
-  const [undo, threads, icons, sideW, listW, sideCol, remoteImg, autoTrust] = await Promise.all([
-    api.getSetting("undo_send"),
-    api.getSetting("threads"),
-    api.getSetting("sender_icons"),
-    api.getSetting("side_width"),
-    api.getSetting("list_width"),
-    api.getSetting("sidebar_collapsed"),
-    api.getSetting("remote_images"),
-    api.getSetting("auto_trust_sent"),
-  ]);
+function applyPrefs(settings: Record<string, string>) {
+  const undo = settings["undo_send"] ?? null;
   const n = Number(undo);
   if (undo != null && Number.isFinite(n)) ui.undoSend = n;
-  ui.threaded = threads !== "off";
-  ui.senderIcons = icons !== "off";
+  ui.threaded = settings["threads"] !== "off";
+  ui.senderIcons = settings["sender_icons"] !== "off";
+  const sideW = settings["side_width"] ?? null;
   const sw = Number(sideW);
   if (sideW != null && Number.isFinite(sw) && sw >= 170 && sw <= 320) ui.sideWidth = sw;
+  const listW = settings["list_width"] ?? null;
   const lw = Number(listW);
   if (listW != null && Number.isFinite(lw) && lw >= 260 && lw <= 480) ui.listWidth = lw;
-  ui.sidebarCollapsed = sideCol === "on";
+  ui.sidebarCollapsed = settings["sidebar_collapsed"] === "on";
+  const remoteImg = settings["remote_images"];
   ui.remoteImages = remoteImg === "always" || remoteImg === "strip_trackers" ? remoteImg : "ask";
-  ui.autoTrustSent = autoTrust !== "off";
+  ui.autoTrustSent = settings["auto_trust_sent"] !== "off";
+}
+
+export async function loadPrefs() {
+  const settings = await api.getSettings([
+    "undo_send", "threads", "sender_icons", "side_width",
+    "list_width", "sidebar_collapsed", "remote_images", "auto_trust_sent",
+  ]);
+  applyPrefs(settings);
+}
+
+/** Loads all initial UI state in a single IPC round-trip and defers secondary lookups past first paint. */
+export async function bootstrapApp() {
+  const initialView: MailView = ui.view.kind === "outbox" ? { kind: "unified", role: "inbox" } : ui.view;
+  const data = await api.bootstrap(initialView, PAGE, STARTUP_SETTING_KEYS);
+  ui.accounts = data.accounts;
+  ui.folders = data.folders;
+  ui.smartCounts = data.smartCounts;
+  ui.outbox = data.outbox;
+  ui.pendingAgentActions = data.pendingAgentActions;
+  applyPrefs(data.settings);
+  hydrateTheme(data.settings);
+  hydrateBadgeMode(data.settings);
+  hydrateShortcuts(data.settings);
+  hydrateAi(data.settings);
+  try {
+    ui.trustedSenders = JSON.parse(data.settings["trusted_senders"] || "[]");
+  } catch {
+    ui.trustedSenders = [];
+  }
+  ui.list = data.messages;
+  ui.hasMore = data.messages.length === PAGE;
+  ui.listReady = true;
+  prewarmAround(ui.selectedId);
+  if (ui.autoTrustSent) {
+    setTimeout(() => { loadSentRecipients(); }, 250);
+  }
 }
 
 export function setPaneWidths(side: number, list: number) {
@@ -569,19 +621,13 @@ export async function prewarmMessage(id: number): Promise<void> {
     const t = thread.length ? thread : [d];
     putThread(id, t);
     // Pre-run DOMParser inertly so opening skips main-thread parsing.
+    // Remote images are NOT preloaded on hover/background prewarm to save bandwidth and decoded bitmap RAM.
     const isPlain = !d.html;
     const body = d.html ?? textToHtml(d.text ?? "");
     const trusted = isSenderTrusted(d.fromAddr);
     const allowRemote = trusted || hasShownImages(id);
     const stripTrackers = shouldStripTrackers(d.fromAddr);
     cachedFrameDoc(id, body, allowRemote, isPlain, stripTrackers);
-    // Preload remote images ONLY when the sender is allowed (never for untrusted senders, junk, or trash).
-    if (d.html && trusted) {
-      const role = roleOf(d);
-      if (role !== "junk" && role !== "trash") {
-        preloadRemoteImages(extractRemoteImageUrls(d.html));
-      }
-    }
   } finally {
     prewarmInFlight.delete(id);
   }
@@ -643,6 +689,15 @@ function markRowReadIfNeeded(id: number, my: number) {
   }
 }
 
+function preloadAllowedImages(d: Detail) {
+  if (!d.html) return;
+  const role = roleOf(d);
+  if (role === "junk" || role === "trash") return;
+  if (isSenderTrusted(d.fromAddr) || hasShownImages(d.id)) {
+    preloadRemoteImages(cachedRemoteImageUrls(d.id, d.html, shouldStripTrackers(d.fromAddr)));
+  }
+}
+
 /** Opens a row: its message, and the conversation around it. */
 export async function openMessage(id: number | null) {
   ui.selectedId = id;
@@ -669,6 +724,7 @@ export async function openMessage(id: number | null) {
     ui.details = cachedDetailsFor(t.map((m) => m.id));
     ui.detailLoading = false;
     upsertReaderPane(id, cached, t, expandIds);
+    preloadAllowedImages(cached);
     markRowReadIfNeeded(id, my);
     prewarmAround(id);
 
@@ -722,6 +778,7 @@ export async function openMessage(id: number | null) {
     ui.expandIds = expandIds;
     ui.thread = t;
     upsertReaderPane(id, d, t, expandIds);
+    preloadAllowedImages(d);
   } catch (e) {
     if (my === detailSeq) {
       ui.detail = null;
@@ -1445,8 +1502,14 @@ export function noteSentRecipients(addrs: string[]) {
   if (next) ui.sentRecipients = next;
 }
 
+const ownEmails = $derived(new Set(ui.accounts.map((a) => a.email.toLowerCase())));
+
+/** Lowercased set of the user's own account email addresses (reactive). */
+export function myEmails(): Set<string> {
+  return ownEmails;
+}
+
 function isExplicitlyTrusted(email: string): boolean {
-  const ownEmails = new Set(ui.accounts.map((a) => a.email.toLowerCase()));
   return isRemoteImageAllowed(email, {
     always: false,
     entries: ui.trustedSenders,

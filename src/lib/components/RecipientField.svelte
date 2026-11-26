@@ -46,6 +46,8 @@
   }
 
   function commit(raw: string): boolean {
+    clearTimeout(suggestTimer);
+    seq++;
     const seen = new Set(value);
     const added: string[] = [];
     for (const p of raw.split(/[,;\n]+/).map((s) => s.trim()).filter(Boolean)) {
@@ -61,19 +63,26 @@
   }
 
   let seq = 0;
-  async function suggest() {
+  let suggestTimer: ReturnType<typeof setTimeout> | undefined;
+
+  $effect(() => () => clearTimeout(suggestTimer));
+
+  function suggest() {
+    clearTimeout(suggestTimer);
     const q = input.trim();
     const my = ++seq;
     if (q.length < 1) {
       suggestions = [];
       return;
     }
-    const res = await api.contacts(q);
-    if (my === seq) {
-      suggestions = res.filter((a) => !value.some((v) => v.includes(a.email)));
-      hi = 0;
-      if (suggestions.length) positionPop();
-    }
+    suggestTimer = setTimeout(async () => {
+      const res = await api.contacts(q);
+      if (my === seq) {
+        suggestions = res.filter((a) => !value.some((v) => v.includes(a.email)));
+        hi = 0;
+        if (suggestions.length) positionPop();
+      }
+    }, 120);
   }
 
   function pick(a: Addr) {

@@ -135,14 +135,23 @@ export async function resetShortcuts() {
   await save();
 }
 
-export async function loadShortcuts() {
+export function hydrateShortcuts(settings: Record<string, string>) {
   try {
-    const saved = JSON.parse((await api.getSetting("shortcuts")) || "{}") as Partial<Record<Action, string[]>>;
+    const saved = JSON.parse(settings["shortcuts"] || "{}") as Partial<Record<Action, string[]>>;
     const merged = structuredClone(DEFAULTS);
     for (const a of Object.keys(merged) as Action[]) {
       if (Array.isArray(saved[a])) merged[a] = saved[a]!.filter((c) => typeof c === "string");
     }
     keymap.bindings = merged;
+  } catch {
+    keymap.bindings = structuredClone(DEFAULTS);
+  }
+}
+
+export async function loadShortcuts() {
+  try {
+    const raw = await api.getSetting("shortcuts");
+    hydrateShortcuts(raw ? { shortcuts: raw } : {});
   } catch {
     keymap.bindings = structuredClone(DEFAULTS);
   }

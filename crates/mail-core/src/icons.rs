@@ -30,7 +30,7 @@ pub enum Outcome {
     Failed,
 }
 
-const MAX_IMAGE: usize = 256 * 1024;
+const MAX_IMAGE: usize = 128 * 1024;
 const MAX_HTML: usize = 384 * 1024;
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Mailvern/0.1";
 
@@ -336,8 +336,11 @@ fn icon_links(html: &str, base: &Url) -> Vec<Url> {
         let score = if svg {
             300
         } else {
+            // Avatars render at 26–38 CSS px (up to 76 px @2x): prefer crisp 64–192 px icons
+            // over oversized 512 px+ PNGs to minimize DB storage and IPC payload size.
             match size {
-                Some(n) => n.min(512),
+                Some(n) if n <= 192 => n,
+                Some(_) => 150,
                 None if touch => 180,
                 None => 32,
             }

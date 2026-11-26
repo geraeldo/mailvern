@@ -6,29 +6,33 @@
   import Sidebar from "./lib/components/Sidebar.svelte";
   import MessageList from "./lib/components/MessageList.svelte";
   import Reader from "./lib/components/Reader.svelte";
-  import Composer from "./lib/components/Composer.svelte";
-  import Settings from "./lib/components/Settings.svelte";
-  import ShortcutHelp from "./lib/components/ShortcutHelp.svelte";
-  import WhenPicker from "./lib/components/WhenPicker.svelte";
-  import MovePicker from "./lib/components/MovePicker.svelte";
-  import PromptModal from "./lib/components/PromptModal.svelte";
-  import SourceModal from "./lib/components/SourceModal.svelte";
   import { api, type MailEvent } from "./lib/api";
   import { allowNativeMenu } from "./lib/menus";
-  import { refreshBadge, loadBadgeMode } from "./lib/badge.svelte";
-  import { loadTheme } from "./lib/theme.svelte";
-  import { loadAi } from "./lib/ai/config.svelte";
+  import { refreshBadge } from "./lib/badge.svelte";
+  import { pruneBackgroundCaches } from "./lib/mail-cache.svelte";
   import {
-    ui, loadAccounts, loadFolders, loadList, loadTrusted, loadSentRecipients, loadPrefs, loadOutbox, loadPendingAgentActions, refreshThread, move, compose,
+    ui, bootstrapApp, loadFolders, loadList, loadSentRecipients, loadOutbox, refreshThread, move, compose,
     archiveSelected, trashSelected, toggleJunk, toggleSeen, toggleFlag, accountById, openSettings, openAccountSettings,
     moveSelected, snoozeSelected, unsnoozeSelected, selectAll, extendSelection, clearSelection, snoozeRows, moveRows,
     selectedRows, roleOf, toast, undoToast, runToastAction, copyThread, openMessage, commitPending, setPaneWidths, toggleSidebar, submitFolderPrompt,
     openMailto, printOpenThread,
   } from "./lib/state.svelte";
   import { snoozePresets } from "./lib/when";
-  import { exitAi } from "./lib/ai/search.svelte";
   import { loadRules, rulesUi } from "./lib/rules.svelte";
-  import { keymap, comboOf, match, canFireWhileTyping, usesModifier, loadShortcuts, type Action } from "./lib/shortcuts.svelte";
+  import { keymap, comboOf, match, canFireWhileTyping, usesModifier, type Action } from "./lib/shortcuts.svelte";
+
+  // Lazy-loaded overlays and composer: kept out of the initial boot bundle until opened.
+  function lazyComponent<T>(load: () => Promise<{ default: T }>): () => Promise<T> {
+    let cached: Promise<T> | null = null;
+    return () => (cached ??= load().then((m) => m.default));
+  }
+  const loadComposer = lazyComponent(() => import("./lib/components/Composer.svelte"));
+  const loadSettings = lazyComponent(() => import("./lib/components/Settings.svelte"));
+  const loadShortcutHelp = lazyComponent(() => import("./lib/components/ShortcutHelp.svelte"));
+  const loadWhenPicker = lazyComponent(() => import("./lib/components/WhenPicker.svelte"));
+  const loadMovePicker = lazyComponent(() => import("./lib/components/MovePicker.svelte"));
+  const loadPromptModal = lazyComponent(() => import("./lib/components/PromptModal.svelte"));
+  const loadSourceModal = lazyComponent(() => import("./lib/components/SourceModal.svelte"));
 
   let list: MessageList;
   let notify = false;
@@ -101,13 +105,12 @@
   }
 
   onMount(() => {
-    loadTheme();
     (async () => {
-      await loadAccounts();
-      await loadPrefs();
-      await Promise.all([
-        loadFolders(), loadList(true), loadTrusted(), loadShortcuts(), loadBadgeMode(), loadOutbox(), loadAi(), loadPendingAgentActions(),
-      ]);
+      try {
+        await bootstrapApp();
+      } catch (e) {
+        toast(String(e));
+      }
       refreshBadge();
       if (!ui.accounts.length) openAccountSettings("new");
       notify = (await isPermissionGranted()) || (await requestPermission()) === "granted";
@@ -167,6 +170,7 @@
     });
     // Bringing the window forward counts as looking at your mail: clear "new" from the badge.
     const unMailto = listen<string>("open-mailto", ({ payload }) => openMailto(payload));
+    const unHidden = listen("window-hidden", () => pruneBackgroundCaches(ui.selectedId));
     const unFocus = getCurrentWindow().onFocusChanged(({ payload: focused }) => {
       windowFocused = focused;
       if (focused) refreshBadge();
@@ -178,6 +182,7 @@
       window.removeEventListener("beforeunload", onUnload);
       un.then((f) => f());
       unMailto.then((f) => f());
+      unHidden.then((f) => f());
       unFocus.then((f) => f());
     };
   });
@@ -280,7 +285,7 @@
     if (combo === "escape" && !typing(e) && ui.ai) {
       e.preventDefault();
       if (ui.selectedId != null) openMessage(null);
-      else exitAi();
+      else import("./lib/ai/search.svelte").then((m) => m.exitAi());
       return;
     }
     const action = match(combo);
@@ -326,53 +331,67 @@
 </div>
 
 {#if ui.composers.length}
-  <div class="compose-dock">
-    {#each ui.composers as session (session.key)}
-      <Composer {session} />
-    {/each}
-  </div>
+  {#await loadComposer() then ComposerComp}
+    <div class="compose-dock">
+      {#each ui.composers as session (session.key)}
+        <ComposerComp {session} />
+      {/each}
+    </div>
+  {/await}
 {/if}
 
 {#if ui.settings}
-  <Settings />
+  {#await loadSettings() then SettingsComp}
+    <SettingsComp />
+  {/await}
 {/if}
 
 {#if ui.shortcutHelp}
-  <ShortcutHelp onclose={() => (ui.shortcutHelp = false)} />
+  {#await loadShortcutHelp() then ShortcutHelpComp}
+    <ShortcutHelpComp onclose={() => (ui.shortcutHelp = false)} />
+  {/await}
 {/if}
 
 {#if ui.picker?.kind === "snooze"}
-  <WhenPicker
-    title="Snooze until"
-    action="Snooze"
-    presets={snoozePresets()}
-    onpick={(at) => ui.picker?.kind === "snooze" && snoozeRows(ui.picker.rows, at)}
-    onclose={() => (ui.picker = null)} />
+  {#await loadWhenPicker() then WhenPickerComp}
+    <WhenPickerComp
+      title="Snooze until"
+      action="Snooze"
+      presets={snoozePresets()}
+      onpick={(at) => ui.picker?.kind === "snooze" && snoozeRows(ui.picker.rows, at)}
+      onclose={() => (ui.picker = null)} />
+  {/await}
 {:else if ui.picker?.kind === "move"}
-  <MovePicker
-    accountId={ui.picker.accountId}
-    exclude={[...new Set(ui.picker.rows.map((r) => r.folderId))]}
-    onpick={(f) => ui.picker?.kind === "move" && moveRows(ui.picker.rows, f)}
-    onclose={() => (ui.picker = null)} />
+  {#await loadMovePicker() then MovePickerComp}
+    <MovePickerComp
+      accountId={ui.picker.accountId}
+      exclude={[...new Set(ui.picker.rows.map((r) => r.folderId))]}
+      onpick={(f) => ui.picker?.kind === "move" && moveRows(ui.picker.rows, f)}
+      onclose={() => (ui.picker = null)} />
+  {/await}
 {/if}
 
 {#if ui.folderPrompt}
   {@const fp = ui.folderPrompt}
-  <PromptModal
-    title={fp.kind === "create" ? (fp.parentName ? `New subfolder in ${fp.parentName}` : "New folder") : `Rename “${fp.folder.name}”`}
-    placeholder="Folder name"
-    initial={fp.kind === "rename" ? fp.folder.name : ""}
-    action={fp.kind === "create" ? "Create" : "Rename"}
-    onsubmit={submitFolderPrompt}
-    onclose={() => (ui.folderPrompt = null)} />
+  {#await loadPromptModal() then PromptModalComp}
+    <PromptModalComp
+      title={fp.kind === "create" ? (fp.parentName ? `New subfolder in ${fp.parentName}` : "New folder") : `Rename “${fp.folder.name}”`}
+      placeholder="Folder name"
+      initial={fp.kind === "rename" ? fp.folder.name : ""}
+      action={fp.kind === "create" ? "Create" : "Rename"}
+      onsubmit={submitFolderPrompt}
+      onclose={() => (ui.folderPrompt = null)} />
+  {/await}
 {/if}
 
 {#if ui.sourceView}
-  <SourceModal
-    messageId={ui.sourceView.id}
-    subject={ui.sourceView.subject}
-    source={ui.sourceView.raw}
-    onclose={() => (ui.sourceView = null)} />
+  {#await loadSourceModal() then SourceModalComp}
+    <SourceModalComp
+      messageId={ui.sourceView.id}
+      subject={ui.sourceView.subject}
+      source={ui.sourceView.raw}
+      onclose={() => (ui.sourceView = null)} />
+  {/await}
 {/if}
 
 {#if ui.toast}

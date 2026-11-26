@@ -14,7 +14,25 @@
   import { addrOf } from "../avatars.svelte";
   import { api } from "../api";
   import { ai, searchReady } from "../ai/config.svelte";
-  import { runAiSearch, stopAiSearch } from "../ai/search.svelte";
+
+  type AiSearchMod = typeof import("../ai/search.svelte");
+  let aiSearchMod: Promise<AiSearchMod> | null = null;
+  function loadAiSearch(): Promise<AiSearchMod> {
+    return (aiSearchMod ??= import("../ai/search.svelte"));
+  }
+  function stopAiIfLoaded() {
+    if (aiSearchMod) aiSearchMod.then((m) => m.stopAiSearch());
+  }
+
+  let hoverTimer: ReturnType<typeof setTimeout> | undefined;
+  function schedulePrewarm(id: number) {
+    clearTimeout(hoverTimer);
+    hoverTimer = setTimeout(() => prewarmMessage(id), 110);
+  }
+  function cancelPrewarm() {
+    clearTimeout(hoverTimer);
+  }
+  $effect(() => () => clearTimeout(hoverTimer));
 
   const ROW = 78;
   const OVERSCAN = 8;
@@ -98,7 +116,7 @@
   });
 
   function onInput() {
-    stopAiSearch();
+    stopAiIfLoaded();
     clearTimeout(timer);
     // Search once typing pauses, not on every key.
     timer = setTimeout(() => {
@@ -127,7 +145,7 @@
     lastQuery = draft;
     if (ui.query !== draft) setQuery(draft);
     searchEl?.blur();
-    runAiSearch(q);
+    loadAiSearch().then((m) => m.runAiSearch(q));
   }
 
   /** Sources are numbered to match the answer's citations, once the answer is in. */
@@ -135,25 +153,29 @@
   const numbered = $derived(!!sourceTurn && !sourceTurn.running);
   const running = $derived(aiRunning(ui.ai));
 
-  const FILTER_CHIPS: { token: string; label: string; toggle?: boolean }[] = [
-    { token: "is:unread", label: "Unread", toggle: true },
-    { token: "is:flagged", label: "Flagged", toggle: true },
-    { token: "has:attachment", label: "Has attachment", toggle: true },
-    { token: "from:", label: "from:" },
-    { token: "subject:", label: "subject:" },
-    { token: "after:7d", label: "Last 7d", toggle: true },
+  type FilterChip = { token: string; label: string; toggle?: boolean; testRe: RegExp; stripRe: RegExp };
+  const makeChip = (token: string, label: string, toggle?: boolean): FilterChip => {
+    const esc = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return {
+      token,
+      label,
+      toggle,
+      testRe: new RegExp(`(?:^|\\s)${esc}(?:\\s|$)`, "i"),
+      stripRe: new RegExp(`(?:^|\\s)${esc}(?=\\s|$)`, "gi"),
+    };
+  };
+  const FILTER_CHIPS: FilterChip[] = [
+    makeChip("is:unread", "Unread", true),
+    makeChip("is:flagged", "Flagged", true),
+    makeChip("has:attachment", "Has attachment", true),
+    makeChip("from:", "from:"),
+    makeChip("subject:", "subject:"),
+    makeChip("after:7d", "Last 7d", true),
   ];
 
-  function hasToken(tok: string): boolean {
-    return new RegExp(`(?:^|\\s)${tok.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\\s|$)`, "i").test(draft);
-  }
-
-  function applyChip(chip: { token: string; toggle?: boolean }) {
-    if (chip.toggle && hasToken(chip.token)) {
-      draft = draft
-        .replace(new RegExp(`(?:^|\\s)${chip.token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?=\\s|$)`, "gi"), "")
-        .replace(/\s+/g, " ")
-        .trim();
+  function applyChip(chip: FilterChip) {
+    if (chip.toggle && chip.testRe.test(draft)) {
+      draft = draft.replace(chip.stripRe, "").replace(/\s+/g, " ").trim();
     } else {
       const base = draft.trimEnd();
       draft = base ? `${base} ${chip.token}` : chip.token;
@@ -181,7 +203,7 @@
 
   function closeSearch() {
     clearTimeout(timer);
-    stopAiSearch();
+    stopAiIfLoaded();
     lastQuery = "";
     draft = "";
     searchOpen = false;
@@ -246,7 +268,7 @@
     </div>
     <div class="ops" aria-label="Search filters">
       {#each FILTER_CHIPS as chip (chip.token)}
-        {@const on = !!chip.toggle && hasToken(chip.token)}
+        {@const on = !!chip.toggle && chip.testRe.test(draft)}
         <button type="button" class="op" class:on onclick={() => applyChip(chip)}>{chip.label}</button>
       {/each}
     </div>
@@ -335,7 +357,9 @@
               e.dataTransfer.effectAllowed = "copy";
             }}
             style:transform="translateY({(start + i) * ROW}px)"
-            onpointerenter={() => prewarmMessage(m.id)}
+            onpointerenter={() => schedulePrewarm(m.id)}
+            onpointerleave={cancelPrewarm}
+            onpointerdown={() => { cancelPrewarm(); prewarmMessage(m.id); }}
             onclick={(e) => clickRow(m, e)}
             ondblclick={() => onDouble(m.id)}
             oncontextmenu={(e) => { e.preventDefault(); messageMenu(m); }}>

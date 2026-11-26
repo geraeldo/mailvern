@@ -8,7 +8,7 @@
   import Switch from "./Switch.svelte";
   import RuleEditor from "./RuleEditor.svelte";
   import { rulesUi, loadRules, conditionsSummary, actionsSummary, openRuleEditor, actionText, sends } from "../rules.svelte";
-  import { describeRule, type RuleStep } from "../ai/rules";
+  import type { RuleStep } from "../ai/rules";
   import { searchReady } from "../ai/config.svelte";
   import { openSettings, toast, accountById, accountLabel } from "../state.svelte";
 
@@ -107,6 +107,7 @@
     steps = [];
     abort = new AbortController();
     try {
+      const { describeRule } = await import("../ai/rules");
       const rule = await describeRule(text, { signal: abort.signal, source: $state.snapshot(rulesUi.source), onStep: (s) => (steps = s) });
       describe = "";
       openRuleEditor(rule);

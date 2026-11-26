@@ -95,6 +95,15 @@ export type Detail = Summary & {
 
 export type SmartName = "flagged" | "unread";
 export type SmartCounts = { flagged: number; unread: number };
+export type BootstrapData = {
+  accounts: Account[];
+  folders: Folder[];
+  smartCounts: SmartCounts;
+  messages: Summary[];
+  outbox: OutboxItem[];
+  pendingAgentActions: number;
+  settings: Record<string, string>;
+};
 
 /** "outbox" is the app's own list of queued mail; it never goes to the backend as a view. */
 export type View =
@@ -301,6 +310,9 @@ export type MailEvent =
   | { kind: "agentSent"; outboxId: number; accountId: number; subject: string; to: string[] };
 
 export const api = {
+  bootstrap: (view: MailView, limit: number, settingKeys: string[]) =>
+    invoke<BootstrapData>("bootstrap", { view, limit, settingKeys }),
+  getSettings: (keys: string[]) => invoke<Record<string, string>>("get_settings", { keys }),
   accounts: () => invoke<Account[]>("accounts"),
   saveAccount: (account: Account, password: string | null) => invoke<Account>("save_account", { account, password }),
   deleteAccount: (id: number) => invoke<void>("delete_account", { id }),

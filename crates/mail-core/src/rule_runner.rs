@@ -260,7 +260,8 @@ impl Engine {
     /// Takes new Inbox mail off the queue as it arrives, runs the rules on it, then
     /// announces what's still in the Inbox and unread.
     pub(super) async fn rule_runner(self) {
-        let _ = self.db.prune_rule_seen(now() - SEEN_FOR);
+        let mut last_prune = now();
+        let _ = self.db.prune_rule_seen(last_prune - SEEN_FOR);
         loop {
             let batch = self.db.rule_queue(100).unwrap_or_else(|e| {
                 eprintln!("rules: {e:#}");
@@ -270,24 +271,41 @@ impl Engine {
                 self.rules_wake.notified().await;
                 continue;
             }
+            let t = now();
+            if t - last_prune >= 86_400 {
+                let _ = self.db.prune_rule_seen(t - SEEN_FOR);
+                last_prune = t;
+            }
             self.process_queue(batch).await;
         }
     }
 
     /// (message id, account id, queued at) rows from the queue.
-    /// Processes accounts concurrently so a slow body fetch on one account never stalls another.
+    /// Compiles active rules once per batch and processes accounts concurrently so a slow
+    /// body fetch on one account never stalls another.
     async fn process_queue(&self, batch: Vec<(i64, i64, i64)>) {
         let mine = self.my_addresses().unwrap_or_default();
+        // Load and compile enabled rules once for the entire batch instead of per message.
+        let compiled_rules: Vec<(Rule, Compiled)> = self
+            .db
+            .rules()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.enabled && !r.needs_approval && r.paused_reason.is_none())
+            .filter_map(|r| Compiled::new(&r, &mine).ok().map(|c| (r, c)))
+            .collect();
         let mut by_account: HashMap<i64, Vec<(i64, i64)>> = HashMap::new();
         for (id, account_id, queued_at) in batch {
             by_account.entry(account_id).or_default().push((id, queued_at));
         }
         let mine_ref = &mine;
+        let rules_ref = &compiled_rules;
         let futs = by_account.into_iter().map(|(account_id, items)| async move {
+            let ids: Vec<i64> = items.iter().map(|(id, _)| *id).collect();
+            let _ = self.db.unqueue_for_rules(&ids);
             let mut announce: Vec<Facts> = Vec::new();
             for (id, queued_at) in items {
                 let facts = self.db.rule_facts(id);
-                let _ = self.db.unqueue_for_rules(&[id]);
                 let f = match facts {
                     Ok(Some(f)) => f,
                     Ok(None) => continue,
@@ -296,7 +314,7 @@ impl Engine {
                         continue;
                     }
                 };
-                let applied = self.run_rules_on(&f, mine_ref).await.unwrap_or_else(|e| {
+                let applied = self.run_rules_on(&f, mine_ref, rules_ref).await.unwrap_or_else(|e| {
                     eprintln!("rules: {e:#}");
                     Applied::default()
                 });
@@ -319,24 +337,19 @@ impl Engine {
         futures::future::join_all(futs).await;
     }
 
-    async fn run_rules_on(&self, f: &Facts, mine: &[String]) -> Result<Applied> {
+    async fn run_rules_on(&self, f: &Facts, mine: &[String], rules: &[(Rule, Compiled)]) -> Result<Applied> {
         // A message that comes back to the Inbox gets a new UID; rules saw it already.
         if let Some(mid) = &f.message_id {
             if !self.db.mark_rule_seen(f.account_id, mid, now())? {
                 return Ok(Applied::default());
             }
         }
-        let rules: Vec<Rule> = self
-            .db
-            .rules()?
-            .into_iter()
-            .filter(|r| r.enabled && !r.needs_approval && r.paused_reason.is_none())
-            .filter(|r| r.account_id.is_none_or(|a| a == f.account_id))
-            .collect();
         let mut body: Option<String> = None;
         let mut matched = Vec::new();
-        for r in &rules {
-            let Ok(c) = Compiled::new(r, mine) else { continue };
+        for (r, c) in rules {
+            if !r.account_id.is_none_or(|a| a == f.account_id) {
+                continue;
+            }
             let mut v = c.check(f, body.as_deref());
             if v == Verdict::NeedBody && body.is_none() {
                 // Download it only now that a rule needs it. If that fails, it counts as empty.

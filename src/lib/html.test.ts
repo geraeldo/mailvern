@@ -29,6 +29,8 @@ describe("sanitize", () => {
     expect(sanitize(`<a href="  java\tscript:alert(1)">bad2</a>`)).toBe("<a>bad2</a>");
     expect(sanitize(`<img src="https://tracker.example/pixel.gif"><p>ok</p>`)).toBe("<p>ok</p>");
     expect(sanitize(`<img src="data:image/svg+xml;base64,PHN2Zz4="><p>ok</p>`)).toBe("<p>ok</p>");
+    expect(sanitize(`<img src="mailvern-cid://localhost/42/0" alt="inline">`)).toBe(`<img src="mailvern-cid://localhost/42/0" alt="inline">`);
+    expect(sanitize(`<img src="mailvern-cid://evil/42/0"><img src="mailvern-cid://localhost/0/0"><p>ok</p>`)).toBe("<p>ok</p>");
   });
 });
 
@@ -53,10 +55,10 @@ describe("frameDoc", () => {
     expect(doc).not.toContain("<base");
     expect(doc).not.toContain("<script");
     expect(doc).not.toContain("target=");
-    expect(doc).toContain("img-src data: cid:; style-src 'unsafe-inline'");
+    expect(doc).toContain("img-src data: cid: mailvern-cid:; style-src 'unsafe-inline'");
 
     const remoteDoc = frameDoc(`<img src="https://ok.test/a.png">`, true);
-    expect(remoteDoc).toContain("img-src data: cid: https: http:");
+    expect(remoteDoc).toContain("img-src data: cid: mailvern-cid: https: http:");
   });
 
   it("strips tracking pixels and known tracker domains when stripTrackers is enabled", () => {

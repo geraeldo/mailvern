@@ -8,7 +8,8 @@
     plain = false,
     stripTrackers = false,
     cacheKey,
-  }: { html: string; allowRemote: boolean; plain?: boolean; stripTrackers?: boolean; cacheKey?: number } = $props();
+    active = true,
+  }: { html: string; allowRemote: boolean; plain?: boolean; stripTrackers?: boolean; cacheKey?: number; active?: boolean } = $props();
   let frame: HTMLIFrameElement;
   let h = $state(untrack(() => getCachedFrameHeight(cacheKey) ?? 40));
   let ro: ResizeObserver | undefined;
@@ -44,14 +45,18 @@
 
   // Each new document (on opening a message, or after allowing images) is measured as soon as it is
   // parsed, so it never sits cut off while images load. The load event can't be relied on: it waits
-  // for every remote image, and one that stalls holds it forever. A timer, not requestAnimationFrame,
-  // so it still runs while the window is hidden.
+  // for every remote image, and one that stalls holds it forever. Skips polling while hidden in the
+  // keep-alive pool and backs off exponentially (10 -> 20 -> 40 -> 80ms) to avoid busy timers.
   $effect(() => {
     void doc;
+    if (!active) return;
     let timer = 0;
     let tries = 0;
     const tick = () => {
-      if (!track() && ++tries < 500) timer = window.setTimeout(tick, 10);
+      if (!track() && ++tries < 80) {
+        const delay = Math.min(80, 10 * (1 << Math.min(3, tries - 1)));
+        timer = window.setTimeout(tick, delay);
+      }
     };
     tick();
     return () => clearTimeout(timer);

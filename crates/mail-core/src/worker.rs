@@ -30,8 +30,9 @@ const PREFETCH_MAX_COUNT: usize = 15;
 const PREFETCH_MAX_BYTES: u32 = 4_000_000;
 /// Maximum size of any single email that will be predownloaded in the background (4 MiB).
 const PREFETCH_MAX_EMAIL_BYTES: u32 = 4 * 1024 * 1024;
-/// Maximum cached raw bodies per account before evicting oldest non-Inbox bodies.
-const MAX_BODY_CACHE_BYTES: i64 = 500 * 1024 * 1024;
+/// Maximum cached compressed raw bodies per account before evicting oldest non-Inbox bodies
+/// (~150 MiB compressed holds ~450–600 MiB of raw RFC 822 mail).
+const MAX_BODY_CACHE_BYTES: i64 = 150 * 1024 * 1024;
 /// Liveness check threshold before reusing an idle worker IMAP session.
 const STALE_SESSION_AFTER: Duration = Duration::from_secs(90);
 /// IDLE refresh interval (short enough to recover quickly after sleep/NAT drops).
@@ -419,9 +420,9 @@ impl Worker {
             .into_iter()
             .find(|(u, _)| *u == uid)
             .ok_or_else(|| anyhow!("Message no longer on server"))?;
-        let info = tokio::task::spawn_blocking({
-            let raw = raw.clone();
-            move || parse::body_info(&raw)
+        let (raw, info) = tokio::task::spawn_blocking(move || {
+            let info = parse::body_info(&raw);
+            (raw, info)
         })
         .await
         .map_err(|_| anyhow!("Parsing message failed"))?;
@@ -1116,11 +1117,14 @@ impl Worker {
             .into_iter()
             .map(|(id, _, _)| id)
             .collect();
-        let mut folders: Vec<(i64, String, Option<&'static str>, Option<FolderStatus>)> = Vec::with_capacity(remote.len());
-        for f in &remote {
-            let id = self.db.upsert_folder(self.account.id, &f.path, &f.name, f.role)?;
-            folders.push((id, f.path.clone(), f.role, f.status));
-        }
+        let batch_items: Vec<(&str, &str, Option<&str>)> =
+            remote.iter().map(|f| (f.path.as_str(), f.name.as_str(), f.role)).collect();
+        let ids = self.db.upsert_folders_batch(self.account.id, &batch_items)?;
+        let mut folders: Vec<(i64, String, Option<&'static str>, Option<FolderStatus>)> = remote
+            .iter()
+            .zip(ids)
+            .map(|(f, id)| (id, f.path.clone(), f.role, f.status))
+            .collect();
         let keep_ids: Vec<i64> = folders.iter().map(|f| f.0).collect();
         self.db.remove_folders_except(self.account.id, &keep_ids)?;
         let new_ids: HashSet<i64> = keep_ids.iter().copied().collect();
@@ -1162,9 +1166,10 @@ impl Worker {
         }
 
         // Pass 2: byte-budgeted body prefetching.
+        let mut stored_any = false;
         for (id, path, role) in &synced_folders {
             match self.prefetch(*id, path, *role, None).await {
-                Ok(()) => {}
+                Ok(n) => stored_any |= n > 0,
                 Err(e) if is_folder_refusal_err(&e) => {
                     eprintln!("prefetch {path} skipped: {e:#}");
                 }
@@ -1172,8 +1177,10 @@ impl Worker {
             }
         }
 
-        // Keep per-account raw body cache bounded on disk.
-        let _ = self.db.prune_old_bodies(self.account.id, MAX_BODY_CACHE_BYTES);
+        // Keep per-account compressed body cache bounded on disk and reclaim pages when needed.
+        if stored_any || force {
+            let _ = self.db.prune_old_bodies(self.account.id, MAX_BODY_CACHE_BYTES);
+        }
 
         if folder_errors > 0 && synced_folders.is_empty() {
             return Err(anyhow!("Couldn't sync any folders on the mail server"));
@@ -1433,7 +1440,7 @@ impl Worker {
         // Persist updated folder watermarks.
         let next_uidnext = mb.uid_next.unwrap_or_else(|| new_max_uid.saturating_add(1));
         let next_modseq = if mb.nomodseq { 0 } else { mb.highest_modseq.unwrap_or(prev_state.highest_modseq) };
-        let local_unseen = self.db.folders().ok().and_then(|fs| fs.into_iter().find(|f| f.id == folder_id).map(|f| f.unread)).unwrap_or(-1);
+        let local_unseen = self.db.folder_unread(folder_id).unwrap_or(-1);
         self.db.update_folder_sync_state(
             folder_id,
             &FolderSyncState {
@@ -1463,22 +1470,26 @@ impl Worker {
     /// Downloads recent bodies ahead of time so opening a message is instant.
     /// Deduplicates locally across folders/stashes first, packs chunks by byte budget,
     /// parses MIME off the async runtime, and commits each chunk in one transaction.
-    async fn prefetch(&mut self, folder_id: i64, path: &str, role: Option<&str>, limit_override: Option<usize>) -> Result<()> {
+    /// Coalesces UI change events so prefetching never floods the frontend every 15 messages.
+    async fn prefetch(&mut self, folder_id: i64, path: &str, role: Option<&str>, limit_override: Option<usize>) -> Result<usize> {
         let (default_limit, max_size) = prefetch_policy(role);
         let limit = limit_override.map(|l| l.min(default_limit)).unwrap_or(default_limit);
         if limit == 0 {
-            return Ok(());
+            return Ok(0);
         }
         // Hydrate any bodies already cached in another folder (Gmail labels) or in `moved_bodies`.
-        if self.db.copy_existing_bodies_for_folder(self.account.id, folder_id)? > 0 {
+        let mut total_stored = 0usize;
+        let hydrated = self.db.copy_existing_bodies_for_folder(self.account.id, folder_id)?;
+        if hydrated > 0 {
             self.changed(Some(folder_id));
         }
         let missing = self.db.missing_bodies_with_size(folder_id, limit, max_size)?;
         if missing.is_empty() {
-            return Ok(());
+            return Ok(total_stored);
         }
         let batches = pack_prefetch_batches(&missing, PREFETCH_MAX_COUNT, PREFETCH_MAX_BYTES);
-        for chunk in batches {
+        let mut pending_notify = false;
+        for (idx, chunk) in batches.into_iter().enumerate() {
             self.select(path).await?;
             let s = self.ensure().await?;
             let fetched = imap::fetch_bodies(s, &imap::uid_set(&chunk)).await?;
@@ -1495,24 +1506,37 @@ impl Worker {
                 })
                 .await
                 .map_err(|_| anyhow!("Parsing bodies failed"))?;
-                if self.db.store_bodies_batch(folder_id, &parsed)? > 0 {
-                    self.changed(Some(folder_id));
+                let stored = self.db.store_bodies_batch(folder_id, &parsed)?;
+                if stored > 0 {
+                    total_stored += stored;
+                    if idx == 0 {
+                        // Emit once after the newest visible chunk so top snippets appear right away.
+                        self.changed(Some(folder_id));
+                        pending_notify = false;
+                    } else {
+                        pending_notify = true;
+                    }
                 }
             }
             self.drain_urgent().await;
         }
-        Ok(())
+        if pending_notify {
+            self.changed(Some(folder_id));
+        }
+        Ok(total_stored)
     }
 }
 
 /// Per-folder background body prefetch policy: `(max_messages, max_email_bytes)`.
-/// Never predownloads Trash or Junk; caps every email at 4 MiB.
+/// Skips Trash, Junk, and Gmail's All Mail (which duplicates Inbox/Sent/Archive);
+/// caps custom folders lightly so large accounts stay fast and lean on disk.
 fn prefetch_policy(role: Option<&str>) -> (usize, u32) {
     match role {
-        Some("trash") | Some("junk") => (0, 0),
-        Some("inbox") => (500, PREFETCH_MAX_EMAIL_BYTES),
-        Some("sent") | Some("drafts") | Some("snoozed") | Some("archive") | Some("all") | None => (200, PREFETCH_MAX_EMAIL_BYTES),
-        _ => (100, PREFETCH_MAX_EMAIL_BYTES),
+        Some("trash") | Some("junk") | Some("all") => (0, 0),
+        Some("inbox") => (250, PREFETCH_MAX_EMAIL_BYTES),
+        Some("sent") | Some("drafts") | Some("snoozed") | Some("archive") => (80, PREFETCH_MAX_EMAIL_BYTES),
+        None => (25, PREFETCH_MAX_EMAIL_BYTES),
+        _ => (40, PREFETCH_MAX_EMAIL_BYTES),
     }
 }
 
@@ -1669,7 +1693,8 @@ mod tests {
     fn prefetch_policy_skips_trash_and_junk_and_caps_at_4mb() {
         assert_eq!(prefetch_policy(Some("trash")), (0, 0));
         assert_eq!(prefetch_policy(Some("junk")), (0, 0));
-        for role in [Some("inbox"), Some("sent"), Some("drafts"), Some("snoozed"), Some("archive"), Some("all"), None] {
+        assert_eq!(prefetch_policy(Some("all")), (0, 0));
+        for role in [Some("inbox"), Some("sent"), Some("drafts"), Some("snoozed"), Some("archive"), None] {
             let (limit, max_bytes) = prefetch_policy(role);
             assert!(limit > 0, "expected prefetch enabled for {role:?}");
             assert_eq!(max_bytes, 4 * 1024 * 1024);

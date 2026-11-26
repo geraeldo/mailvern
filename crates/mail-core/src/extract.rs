@@ -5,7 +5,11 @@ use crate::model::AttachmentContent;
 use crate::parse;
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+use std::time::Duration;
 
 /// Images larger than this are not sent to a model.
 const MAX_IMAGE: usize = 20 * 1024 * 1024;
@@ -13,6 +17,162 @@ const MAX_IMAGE: usize = 20 * 1024 * 1024;
 const MAX_ENTRY: u64 = 50 * 1024 * 1024;
 /// Total uncompressed bytes allowed across all entries of a ZIP-based document or spreadsheet.
 const MAX_ZIP_TOTAL: u64 = 50 * 1024 * 1024;
+/// Max attachment payload piped to the isolated extraction worker subprocess.
+const MAX_WORKER_INPUT: u64 = 32 * 1024 * 1024;
+/// Wall-clock timeout for a single PDF/Office extraction subprocess before killing it.
+const WORKER_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// When set (by the desktop app at startup), PDF and Office extractions run in a short-lived
+/// child process (`<exe> --extract-worker <kind>`) so panics/aborts, stack overflows, or huge
+/// parser heap spikes never crash or bloat the main app process.
+static WORKER_EXE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Enables subprocess isolation for PDF/Office extraction using `exe --extract-worker <kind>`.
+pub fn enable_subprocess_worker(exe: PathBuf) {
+    let _ = WORKER_EXE.set(exe);
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WorkerOutput {
+    ok: bool,
+    text: Option<String>,
+    parts: Option<usize>,
+    error: Option<String>,
+}
+
+fn extract_kind_direct(kind: &str, bytes: &[u8]) -> Result<(String, Option<usize>)> {
+    match kind {
+        "pdf" => {
+            let pages = pdf_pages(bytes)?;
+            let n = pages.len();
+            let text: String = pages
+                .iter()
+                .enumerate()
+                .map(|(i, p)| format!("--- Page {} ---\n{}\n", i + 1, tidy(p)))
+                .collect();
+            if pages.iter().all(|p| p.trim().is_empty()) {
+                return Err(anyhow!("This PDF has no text layer (it is probably a scan or images)."));
+            }
+            Ok((text, Some(n)))
+        }
+        "docx" => Ok((docx_text(bytes)?, None)),
+        "pptx" => {
+            let (text, n) = pptx_text(bytes)?;
+            Ok((text, Some(n)))
+        }
+        "spreadsheet" => {
+            let (text, n) = spreadsheet_text(bytes)?;
+            Ok((text, Some(n)))
+        }
+        other => Err(anyhow!("Unsupported extraction format: {other}")),
+    }
+}
+
+/// Executes one isolated extraction request over arbitrary `input`/`output` streams.
+pub fn run_worker_io(kind: &str, input: impl Read, mut output: impl Write) -> i32 {
+    let mut bytes = Vec::new();
+    let res = match input.take(MAX_WORKER_INPUT + 1).read_to_end(&mut bytes) {
+        Err(e) => Err(anyhow!("Couldn't read attachment input: {e}")),
+        Ok(_) if bytes.len() as u64 > MAX_WORKER_INPUT => {
+            Err(anyhow!("This file is too large to read safely (exceeds 32 MB)."))
+        }
+        Ok(_) => extract_kind_direct(kind, &bytes),
+    };
+    let payload = match res {
+        Ok((text, parts)) => WorkerOutput { ok: true, text: Some(text), parts, error: None },
+        Err(e) => WorkerOutput { ok: false, text: None, parts: None, error: Some(format!("{e:#}")) },
+    };
+    if serde_json::to_writer(&mut output, &payload).is_ok() && output.flush().is_ok() {
+        0
+    } else {
+        1
+    }
+}
+
+/// Entrypoint for `<app> --extract-worker <kind>`. Runs before GUI/Tokio init and exits immediately
+/// so all peak PDF/Office parser allocations return to the OS.
+pub fn run_worker_stdio() -> i32 {
+    let kind = std::env::args().nth(2).unwrap_or_default();
+    run_worker_io(&kind, std::io::stdin().lock(), std::io::stdout().lock())
+}
+
+fn friendly_crash_error(kind: &str) -> anyhow::Error {
+    match kind {
+        "pdf" => anyhow!("Couldn't read this PDF."),
+        "spreadsheet" => anyhow!("Couldn't read this spreadsheet."),
+        "docx" => anyhow!("Couldn't read this Word file."),
+        "pptx" => anyhow!("Couldn't read this PowerPoint file."),
+        _ => anyhow!("Couldn't read this file."),
+    }
+}
+
+fn run_in_subprocess(exe: &Path, kind: &str, bytes: &[u8]) -> Result<(String, Option<usize>)> {
+    if bytes.len() as u64 > MAX_WORKER_INPUT {
+        return Err(anyhow!("This file is too large to read safely (exceeds 32 MB)."));
+    }
+    let mut child = Command::new(exe)
+        .arg("--extract-worker")
+        .arg(kind)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| friendly_crash_error(kind))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let payload = bytes.to_vec();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&payload);
+        });
+    }
+
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(friendly_crash_error(kind));
+    };
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let cap = MAX_ZIP_TOTAL + 1024 * 1024;
+        let res = stdout.take(cap).read_to_end(&mut out).map(|_| out);
+        let _ = tx.send(res);
+    });
+
+    let raw_out = match rx.recv_timeout(WORKER_TIMEOUT) {
+        Ok(Ok(buf)) => buf,
+        Ok(Err(_)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(friendly_crash_error(kind));
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!("Timed out reading this attachment."));
+        }
+    };
+
+    let status = child.wait().map_err(|_| friendly_crash_error(kind))?;
+    if !status.success() {
+        return Err(friendly_crash_error(kind));
+    }
+    let parsed: WorkerOutput = serde_json::from_slice(&raw_out).map_err(|_| friendly_crash_error(kind))?;
+    if parsed.ok {
+        Ok((parsed.text.unwrap_or_default(), parsed.parts))
+    } else {
+        Err(anyhow!(parsed.error.unwrap_or_else(|| friendly_crash_error(kind).to_string())))
+    }
+}
+
+fn extract_isolated(kind: &str, bytes: &[u8]) -> Result<(String, Option<usize>)> {
+    if let Some(exe) = WORKER_EXE.get() {
+        run_in_subprocess(exe, kind, bytes)
+    } else {
+        extract_kind_direct(kind, bytes)
+    }
+}
 
 /// The content of attachment `index` of a raw message. Text comes back from `offset` (in
 /// characters), at most `max_chars` of it, so long documents can be read in parts.
@@ -42,22 +202,16 @@ pub fn attachment_content(raw: &[u8], index: usize, offset: usize, max_chars: us
     let extracted: Result<Option<(String, String, Option<usize>)>> = (|| {
         Ok(Some(match (mime.as_str(), ext.as_str()) {
             ("application/pdf", _) | (_, "pdf") => {
-                let pages = pdf_pages(&bytes)?;
-                let n = pages.len();
-                let text: String = pages
-                    .iter()
-                    .enumerate()
-                    .map(|(i, p)| format!("--- Page {} ---\n{}\n", i + 1, tidy(p)))
-                    .collect();
-                if pages.iter().all(|p| p.trim().is_empty()) {
-                    return Err(anyhow!("This PDF has no text layer (it is probably a scan or images)."));
-                }
-                ("pdf".into(), text, Some(n))
+                let (text, parts) = extract_isolated("pdf", &bytes)?;
+                ("pdf".into(), text, parts)
             }
-            (m, e) if e == "docx" || m.contains("wordprocessingml") => ("docx".into(), docx_text(&bytes)?, None),
+            (m, e) if e == "docx" || m.contains("wordprocessingml") => {
+                let (text, parts) = extract_isolated("docx", &bytes)?;
+                ("docx".into(), text, parts)
+            }
             (m, e) if e == "pptx" || m.contains("presentationml") => {
-                let (text, n) = pptx_text(&bytes)?;
-                ("pptx".into(), text, Some(n))
+                let (text, parts) = extract_isolated("pptx", &bytes)?;
+                ("pptx".into(), text, parts)
             }
             (m, e)
                 if matches!(e, "xlsx" | "xlsm" | "xlsb" | "xls" | "ods")
@@ -65,8 +219,8 @@ pub fn attachment_content(raw: &[u8], index: usize, offset: usize, max_chars: us
                     || m == "application/vnd.ms-excel"
                     || m == "application/vnd.oasis.opendocument.spreadsheet" =>
             {
-                let (text, n) = spreadsheet_text(&bytes)?;
-                ("spreadsheet".into(), text, Some(n))
+                let (text, parts) = extract_isolated("spreadsheet", &bytes)?;
+                ("spreadsheet".into(), text, parts)
             }
             ("message/rfc822", _) | (_, "eml") => ("email".into(), email_text(&bytes), None),
             (m, e) if m == "text/html" || matches!(e, "html" | "htm") => ("html".into(), html_text(&String::from_utf8_lossy(&bytes)), None),
@@ -128,12 +282,20 @@ pub(crate) fn tidy(s: &str) -> String {
 }
 
 fn pdf_pages(bytes: &[u8]) -> Result<Vec<String>> {
-    // The PDF parser can panic on unusual files; treat that like any other read failure.
-    let bytes = bytes.to_vec();
-    match std::panic::catch_unwind(move || pdf_extract::extract_text_from_mem_by_pages(&bytes)) {
-        Ok(Ok(pages)) => Ok(pages),
-        Ok(Err(e)) => Err(anyhow!("Couldn't read this PDF: {e}")),
-        Err(_) => Err(anyhow!("Couldn't read this PDF.")),
+    // In release builds (`panic = "abort"`), this runs inside the isolated `--extract-worker`
+    // subprocess. In unwind builds (tests / direct library callers), keep `catch_unwind` too.
+    #[cfg(panic = "unwind")]
+    {
+        let bytes = bytes.to_vec();
+        match std::panic::catch_unwind(move || pdf_extract::extract_text_from_mem_by_pages(&bytes)) {
+            Ok(Ok(pages)) => Ok(pages),
+            Ok(Err(e)) => Err(anyhow!("Couldn't read this PDF: {e}")),
+            Err(_) => Err(anyhow!("Couldn't read this PDF.")),
+        }
+    }
+    #[cfg(not(panic = "unwind"))]
+    {
+        pdf_extract::extract_text_from_mem_by_pages(bytes).map_err(|e| anyhow!("Couldn't read this PDF: {e}"))
     }
 }
 
@@ -276,11 +438,10 @@ fn pptx_text(bytes: &[u8]) -> Result<(String, usize)> {
 }
 
 fn spreadsheet_text(bytes: &[u8]) -> Result<(String, usize)> {
-    use calamine::{Data, Reader};
     check_zip_total(bytes)?;
-    let bytes = bytes.to_vec();
-    let parsed = std::panic::catch_unwind(move || -> Result<(String, usize)> {
-        let mut book = calamine::open_workbook_auto_from_rs(Cursor::new(bytes)).map_err(|e| anyhow!("Couldn't open this spreadsheet: {e}"))?;
+    let parse = |buf: Vec<u8>| -> Result<(String, usize)> {
+        use calamine::{Data, Reader};
+        let mut book = calamine::open_workbook_auto_from_rs(Cursor::new(buf)).map_err(|e| anyhow!("Couldn't open this spreadsheet: {e}"))?;
         let names = book.sheet_names();
         let mut out = String::new();
         for name in &names {
@@ -311,10 +472,18 @@ fn spreadsheet_text(bytes: &[u8]) -> Result<(String, usize)> {
             }
         }
         Ok((out, names.len()))
-    });
-    match parsed {
-        Ok(res) => res,
-        Err(_) => Err(anyhow!("Couldn't read this spreadsheet.")),
+    };
+    #[cfg(panic = "unwind")]
+    {
+        let owned = bytes.to_vec();
+        match std::panic::catch_unwind(move || parse(owned)) {
+            Ok(res) => res,
+            Err(_) => Err(anyhow!("Couldn't read this spreadsheet.")),
+        }
+    }
+    #[cfg(not(panic = "unwind"))]
+    {
+        parse(bytes.to_vec())
     }
 }
 
@@ -468,7 +637,6 @@ fn zip_listing(bytes: &[u8]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     fn zip_of(files: &[(&str, &str)]) -> Vec<u8> {
         let mut buf = Cursor::new(Vec::new());
@@ -530,5 +698,22 @@ mod tests {
         assert!(matches!(attachment_content(raw, 1, 0, 1000).unwrap(), AttachmentContent::Image { .. }));
         assert!(matches!(attachment_content(raw, 2, 0, 1000).unwrap(), AttachmentContent::Unsupported { .. }));
         assert!(attachment_content(raw, 3, 0, 1000).is_err());
+    }
+
+    #[test]
+    fn worker_io_round_trips_docx_and_reports_corrupt_pdf() {
+        let doc = r#"<w:document><w:body><w:p><w:r><w:t>Hello worker</w:t></w:r></w:p></w:body></w:document>"#;
+        let bytes = zip_of(&[("word/document.xml", doc)]);
+        let mut out = Vec::new();
+        assert_eq!(run_worker_io("docx", Cursor::new(&bytes), &mut out), 0);
+        let parsed: WorkerOutput = serde_json::from_slice(&out).unwrap();
+        assert!(parsed.ok);
+        assert_eq!(parsed.text.as_deref(), Some("Hello worker"));
+
+        let mut bad_out = Vec::new();
+        assert_eq!(run_worker_io("pdf", Cursor::new(b"not a pdf"), &mut bad_out), 0);
+        let bad: WorkerOutput = serde_json::from_slice(&bad_out).unwrap();
+        assert!(!bad.ok);
+        assert!(bad.error.as_deref().unwrap_or("").contains("PDF"));
     }
 }

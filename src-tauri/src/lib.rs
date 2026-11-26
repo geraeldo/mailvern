@@ -1,14 +1,14 @@
 use mail_core::model::{
-    Account, AttachmentContent, Folder, MailGroup, MailQuery, MessageDetail, MessageSummary, Outgoing, OutboxItem, Rule, RuleActivity,
-    RuleRun, RuleTest, SearchScope, SmartCounts, View,
+    Account, AttachmentContent, BootstrapData, Folder, MailGroup, MailQuery, MessageDetail, MessageSummary, Outgoing, OutboxItem, Rule,
+    RuleActivity, RuleRun, RuleTest, SearchScope, SmartCounts, View,
 };
 use mail_core::text::{quarantine_file, safe_filename};
 use mail_core::Engine;
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
-use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
 
 mod agents;
@@ -176,22 +176,41 @@ async fn attachment_content(engine: E<'_>, id: i64, index: usize, offset: Option
 
 /// The OpenRouter API key lives in the Keychain, like account passwords.
 const AI_KEY: &str = "openrouter-api-key";
+/// Non-secret flag in SQLite settings so startup avoids a Keychain IPC lookup.
+const AI_CONFIGURED: &str = "ai_configured";
 
 #[tauri::command(async)]
-fn ai_key() -> Option<String> {
-    mail_core::secrets::get(AI_KEY).ok().filter(|k| !k.is_empty())
+fn ai_key(engine: E) -> Option<String> {
+    let key = mail_core::secrets::get(AI_KEY).ok().filter(|k| !k.is_empty());
+    let _ = engine.set_setting(AI_CONFIGURED, if key.is_some() { "1" } else { "0" });
+    key
 }
 
 /// Stores the key, or removes it when `key` is empty.
 #[tauri::command(async)]
-fn set_ai_key(key: String) -> R<()> {
+fn set_ai_key(engine: E, key: String) -> R<()> {
     let key = key.trim();
     if key.is_empty() {
         mail_core::secrets::delete(AI_KEY);
+        let _ = engine.set_setting(AI_CONFIGURED, "0");
         Ok(())
     } else {
-        mail_core::secrets::set(AI_KEY, key).map_err(err)
+        mail_core::secrets::set(AI_KEY, key).map_err(err)?;
+        let _ = engine.set_setting(AI_CONFIGURED, "1");
+        Ok(())
     }
+}
+
+#[tauri::command(async)]
+fn bootstrap(engine: E, view: View, limit: i64, setting_keys: Vec<String>) -> R<BootstrapData> {
+    let keys: Vec<&str> = setting_keys.iter().map(String::as_str).filter(|k| !is_restricted_setting(k)).collect();
+    engine.bootstrap(&view, limit, &keys).map_err(err)
+}
+
+#[tauri::command(async)]
+fn get_settings(engine: E, keys: Vec<String>) -> R<HashMap<String, String>> {
+    let allowed: Vec<&str> = keys.iter().map(String::as_str).filter(|k| !is_restricted_setting(k)).collect();
+    engine.settings_many(&allowed).map_err(err)
 }
 
 #[tauri::command(async)]
@@ -217,30 +236,41 @@ async fn rsvp_invite(engine: E<'_>, id: i64, status: String) -> R<String> {
 #[tauri::command]
 async fn open_ics(app: tauri::AppHandle, engine: E<'_>, id: i64) -> R<()> {
     let (name, bytes) = engine.raw_ics(id).await.map_err(err)?;
-    let dir = std::env::temp_dir().join("Mailvern").join(format!("ics-{id}"));
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = write_unique_file(&dir, &safe_filename(&name), &bytes)?;
-    quarantine_file(&path);
+    let path = tokio::task::spawn_blocking(move || -> R<PathBuf> {
+        let dir = std::env::temp_dir().join("Mailvern").join(format!("ics-{id}"));
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = write_unique_file(&dir, &safe_filename(&name), &bytes)?;
+        quarantine_file(&path);
+        Ok(path)
+    })
+    .await
+    .map_err(|_| "Writing invite failed".to_string())??;
     app.opener().open_path(path.to_string_lossy(), None::<&str>).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn raw_source(engine: E<'_>, id: i64) -> R<String> {
     let (_, raw) = engine.raw_message(id).await.map_err(err)?;
-    Ok(String::from_utf8_lossy(&raw).into_owned())
+    tokio::task::spawn_blocking(move || String::from_utf8_lossy(&raw).into_owned())
+        .await
+        .map_err(|_| "Decoding message source failed".to_string())
 }
 
 #[tauri::command]
 async fn export_eml(app: tauri::AppHandle, engine: E<'_>, id: i64, dest: Option<String>) -> R<String> {
     let (name, raw) = engine.raw_message(id).await.map_err(err)?;
-    let path = if let Some(d) = dest.filter(|s| !s.trim().is_empty()) {
-        let p = PathBuf::from(d);
-        std::fs::write(&p, &raw).map_err(|e| e.to_string())?;
-        p
-    } else {
-        let dir = dirs::download_dir().ok_or("No Downloads folder")?;
-        write_unique_file(&dir, &safe_filename(&name), &raw)?
-    };
+    let path = tokio::task::spawn_blocking(move || -> R<PathBuf> {
+        if let Some(d) = dest.filter(|s| !s.trim().is_empty()) {
+            let p = PathBuf::from(d);
+            std::fs::write(&p, &raw).map_err(|e| e.to_string())?;
+            Ok(p)
+        } else {
+            let dir = dirs::download_dir().ok_or("No Downloads folder")?;
+            write_unique_file(&dir, &safe_filename(&name), &raw)
+        }
+    })
+    .await
+    .map_err(|_| "Exporting message failed".to_string())??;
     let _ = app.opener().reveal_item_in_dir(&path);
     Ok(path.to_string_lossy().into())
 }
@@ -472,14 +502,19 @@ fn is_dangerous_extension(name: &str) -> bool {
 #[tauri::command]
 async fn open_attachment(app: tauri::AppHandle, engine: E<'_>, id: i64, index: usize) -> R<()> {
     let (name, bytes) = engine.attachment(id, index).await.map_err(err)?;
-    let safe = safe_filename(&name);
-    if is_dangerous_extension(&safe) {
-        return Err(format!("“{safe}” can run code or scripts, so Mailvern won't open it directly. Save it to Downloads first if you trust the sender."));
-    }
-    let dir = std::env::temp_dir().join("Mailvern").join(format!("{id}-{index}"));
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = write_unique_file(&dir, &safe, &bytes)?;
-    quarantine_file(&path);
+    let path = tokio::task::spawn_blocking(move || -> R<PathBuf> {
+        let safe = safe_filename(&name);
+        if is_dangerous_extension(&safe) {
+            return Err(format!("“{safe}” can run code or scripts, so Mailvern won't open it directly. Save it to Downloads first if you trust the sender."));
+        }
+        let dir = std::env::temp_dir().join("Mailvern").join(format!("{id}-{index}"));
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = write_unique_file(&dir, &safe, &bytes)?;
+        quarantine_file(&path);
+        Ok(path)
+    })
+    .await
+    .map_err(|_| "Opening attachment failed".to_string())??;
     app.opener().open_path(path.to_string_lossy(), None::<&str>).map_err(|e| e.to_string())
 }
 
@@ -487,9 +522,14 @@ async fn open_attachment(app: tauri::AppHandle, engine: E<'_>, id: i64, index: u
 #[tauri::command]
 async fn save_attachment(app: tauri::AppHandle, engine: E<'_>, id: i64, index: usize) -> R<String> {
     let (name, bytes) = engine.attachment(id, index).await.map_err(err)?;
-    let dir = dirs::download_dir().ok_or("No Downloads folder")?;
-    let path = write_unique_file(&dir, &safe_filename(&name), &bytes)?;
-    quarantine_file(&path);
+    let path = tokio::task::spawn_blocking(move || -> R<PathBuf> {
+        let dir = dirs::download_dir().ok_or("No Downloads folder")?;
+        let path = write_unique_file(&dir, &safe_filename(&name), &bytes)?;
+        quarantine_file(&path);
+        Ok(path)
+    })
+    .await
+    .map_err(|_| "Saving attachment failed".to_string())??;
     let _ = app.opener().reveal_item_in_dir(&path);
     Ok(path.to_string_lossy().into())
 }
@@ -501,31 +541,42 @@ async fn save_all_attachments(app: tauri::AppHandle, engine: E<'_>, id: i64, des
     if files.is_empty() {
         return Ok(0);
     }
-    let dir = match dest_dir.filter(|s| !s.trim().is_empty()) {
-        Some(d) => PathBuf::from(d),
-        None => dirs::download_dir().ok_or("No Downloads folder")?,
-    };
-    let mut last_path = None;
-    for (name, bytes) in &files {
-        let path = write_unique_file(&dir, &safe_filename(name), bytes)?;
-        quarantine_file(&path);
-        last_path = Some(path);
-    }
+    let count = files.len();
+    let last_path = tokio::task::spawn_blocking(move || -> R<Option<PathBuf>> {
+        let dir = match dest_dir.filter(|s| !s.trim().is_empty()) {
+            Some(d) => PathBuf::from(d),
+            None => dirs::download_dir().ok_or("No Downloads folder")?,
+        };
+        let mut last = None;
+        for (name, bytes) in &files {
+            let path = write_unique_file(&dir, &safe_filename(name), bytes)?;
+            quarantine_file(&path);
+            last = Some(path);
+        }
+        Ok(last)
+    })
+    .await
+    .map_err(|_| "Saving attachments failed".to_string())??;
     if let Some(p) = last_path {
         let _ = app.opener().reveal_item_in_dir(&p);
     }
-    Ok(files.len())
+    Ok(count)
 }
 
 /// Previews an attachment with macOS Quick Look (`qlmanage -p`).
 #[tauri::command]
 async fn quicklook_attachment(engine: E<'_>, id: i64, index: usize) -> R<()> {
     let (name, bytes) = engine.attachment(id, index).await.map_err(err)?;
-    let safe = safe_filename(&name);
-    let dir = std::env::temp_dir().join("Mailvern").join(format!("ql-{id}-{index}"));
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = write_unique_file(&dir, &safe, &bytes)?;
-    quarantine_file(&path);
+    let path = tokio::task::spawn_blocking(move || -> R<PathBuf> {
+        let safe = safe_filename(&name);
+        let dir = std::env::temp_dir().join("Mailvern").join(format!("ql-{id}-{index}"));
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = write_unique_file(&dir, &safe, &bytes)?;
+        quarantine_file(&path);
+        Ok(path)
+    })
+    .await
+    .map_err(|_| "Preparing Quick Look failed".to_string())??;
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("/usr/bin/qlmanage")
@@ -548,36 +599,69 @@ async fn quicklook_attachment(engine: E<'_>, id: i64, index: usize) -> R<()> {
 #[tauri::command]
 async fn stage_attachment(engine: E<'_>, id: i64, index: usize) -> R<FileInfo> {
     let (name, bytes) = engine.attachment(id, index).await.map_err(err)?;
-    let safe = safe_filename(&name);
-    let dir = std::env::temp_dir().join("Mailvern").join(format!("drag-{id}-{index}"));
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let candidate = dir.join(&safe);
-    let path = if candidate.is_file() {
-        candidate
-    } else {
-        let p = write_unique_file(&dir, &safe, &bytes)?;
-        quarantine_file(&p);
-        p
-    };
-    Ok(FileInfo { path: path.to_string_lossy().into(), name: safe, size: bytes.len() as u64 })
+    tokio::task::spawn_blocking(move || -> R<FileInfo> {
+        let safe = safe_filename(&name);
+        let dir = std::env::temp_dir().join("Mailvern").join(format!("drag-{id}-{index}"));
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let candidate = dir.join(&safe);
+        let path = if candidate.is_file() {
+            candidate
+        } else {
+            let p = write_unique_file(&dir, &safe, &bytes)?;
+            quarantine_file(&p);
+            p
+        };
+        Ok(FileInfo { path: path.to_string_lossy().into(), name: safe, size: bytes.len() as u64 })
+    })
+    .await
+    .map_err(|_| "Staging attachment failed".to_string())?
 }
 
 /// Writes a message's raw RFC 822 source to a temp `.eml` file so it can be attached to a draft.
 #[tauri::command]
 async fn stage_eml(engine: E<'_>, id: i64) -> R<FileInfo> {
     let (name, raw) = engine.raw_message(id).await.map_err(err)?;
-    let safe = safe_filename(&name);
-    let dir = std::env::temp_dir().join("Mailvern").join(format!("eml-{id}"));
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = write_unique_file(&dir, &safe, &raw)?;
-    Ok(FileInfo { path: path.to_string_lossy().into(), name: safe, size: raw.len() as u64 })
+    tokio::task::spawn_blocking(move || -> R<FileInfo> {
+        let safe = safe_filename(&name);
+        let dir = std::env::temp_dir().join("Mailvern").join(format!("eml-{id}"));
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = write_unique_file(&dir, &safe, &raw)?;
+        Ok(FileInfo { path: path.to_string_lossy().into(), name: safe, size: raw.len() as u64 })
+    })
+    .await
+    .map_err(|_| "Staging message failed".to_string())?
 }
 
-/// Puts text on the clipboard. Done natively: the webview's clipboard refuses writes that
-/// don't come straight from a click, such as after loading bodies or from a native menu.
+/// Puts text on the clipboard natively without pulling in `tauri-plugin-clipboard-manager`
+/// (`arboard` + `image` + `moxcms`).
+#[cfg(target_os = "macos")]
 #[tauri::command]
-fn copy_text(app: tauri::AppHandle, text: String) -> R<()> {
-    app.clipboard().write_text(text).map_err(|e| e.to_string())
+fn copy_text(text: String) -> R<()> {
+    use objc2::msg_send;
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyClass, AnyObject, Bool};
+    use objc2_foundation::NSString;
+
+    unsafe {
+        let cls = AnyClass::get(c"NSPasteboard").ok_or("Clipboard unavailable")?;
+        let pb: Option<Retained<AnyObject>> = msg_send![cls, generalPasteboard];
+        let pb = pb.ok_or("Clipboard unavailable")?;
+        let _: isize = msg_send![&*pb, clearContents];
+        let ns_text = NSString::from_str(&text);
+        let ns_type = NSString::from_str("public.utf8-plain-text");
+        let ok: Bool = msg_send![&*pb, setString: &*ns_text, forType: &*ns_type];
+        if ok.as_bool() {
+            Ok(())
+        } else {
+            Err("Couldn't write to clipboard".into())
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+fn copy_text(_text: String) -> R<()> {
+    Err("Clipboard write not supported on this platform".into())
 }
 
 #[derive(serde::Serialize)]
@@ -606,15 +690,19 @@ fn file_info(paths: Vec<String>) -> Vec<FileInfo> {
 #[tauri::command]
 async fn attachment_files(engine: E<'_>, id: i64) -> R<Vec<FileInfo>> {
     let files = engine.all_attachments(id).await.map_err(err)?;
-    let dir = std::env::temp_dir().join("Mailvern").join(format!("fwd-{id}"));
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
-    for (name, bytes) in files {
-        let safe = safe_filename(&name);
-        let path = write_unique_file(&dir, &safe, &bytes)?;
-        out.push(FileInfo { path: path.to_string_lossy().into(), name: safe, size: bytes.len() as u64 });
-    }
-    Ok(out)
+    tokio::task::spawn_blocking(move || -> R<Vec<FileInfo>> {
+        let dir = std::env::temp_dir().join("Mailvern").join(format!("fwd-{id}"));
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for (name, bytes) in files {
+            let safe = safe_filename(&name);
+            let path = write_unique_file(&dir, &safe, &bytes)?;
+            out.push(FileInfo { path: path.to_string_lossy().into(), name: safe, size: bytes.len() as u64 });
+        }
+        Ok(out)
+    })
+    .await
+    .map_err(|_| "Preparing attachments failed".to_string())?
 }
 
 /// Reads an image file as a data: URL for inserting into the editor.
@@ -648,7 +736,7 @@ fn read_image(path: String) -> R<String> {
 
 #[derive(serde::Serialize)]
 struct SenderIcon {
-    /// A data: URL.
+    /// A `mailvern-icon://localhost/{domain}` URL served directly as binary bytes.
     url: String,
     /// A BIMI logo, made to fill the avatar. Otherwise a website icon.
     logo: bool,
@@ -657,11 +745,46 @@ struct SenderIcon {
 /// The sender's domain logo or website icon, None to show initials.
 #[tauri::command]
 async fn sender_icon(engine: E<'_>, email: String) -> R<Option<SenderIcon>> {
-    use base64::Engine as _;
+    let Some(domain) = mail_core::icons::icon_domain(&email) else {
+        return Ok(None);
+    };
     Ok(engine.sender_icon(&email).await.map_err(err)?.map(|i| SenderIcon {
-        url: format!("data:{};base64,{}", i.mime, base64::engine::general_purpose::STANDARD.encode(&i.data)),
+        url: format!("mailvern-icon://localhost/{domain}"),
         logo: i.logo,
     }))
+}
+
+fn parse_cid_uri(uri: &tauri::http::Uri) -> Option<(i64, usize)> {
+    if uri.host() != Some("localhost") {
+        return None;
+    }
+    let path = uri.path().strip_prefix('/')?;
+    let (msg, part) = path.split_once('/')?;
+    if part.contains('/') {
+        return None;
+    }
+    let msg_id = msg.parse::<i64>().ok()?;
+    let part_idx = part.parse::<usize>().ok()?;
+    (msg_id > 0).then_some((msg_id, part_idx))
+}
+
+fn parse_icon_uri_domain(uri: &tauri::http::Uri) -> Option<String> {
+    if uri.host() != Some("localhost") {
+        return None;
+    }
+    let seg = uri.path().strip_prefix('/')?;
+    if seg.is_empty() || seg.contains('/') {
+        return None;
+    }
+    mail_core::icons::icon_domain(&format!("a@{seg}"))
+}
+
+fn empty_response(status: tauri::http::StatusCode) -> tauri::http::Response<Vec<u8>> {
+    tauri::http::Response::builder()
+        .status(status)
+        .header(tauri::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .body(Vec::new())
+        .expect("static empty response")
 }
 
 #[tauri::command(async)]
@@ -757,11 +880,68 @@ fn cleanup_temp_dir() {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if let Ok(exe) = std::env::current_exe() {
+        mail_core::extract::enable_subprocess_worker(exe);
+    }
     tauri::Builder::default()
+        .register_asynchronous_uri_scheme_protocol("mailvern-cid", |ctx, request, responder| {
+            if request.method() != tauri::http::Method::GET {
+                responder.respond(empty_response(tauri::http::StatusCode::METHOD_NOT_ALLOWED));
+                return;
+            }
+            let Some((msg_id, part_idx)) = parse_cid_uri(request.uri()) else {
+                responder.respond(empty_response(tauri::http::StatusCode::BAD_REQUEST));
+                return;
+            };
+            let Some(engine) = ctx.app_handle().try_state::<Arc<Engine>>().map(|s| s.inner().clone()) else {
+                responder.respond(empty_response(tauri::http::StatusCode::SERVICE_UNAVAILABLE));
+                return;
+            };
+            tauri::async_runtime::spawn_blocking(move || {
+                let resp = match engine.cid_image(msg_id, part_idx) {
+                    Some((mime, bytes)) => tauri::http::Response::builder()
+                        .status(tauri::http::StatusCode::OK)
+                        .header(tauri::http::header::CONTENT_TYPE, mime)
+                        .header(tauri::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+                        .header(tauri::http::header::CACHE_CONTROL, "private, max-age=3600")
+                        .body(bytes)
+                        .unwrap_or_else(|_| empty_response(tauri::http::StatusCode::INTERNAL_SERVER_ERROR)),
+                    None => empty_response(tauri::http::StatusCode::NOT_FOUND),
+                };
+                responder.respond(resp);
+            });
+        })
+        .register_asynchronous_uri_scheme_protocol("mailvern-icon", |ctx, request, responder| {
+            if request.method() != tauri::http::Method::GET {
+                responder.respond(empty_response(tauri::http::StatusCode::METHOD_NOT_ALLOWED));
+                return;
+            }
+            let Some(domain) = parse_icon_uri_domain(request.uri()) else {
+                responder.respond(empty_response(tauri::http::StatusCode::BAD_REQUEST));
+                return;
+            };
+            let Some(engine) = ctx.app_handle().try_state::<Arc<Engine>>().map(|s| s.inner().clone()) else {
+                responder.respond(empty_response(tauri::http::StatusCode::SERVICE_UNAVAILABLE));
+                return;
+            };
+            tauri::async_runtime::spawn_blocking(move || {
+                let resp = match engine.cached_sender_icon(&domain) {
+                    Ok(Some(icon)) => tauri::http::Response::builder()
+                        .status(tauri::http::StatusCode::OK)
+                        .header(tauri::http::header::CONTENT_TYPE, icon.mime)
+                        .header(tauri::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+                        .header(tauri::http::header::CONTENT_SECURITY_POLICY, "default-src 'none'; sandbox")
+                        .header(tauri::http::header::CACHE_CONTROL, "private, max-age=86400")
+                        .body(icon.data)
+                        .unwrap_or_else(|_| empty_response(tauri::http::StatusCode::INTERNAL_SERVER_ERROR)),
+                    _ => empty_response(tauri::http::StatusCode::NOT_FOUND),
+                };
+                responder.respond(resp);
+            });
+        })
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(external_links())
         // Reopen the window at the size and place it had when the app quit.
         // Visibility is left out: quitting while the window is hidden must not reopen it hidden.
@@ -799,7 +979,8 @@ pub fn run() {
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                let _ = tokio::task::spawn_blocking(cleanup_temp_dir).await;
+                // Clean stale temp files concurrently so startup never waits on disk traversal.
+                tokio::task::spawn_blocking(cleanup_temp_dir);
                 if let Err(e) = engine.start() {
                     eprintln!("start failed: {e:#}");
                 }
@@ -822,6 +1003,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            bootstrap,
+            get_settings,
             accounts,
             save_account,
             delete_account,
@@ -918,6 +1101,14 @@ pub fn run() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
                     api.prevent_close();
+                    // Notify the frontend so it can drop hidden keep-alive iframes while hidden,
+                    // and prune stale temp files in the background during long sessions.
+                    let _ = window.emit("window-hidden", ());
+                    let engine = window.state::<Arc<Engine>>().inner().clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        cleanup_temp_dir();
+                        engine.maintenance();
+                    });
                     // On macOS hide the app rather than the window: ⌘Tab only activates
                     // an app, it doesn't send Reopen, so a hidden window would stay gone.
                     // A hidden app comes back on ⌘Tab and Dock clicks alike.
@@ -931,6 +1122,11 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Mailvern")
         .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                if let Some(engine) = app.try_state::<Arc<Engine>>() {
+                    engine.maintenance();
+                }
+            }
             #[cfg(target_os = "macos")]
             match event {
                 // Clicking the Dock icon brings the hidden window back.
@@ -985,5 +1181,28 @@ mod tests {
         for required in ["'self'", "about:", "https:", "http:", "mailto:"] {
             assert!(tokens.contains(&required), "frame-src must include {required}, got: {frame_src}");
         }
+        let img_src = csp
+            .split(';')
+            .map(str::trim)
+            .find(|d| d.starts_with("img-src "))
+            .expect("CSP must define img-src");
+        let img_tokens: Vec<&str> = img_src.split_whitespace().collect();
+        for required in ["mailvern-cid:", "mailvern-icon:"] {
+            assert!(img_tokens.contains(&required), "img-src must include {required}, got: {img_src}");
+        }
+    }
+
+    #[test]
+    fn custom_uri_scheme_parsers_reject_invalid_inputs() {
+        assert_eq!(parse_cid_uri(&"mailvern-cid://localhost/42/3".parse().unwrap()), Some((42, 3)));
+        assert_eq!(parse_cid_uri(&"mailvern-cid://evil/42/3".parse().unwrap()), None);
+        assert_eq!(parse_cid_uri(&"mailvern-cid://localhost/0/3".parse().unwrap()), None);
+        assert_eq!(parse_cid_uri(&"mailvern-cid://localhost/42/3/extra".parse().unwrap()), None);
+        assert_eq!(parse_cid_uri(&"mailvern-cid://localhost/../3".parse().unwrap()), None);
+
+        assert_eq!(parse_icon_uri_domain(&"mailvern-icon://localhost/stripe.com".parse().unwrap()).as_deref(), Some("stripe.com"));
+        assert_eq!(parse_icon_uri_domain(&"mailvern-icon://evil/stripe.com".parse().unwrap()), None);
+        assert_eq!(parse_icon_uri_domain(&"mailvern-icon://localhost/gmail.com".parse().unwrap()), None);
+        assert_eq!(parse_icon_uri_domain(&"mailvern-icon://localhost/stripe.com/extra".parse().unwrap()), None);
     }
 }

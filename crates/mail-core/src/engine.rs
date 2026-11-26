@@ -55,6 +55,52 @@ mod agent_actions;
 
 pub use agent_actions::AGENT_MODE_KEY;
 
+/// Bounded byte-capped LRU cache for inline `cid:` image parts served over `mailvern-cid://`.
+const CID_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const CID_CACHE_MAX_ENTRIES: usize = 256;
+
+#[derive(Default)]
+struct CidCache {
+    map: HashMap<(i64, usize), (String, Vec<u8>, u64)>,
+    bytes: usize,
+    tick: u64,
+}
+
+impl CidCache {
+    fn get(&mut self, msg_id: i64, part_idx: usize) -> Option<(String, Vec<u8>)> {
+        let entry = self.map.get_mut(&(msg_id, part_idx))?;
+        self.tick += 1;
+        entry.2 = self.tick;
+        Some((entry.0.clone(), entry.1.clone()))
+    }
+
+    fn insert(&mut self, msg_id: i64, part_idx: usize, mime: String, data: Vec<u8>) {
+        if data.len() > CID_CACHE_MAX_BYTES {
+            return;
+        }
+        if let Some(prev) = self.map.remove(&(msg_id, part_idx)) {
+            self.bytes = self.bytes.saturating_sub(prev.1.len());
+        }
+        self.tick += 1;
+        let len = data.len();
+        self.map.insert((msg_id, part_idx), (mime, data, self.tick));
+        self.bytes += len;
+        while self.bytes > CID_CACHE_MAX_BYTES || self.map.len() > CID_CACHE_MAX_ENTRIES {
+            let Some(oldest) = self.map.iter().min_by_key(|(_, v)| v.2).map(|(k, _)| *k) else {
+                break;
+            };
+            if let Some(removed) = self.map.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(removed.1.len());
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.bytes = 0;
+    }
+}
+
 /// The public API the UI talks to. Every read is served from the local database.
 /// Cloning is cheap: clones share everything.
 #[derive(Clone)]
@@ -69,6 +115,8 @@ pub struct Engine {
     icons: Arc<std::sync::OnceLock<Option<Arc<icons::Fetcher>>>>,
     /// Wakes the rule runner when new Inbox mail is queued for it.
     rules_wake: Arc<Notify>,
+    /// Short-lived RAM cache of inline `cid:` raster images for instant `mailvern-cid://` loads.
+    cid_cache: Arc<Mutex<CidCache>>,
 }
 
 impl Engine {
@@ -81,6 +129,7 @@ impl Engine {
             wake: Arc::new(Notify::new()),
             icons: Arc::new(std::sync::OnceLock::new()),
             rules_wake: Arc::new(Notify::new()),
+            cid_cache: Arc::new(Mutex::new(CidCache::default())),
         })
     }
 
@@ -322,6 +371,7 @@ impl Engine {
     pub fn delete_account(&self, id: i64) -> Result<()> {
         let acc = self.db.account(id)?;
         self.workers.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+        self.cid_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.db.delete_account(id)?;
         secrets::delete(&acc.email);
         Ok(())
@@ -605,9 +655,8 @@ impl Engine {
         self.db.body(id)?.ok_or_else(|| anyhow!("Message unavailable"))
     }
 
-    fn build_detail(&self, id: i64, raw: &[u8]) -> Result<MessageDetail> {
-        let (summary, to, cc, reply_to, message_id, references, in_reply_to) = self.db.summary(id)?;
-        let mut p = parse::display(raw);
+    fn build_detail_from_parsed(&self, id: i64, mut p: parse::ParsedBody) -> Result<MessageDetail> {
+        let (summary, to, cc, reply_to, message_id, references, in_reply_to, list_id) = self.db.summary(id)?;
         if let Some(inv) = p.calendar_invite.as_mut() {
             if let Ok(Some(saved)) = self.db.ics_rsvp(summary.account_id, &inv.uid) {
                 inv.my_status = Some(saved);
@@ -631,10 +680,38 @@ impl Engine {
             html: p.html,
             text: p.text,
             attachments: p.attachments,
-            list_id: self.db.list_id(id)?,
+            list_id,
             warnings: p.warnings,
             calendar_invite: p.calendar_invite,
         })
+    }
+
+    fn cache_inline_parts(&self, msg_id: i64, parts: Vec<parse::InlineCidPart>) {
+        if parts.is_empty() {
+            return;
+        }
+        let mut cache = self.cid_cache.lock().unwrap_or_else(|e| e.into_inner());
+        for (part_idx, mime, bytes) in parts {
+            cache.insert(msg_id, part_idx, mime, bytes);
+        }
+    }
+
+    fn build_detail(&self, id: i64, raw: &[u8]) -> Result<MessageDetail> {
+        let (p, parts) = parse::display_for_message(id, raw);
+        self.cache_inline_parts(id, parts);
+        self.build_detail_from_parsed(id, p)
+    }
+
+    /// Returns `(mime, bytes)` for an inline raster image part served over `mailvern-cid://`.
+    /// Hits the bounded RAM cache populated by `message()` / `cached_message()`, falling back to SQLite.
+    pub fn cid_image(&self, message_id: i64, part_index: usize) -> Option<(String, Vec<u8>)> {
+        if let Some(hit) = self.cid_cache.lock().unwrap_or_else(|e| e.into_inner()).get(message_id, part_index) {
+            return Some(hit);
+        }
+        let raw = self.db.body(message_id).ok().flatten()?;
+        let (mime, bytes) = parse::inline_cid_image(&raw, part_index)?;
+        self.cid_cache.lock().unwrap_or_else(|e| e.into_inner()).insert(message_id, part_index, mime.clone(), bytes.clone());
+        Some((mime, bytes))
     }
 
     /// Sends an iMIP RSVP reply (`ACCEPTED`, `TENTATIVE`, or `DECLINED`) to the organizer of a calendar invite.
@@ -646,11 +723,15 @@ impl Engine {
             other => return Err(anyhow!("Invalid RSVP status: {other}")),
         };
         let raw = self.raw(id).await?;
-        let parsed_msg = mail_parser::MessageParser::default()
-            .parse(&raw)
-            .ok_or_else(|| anyhow!("Could not parse message"))?;
-        let invite = crate::ics::parse_from_message(&parsed_msg).ok_or_else(|| anyhow!("No calendar invite in this message"))?;
-        let (summary, _, _, reply_to, orig_mid, orig_refs, _) = self.db.summary(id)?;
+        let invite = tokio::task::spawn_blocking(move || {
+            let parsed_msg = mail_parser::MessageParser::default()
+                .parse(&raw)
+                .ok_or_else(|| anyhow!("Could not parse message"))?;
+            crate::ics::parse_from_message(&parsed_msg).ok_or_else(|| anyhow!("No calendar invite in this message"))
+        })
+        .await
+        .map_err(|_| anyhow!("Could not parse message"))??;
+        let (summary, _, _, reply_to, orig_mid, orig_refs, _, _) = self.db.summary(id)?;
         let acc = self.db.account(summary.account_id)?;
         let target = invite
             .organizer
@@ -706,15 +787,19 @@ impl Engine {
     /// Extracts raw `.ics` bytes for opening in macOS Calendar.
     pub async fn raw_ics(&self, id: i64) -> Result<(String, Vec<u8>)> {
         let raw = self.raw(id).await?;
-        let m = mail_parser::MessageParser::default()
-            .parse(&raw)
-            .ok_or_else(|| anyhow!("Could not parse message"))?;
-        let bytes = crate::ics::extract_raw_ics(&m).ok_or_else(|| anyhow!("No calendar invite in this message"))?;
-        let name = crate::ics::parse_ics(&bytes)
-            .map(|i| format!("{}.ics", i.summary.trim()))
-            .filter(|s| s.len() > 4)
-            .unwrap_or_else(|| format!("invite-{id}.ics"));
-        Ok((name, bytes))
+        tokio::task::spawn_blocking(move || {
+            let m = mail_parser::MessageParser::default()
+                .parse(&raw)
+                .ok_or_else(|| anyhow!("Could not parse message"))?;
+            let bytes = crate::ics::extract_raw_ics(&m).ok_or_else(|| anyhow!("No calendar invite in this message"))?;
+            let name = crate::ics::parse_ics(&bytes)
+                .map(|i| format!("{}.ics", i.summary.trim()))
+                .filter(|s| s.len() > 4)
+                .unwrap_or_else(|| format!("invite-{id}.ics"));
+            Ok((name, bytes))
+        })
+        .await
+        .map_err(|_| anyhow!("Could not parse calendar invite"))?
     }
 
     /// Returns a parsed message detail ONLY if its body is already downloaded locally.
@@ -728,7 +813,11 @@ impl Engine {
 
     pub async fn message(&self, id: i64) -> Result<MessageDetail> {
         let raw = self.raw(id).await?;
-        self.build_detail(id, &raw)
+        let (parsed, parts) = tokio::task::spawn_blocking(move || parse::display_for_message(id, &raw))
+            .await
+            .map_err(|_| anyhow!("Parsing message failed"))?;
+        self.cache_inline_parts(id, parts);
+        self.build_detail_from_parsed(id, parsed)
     }
 
     /// Returns `(suggested_filename, raw_rfc822_bytes)` for exporting `.eml` or viewing original source.
@@ -742,12 +831,17 @@ impl Engine {
 
     pub async fn attachment(&self, id: i64, index: usize) -> Result<(String, Vec<u8>)> {
         let raw = self.raw(id).await?;
-        parse::attachment(&raw, index).ok_or_else(|| anyhow!("Attachment not found"))
+        tokio::task::spawn_blocking(move || parse::attachment(&raw, index))
+            .await
+            .map_err(|_| anyhow!("Extracting attachment failed"))?
+            .ok_or_else(|| anyhow!("Attachment not found"))
     }
 
     pub async fn all_attachments(&self, id: i64) -> Result<Vec<(String, Vec<u8>)>> {
         let raw = self.raw(id).await?;
-        Ok(parse::all_attachments(&raw))
+        tokio::task::spawn_blocking(move || parse::all_attachments(&raw))
+            .await
+            .map_err(|_| anyhow!("Extracting attachments failed"))
     }
 
     pub fn contacts(&self, q: &str) -> Result<Vec<Addr>> {
@@ -764,12 +858,11 @@ impl Engine {
         Ok(self.group_ids(ids)?.into_iter().map(|(k, v)| (k, v.into_iter().map(|(_, uid)| uid).collect())).collect())
     }
 
-    /// Messages by (account, folder), as (id, uid).
+    /// Messages by (account, folder), as (id, uid), loaded in a single batched DB query.
     fn group_ids(&self, ids: &[i64]) -> Result<GroupedIds> {
         let mut g: HashMap<(i64, i64), Vec<(i64, u32)>> = HashMap::new();
-        for id in ids {
-            let (acc, folder, _, uid) = self.db.locate(*id)?;
-            g.entry((acc, folder)).or_default().push((*id, uid));
+        for (id, acc, folder, uid) in self.db.locate_many(ids)? {
+            g.entry((acc, folder)).or_default().push((id, uid));
         }
         Ok(g)
     }
@@ -1023,7 +1116,7 @@ impl Engine {
         let was_draft = existing_mid.is_some();
         let message_id = existing_mid.unwrap_or_else(|| smtp::new_message_id(&acc));
         out.message_id = Some(message_id.clone());
-        let built = smtp::build(&acc, &out, &message_id, false)?;
+        let built = smtp::build_with_resolver(&acc, &out, &message_id, false, |mid, pidx| self.cid_image(mid, pidx))?;
         let at = match send_at {
             Some(t) => t,
             None => now() + self.undo_seconds(),
@@ -1095,7 +1188,7 @@ impl Engine {
             .map(String::from)
             .unwrap_or_else(|| smtp::new_message_id(&acc));
         out.message_id = Some(message_id.clone());
-        let built = smtp::build(&acc, &out, &message_id, true)?;
+        let built = smtp::build_with_resolver(&acc, &out, &message_id, true, |mid, pidx| self.cid_image(mid, pidx))?;
         let (tx, rx) = oneshot::channel();
         self.send_cmd(acc.id, Cmd::SaveDraft { message_id: message_id.clone(), raw: built.raw, reply: tx })?;
         tokio::time::timeout(Duration::from_secs(60), rx)
@@ -1135,6 +1228,10 @@ impl Engine {
         self.db.setting(key)
     }
 
+    pub fn settings_many(&self, keys: &[&str]) -> Result<HashMap<String, String>> {
+        self.db.settings_many(keys)
+    }
+
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         self.db.set_setting(key, value)
     }
@@ -1143,7 +1240,46 @@ impl Engine {
         self.db.delete_setting(key)
     }
 
+    /// Runs lightweight SQLite space reclamation, planner optimization, WAL checkpoint,
+    /// and clears the transient inline CID image RAM cache.
+    pub fn maintenance(&self) {
+        self.cid_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.db.maintenance();
+    }
+
+    /// Returns all startup state in one call so the UI boots without an IPC waterfall.
+    pub fn bootstrap(&self, view: &View, limit: i64, setting_keys: &[&str]) -> Result<BootstrapData> {
+        let settings = self.db.settings_many(setting_keys)?;
+        let threaded = settings.get("threads").map(String::as_str) != Some("off");
+        let accounts = self.db.accounts()?;
+        let folders = self.db.folders()?;
+        let smart_counts = self.db.smart_counts().unwrap_or_default();
+        let messages = self.messages(view, None, 0, limit, threaded)?;
+        let outbox = self.outbox().unwrap_or_default();
+        let pending_agent_actions = self.db.pending_agent_actions_count().unwrap_or(0);
+        Ok(BootstrapData {
+            accounts,
+            folders,
+            smart_counts,
+            messages,
+            outbox,
+            pending_agent_actions,
+            settings,
+        })
+    }
+
     // ---------- sender pictures ----------
+
+    /// Reads an already-cached sender icon for `domain` directly from SQLite (for `mailvern-icon://`).
+    pub fn cached_sender_icon(&self, domain: &str) -> Result<Option<Icon>> {
+        let Some(clean) = icons::icon_domain(&format!("a@{domain}")) else {
+            return Ok(None);
+        };
+        if self.db.setting(SENDER_ICONS)?.as_deref() == Some("off") {
+            return Ok(None);
+        }
+        Ok(self.db.sender_icon(&clean)?.and_then(|(icon, _)| icon))
+    }
 
     /// The picture for a sender: their domain's BIMI logo or website icon. None for
     /// personal mail providers, domains without one, and when the setting is off.
@@ -1213,13 +1349,18 @@ async fn scheduler(db: Arc<Db>, events: broadcast::Sender<Event>, workers: Worke
             }
         }
         let next_ms = db.next_due().ok().flatten().map(|n| n.saturating_mul(1000));
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        // Keep a small floor so a past-due row that failed to claim can't spin the loop;
-        // explicit schedules / send_now wake immediately via `wake.notify_one()`.
-        let wait = next_ms.map(|n| n.saturating_sub(now_ms).clamp(250, 60_000)).unwrap_or(60_000);
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(wait as u64)) => {}
-            _ = wake.notified() => {}
+        match next_ms {
+            // When nothing is scheduled, sleep indefinitely until `wake.notify_one()` (0 idle wakeups).
+            None => wake.notified().await,
+            Some(target_ms) => {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                // Keep a small floor so a past-due row that failed to claim can't spin the loop.
+                let wait = target_ms.saturating_sub(now_ms).clamp(250, 3_600_000);
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(wait as u64)) => {}
+                    _ = wake.notified() => {}
+                }
+            }
         }
     }
 }

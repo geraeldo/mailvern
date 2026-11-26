@@ -4,6 +4,8 @@ import {
   cacheStats,
   cachedDetailsFor,
   cachedFrameDoc,
+  cachedPhishingWarnings,
+  cachedRemoteImageUrls,
   clearMailCache,
   evictMessages,
   getCachedDetail,
@@ -13,6 +15,7 @@ import {
   markCachedFolderRead,
   markShownImages,
   peekCachedDetail,
+  pruneBackgroundCaches,
   putDetail,
   putThread,
   readerPool,
@@ -87,7 +90,7 @@ describe("mail-cache", () => {
   });
 
   it("evicts the least-recently-used pane when exceeding the keep-alive pool cap", () => {
-    for (let i = 1; i <= 8; i++) {
+    for (let i = 1; i <= 4; i++) {
       const d = makeDetail(i);
       putDetail(d);
       upsertReaderPane(i, d, [d], [i]);
@@ -96,14 +99,14 @@ describe("mail-cache", () => {
     const d1 = getCachedDetail(1)!;
     upsertReaderPane(1, d1, [d1], [1]);
 
-    const d9 = makeDetail(9);
-    putDetail(d9);
-    upsertReaderPane(9, d9, [d9], [9]);
+    const d5 = makeDetail(5);
+    putDetail(d5);
+    upsertReaderPane(5, d5, [d5], [5]);
 
     const ids = readerPool.panes.map((p) => p.id);
-    expect(ids).toHaveLength(8);
+    expect(ids).toHaveLength(4);
     expect(ids).toContain(1);
-    expect(ids).toContain(9);
+    expect(ids).toContain(5);
     expect(ids).not.toContain(2);
   });
 
@@ -165,11 +168,45 @@ describe("mail-cache", () => {
     putDetail(d1);
     upsertReaderPane(1, d1, [d1], [1]);
 
-    // Insert 70 more messages (exceeding MAX_DETAILS = 60) without putting them in the pane pool.
-    for (let i = 2; i <= 75; i++) {
+    // Insert 50 more messages (exceeding MAX_DETAILS = 40) without putting them in the pane pool.
+    for (let i = 2; i <= 55; i++) {
       putDetail(makeDetail(i));
     }
     expect(getCachedDetail(1)).toBeDefined();
-    expect(cacheStats().details).toBeLessThanOrEqual(60);
+    expect(cacheStats().details).toBeLessThanOrEqual(40);
+  });
+
+  it("shares a single DOMParser analysis across frameDoc, phishing warnings, and remote images", () => {
+    const html = '<p>Hi <a href="https://evil.test/login">https://bank.example/login</a></p><img src="https://cdn.example/pic.png" width="200" height="100">';
+    const warnings = cachedPhishingWarnings(42, html, false);
+    expect(warnings.length).toBeGreaterThan(0);
+    expect(cacheStats().analyzed).toBe(1);
+
+    const urls = cachedRemoteImageUrls(42, html, false);
+    expect(urls).toEqual(["https://cdn.example/pic.png"]);
+    expect(cacheStats().analyzed).toBe(1);
+
+    const doc = cachedFrameDoc(42, html, true, false, false);
+    expect(doc).toContain("cdn.example/pic.png");
+    expect(cacheStats().analyzed).toBe(1);
+    expect(cacheStats().docBytes).toBe(doc.length);
+  });
+
+  it("prunes hidden panes and enforces doc byte budget", () => {
+    for (let i = 1; i <= 3; i++) {
+      const d = makeDetail(i);
+      putDetail(d);
+      upsertReaderPane(i, d, [d], [i]);
+    }
+    pruneBackgroundCaches(2);
+    expect(readerPool.panes.map((p) => p.id)).toEqual([2]);
+
+    // Large prepared docs exceeding MAX_DOC_BYTES (16 MB) evict older entries.
+    const big = `<p>${"a".repeat(6 * 1024 * 1024)}</p>`;
+    cachedFrameDoc(100, big, false, false);
+    cachedFrameDoc(101, big, false, false);
+    cachedFrameDoc(102, big, false, false);
+    expect(cacheStats().docBytes).toBeLessThanOrEqual(16 * 1024 * 1024);
+    expect(cacheStats().docs).toBeLessThan(3);
   });
 });

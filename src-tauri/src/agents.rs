@@ -81,7 +81,8 @@ impl Agents {
         }
         st.1 = None;
         let enabled = setting(engine, ENABLED).as_deref() == Some("on");
-        let token = load_token(engine);
+        // Only touch macOS Keychain when Agent Access is actually enabled.
+        let token = if enabled { load_token(engine) } else { None };
         if enabled {
             match &token {
                 Some(t) => match Server::start(engine.clone(), DEFAULT_PORT, t.clone()).await {
@@ -96,7 +97,7 @@ impl Agents {
             enabled,
             running: st.0.is_some(),
             url: mail_mcp::url(DEFAULT_PORT),
-            token: token.filter(|_| enabled),
+            token,
             error: st.1.clone(),
             mode: perms.default_mode,
             account_modes: perms.account_modes,
@@ -111,7 +112,7 @@ impl Agents {
             enabled,
             running: st.0.is_some(),
             url: mail_mcp::url(DEFAULT_PORT),
-            token: load_token(engine).filter(|_| enabled),
+            token: if enabled { load_token(engine) } else { None },
             error: st.1.clone(),
             mode: perms.default_mode,
             account_modes: perms.account_modes,

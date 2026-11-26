@@ -746,3 +746,16 @@ pub struct BatchOutcome {
     pub failed: usize,
     pub errors: Vec<String>,
 }
+
+/// Consolidated startup payload returned by `Engine::bootstrap` in a single IPC call.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BootstrapData {
+    pub accounts: Vec<Account>,
+    pub folders: Vec<Folder>,
+    pub smart_counts: SmartCounts,
+    pub messages: Vec<MessageSummary>,
+    pub outbox: Vec<OutboxItem>,
+    pub pending_agent_actions: usize,
+    pub settings: std::collections::HashMap<String, String>,
+}

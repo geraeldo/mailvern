@@ -16,10 +16,8 @@ function baseHost(host: string): string {
 const IP_HOST = /^(?:\d{1,3}\.){3}\d{1,3}$|^\[[0-9a-f:]+\]$/i;
 const VISIBLE_URL = /^(?:https?:\/\/|www\.)([^\s/]+)/i;
 
-/** Scans email HTML for high-signal deceptive links (mismatched URL text, `@` tricks, raw IPs, punycode). */
-export function scanHtmlPhishing(html: string | null | undefined): SecurityWarning[] {
-  if (!html) return [];
-  const doc = new DOMParser().parseFromString(html, "text/html");
+/** Scans an already-parsed HTML Document for high-signal deceptive links (zero extra DOMParser pass). */
+export function scanDocPhishing(doc: Document): SecurityWarning[] {
   let deceptiveHref: { shown: string; actual: string } | null = null;
   let credTrickHost: string | null = null;
   let ipLinkHost: string | null = null;
@@ -96,4 +94,11 @@ export function scanHtmlPhishing(html: string | null | undefined): SecurityWarni
     });
   }
   return out;
+}
+
+/** Scans email HTML for high-signal deceptive links (mismatched URL text, `@` tricks, raw IPs, punycode). */
+export function scanHtmlPhishing(html: string | null | undefined): SecurityWarning[] {
+  if (!html) return [];
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  return scanDocPhishing(doc);
 }

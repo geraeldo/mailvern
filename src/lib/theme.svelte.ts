@@ -22,6 +22,12 @@ async function apply(mode: ThemeMode) {
   } catch {}
 }
 
+export function hydrateTheme(settings: Record<string, string>) {
+  const v = settings["theme"];
+  theme.mode = v === "light" || v === "dark" ? v : "system";
+  if (theme.mode !== "system") apply(theme.mode);
+}
+
 export async function loadTheme() {
   const v = await api.getSetting("theme");
   theme.mode = v === "light" || v === "dark" ? v : "system";

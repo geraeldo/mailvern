@@ -3,15 +3,14 @@
   import Icon from "./Icon.svelte";
   import MailFrame from "./MailFrame.svelte";
   import CalendarCard from "./CalendarCard.svelte";
-  import { ui, compose, accountById, accountLabel, isSenderTrusted, shouldStripTrackers, trustSender, trustDomain, toast, roleOf, editDraft } from "../state.svelte";
+  import { ui, compose, accountById, accountLabel, isSenderTrusted, shouldStripTrackers, trustSender, trustDomain, toast, roleOf, editDraft, myEmails } from "../state.svelte";
   import { api, type Addr, type Summary } from "../api";
   import { longDate, shortDate, displayName, fileSize } from "../format";
   import Avatar from "./Avatar.svelte";
   import { addressMenu } from "../menus";
   import { hasRemoteContent, textToHtml } from "../html";
-  import { scanHtmlPhishing } from "../phishing";
   import { trustableDomain } from "../trust";
-  import { getCachedDetail, hasShownImages, markShownImages, putDetail } from "../mail-cache.svelte";
+  import { cachedPhishingWarnings, getCachedDetail, hasShownImages, markShownImages, putDetail } from "../mail-cache.svelte";
 
   let {
     m,
@@ -38,7 +37,7 @@
   const warnings = $derived.by(() => {
     if (!d || isSentOrDraft) return [];
     const header = d.warnings ?? [];
-    const links = scanHtmlPhishing(d.html);
+    const links = cachedPhishingWarnings(m.id, d.html, stripTrackers);
     return [...header, ...links];
   });
   const acc = $derived(accountById(m.accountId));
@@ -67,7 +66,7 @@
     if (focus) el?.scrollIntoView({ block: "start" });
   });
 
-  const me = $derived(new Set(ui.accounts.map((a) => a.email.toLowerCase())));
+  const me = $derived(myEmails());
   const sender = $derived<Addr>({ name: m.fromName, email: m.fromAddr });
 
   // Clicking non-text header areas folds the message back up; clicking selectable sender/recipient
@@ -211,7 +210,7 @@
             <div
               class="file"
               draggable="true"
-              onpointerenter={() => warmStage(a.index)}
+              onpointerdown={() => warmStage(a.index)}
               ondragstart={(e) => onDragAttachment(e, a.index, a.filename, a.mime)}>
               <button type="button" class="openf" onclick={() => openFile(a.index)} title={`Open ${a.filename}`}>
                 <span class="ficon"><Icon name="file" size={16} /></span>
@@ -247,7 +246,7 @@
       {/if}
 
       <div class="paper" class:plain={isPlain}>
-        <MailFrame html={body} {allowRemote} plain={isPlain} {stripTrackers} cacheKey={m.id} />
+        <MailFrame html={body} {allowRemote} plain={isPlain} {stripTrackers} cacheKey={m.id} {active} />
       </div>
     {:else if error}
       <div class="err">{error}</div>

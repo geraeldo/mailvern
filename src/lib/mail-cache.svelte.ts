@@ -1,23 +1,27 @@
 import { SvelteMap, SvelteSet } from "svelte/reactivity";
-import type { Detail, Summary } from "./api";
-import { frameDoc } from "./html";
+import type { Detail, SecurityWarning, Summary } from "./api";
+import { analyzeEmailHtml, frameDoc, wrapFrameDoc, type AnalyzedEmailHtml } from "./html";
 
 /** Max parsed message bodies kept in memory. */
-const MAX_DETAILS = 60;
-/** Soft byte budget for cached HTML/text bodies (40 MB). */
-const MAX_DETAIL_BYTES = 40 * 1024 * 1024;
+const MAX_DETAILS = 40;
+/** Soft byte budget for cached HTML/text bodies (20 MB). */
+const MAX_DETAIL_BYTES = 20 * 1024 * 1024;
 /** Max conversation thread lists kept in memory. */
 const MAX_THREADS = 80;
 /** Max rendered reader panes kept mounted (hidden) so switching back is instant. */
-const MAX_PANES = 8;
+const MAX_PANES = 4;
 /** Max prepared iframe srcdoc strings cached. */
-const MAX_DOCS = 40;
+const MAX_DOCS = 30;
+/** Soft byte budget for cached prepared srcdoc strings (16 MB). */
+const MAX_DOC_BYTES = 16 * 1024 * 1024;
+/** Max single-pass DOMParser analysis results kept in memory. */
+const MAX_ANALYZED = 40;
 /** Max remembered iframe heights. */
 const MAX_HEIGHTS = 120;
 /** Max remote image URLs tracked as preloaded (trusted senders only). */
 const MAX_PRELOADED_URLS = 400;
 /** Rolling buffer of preloaded Image elements to keep decoded bitmaps warm in WebKit MemoryCache. */
-const MAX_WARM_IMAGES = 60;
+const MAX_WARM_IMAGES = 20;
 
 export type ReaderPane = {
   id: number;
@@ -41,8 +45,13 @@ const threads = new Map<number, Summary[]>();
 /** Messages where the user clicked "Show once" for remote images. */
 const shownImages = new SvelteSet<number>();
 
-/** Prepared srcdoc strings, keyed by `${id}:${allowRemote ? 1 : 0}:${plain ? 1 : 0}`. */
+/** Prepared srcdoc strings, keyed by `${id}:${allowRemote ? 1 : 0}:${plain ? 1 : 0}:${stripTrackers ? 1 : 0}`. */
 const docs = new Map<string, string>();
+const docSizes = new Map<string, number>();
+let docBytes = 0;
+
+/** Single-pass DOMParser analysis cache, keyed by `${id}:${stripTrackers ? 1 : 0}:${plain ? 1 : 0}`. */
+const analyzed = new Map<string, AnalyzedEmailHtml>();
 
 /** Last measured iframe height per message id. */
 const heights = new Map<number, number>();
@@ -88,7 +97,14 @@ function evictDetails() {
 function evictDocsFor(id: number) {
   const prefix = `${id}:`;
   for (const k of docs.keys()) {
-    if (k.startsWith(prefix)) docs.delete(k);
+    if (k.startsWith(prefix)) {
+      docs.delete(k);
+      docBytes = Math.max(0, docBytes - (docSizes.get(k) ?? 0));
+      docSizes.delete(k);
+    }
+  }
+  for (const k of analyzed.keys()) {
+    if (k.startsWith(prefix)) analyzed.delete(k);
   }
 }
 
@@ -191,6 +207,45 @@ export function markShownImages(id: number) {
   shownImages.add(id);
 }
 
+function getAnalyzed(cacheKey: number, html: string, stripTrackers: boolean, plain: boolean): AnalyzedEmailHtml {
+  const key = `${cacheKey}:${stripTrackers ? 1 : 0}:${plain ? 1 : 0}`;
+  const hit = analyzed.get(key);
+  if (hit !== undefined) {
+    touchMap(analyzed, key, hit);
+    return hit;
+  }
+  const res = analyzeEmailHtml(html, stripTrackers, !plain);
+  touchMap(analyzed, key, res);
+  while (analyzed.size > MAX_ANALYZED) {
+    const oldest = analyzed.keys().next().value;
+    if (oldest === undefined) break;
+    analyzed.delete(oldest);
+  }
+  return res;
+}
+
+/** Single-pass cached phishing warnings (reuses the same DOMParser pass as `cachedFrameDoc`). */
+export function cachedPhishingWarnings(
+  cacheKey: number | undefined,
+  html: string | null | undefined,
+  stripTrackers = false,
+): SecurityWarning[] {
+  if (!html) return [];
+  if (cacheKey == null) return analyzeEmailHtml(html, stripTrackers, true).warnings;
+  return getAnalyzed(cacheKey, html, stripTrackers, false).warnings;
+}
+
+/** Single-pass cached remote image URLs (reuses the same DOMParser pass as `cachedFrameDoc`). */
+export function cachedRemoteImageUrls(
+  cacheKey: number | undefined,
+  html: string | null | undefined,
+  stripTrackers = false,
+): string[] {
+  if (!html) return [];
+  if (cacheKey == null) return analyzeEmailHtml(html, stripTrackers, false).remoteImageUrls;
+  return getAnalyzed(cacheKey, html, stripTrackers, false).remoteImageUrls;
+}
+
 /** Cached `frameDoc` builder to avoid repeated DOMParser passes on the same message. */
 export function cachedFrameDoc(
   cacheKey: number | undefined,
@@ -206,12 +261,18 @@ export function cachedFrameDoc(
     touchMap(docs, key, hit);
     return hit;
   }
-  const built = frameDoc(html, allowRemote, plain, stripTrackers);
+  const { preparedBody } = getAnalyzed(cacheKey, html, stripTrackers, plain);
+  const built = wrapFrameDoc(preparedBody, allowRemote, plain);
+  const prevSize = docSizes.get(key) ?? 0;
+  docBytes = Math.max(0, docBytes - prevSize) + built.length;
+  docSizes.set(key, built.length);
   touchMap(docs, key, built);
-  while (docs.size > MAX_DOCS) {
+  while (docs.size > MAX_DOCS || (docBytes > MAX_DOC_BYTES && docs.size > 1)) {
     const oldest = docs.keys().next().value;
     if (oldest === undefined) break;
     docs.delete(oldest);
+    docBytes = Math.max(0, docBytes - (docSizes.get(oldest) ?? 0));
+    docSizes.delete(oldest);
   }
   return built;
 }
@@ -341,6 +402,14 @@ export function evictMessages(ids: number[]) {
   readerPool.panes = readerPool.panes.filter((p) => !set.has(p.id) && !p.thread.some((m) => set.has(m.id)));
 }
 
+/** Drops hidden keep-alive reader panes and warm decoded images when the window is hidden. */
+export function pruneBackgroundCaches(activeId: number | null) {
+  readerPool.panes = activeId != null ? readerPool.panes.filter((p) => p.id === activeId) : [];
+  warmImages.length = 0;
+  preloadedUrls.clear();
+  evictDetails();
+}
+
 /** Clears every cache (e.g. when an account is removed or in tests). */
 export function clearMailCache() {
   details.clear();
@@ -349,6 +418,9 @@ export function clearMailCache() {
   threads.clear();
   shownImages.clear();
   docs.clear();
+  docSizes.clear();
+  docBytes = 0;
+  analyzed.clear();
   heights.clear();
   preloadedUrls.clear();
   warmImages.length = 0;
@@ -363,6 +435,8 @@ export function cacheStats() {
     threads: threads.size,
     panes: readerPool.panes.length,
     docs: docs.size,
+    docBytes,
+    analyzed: analyzed.size,
     heights: heights.size,
   };
 }

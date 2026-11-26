@@ -12,6 +12,11 @@ export const BADGE_MODES: { id: BadgeMode; label: string; detail: string }[] = [
 
 export const badge = $state({ mode: "new" as BadgeMode });
 
+export function hydrateBadgeMode(settings: Record<string, string>) {
+  const v = settings["badge_mode"];
+  if (v === "all" || v === "off" || v === "new") badge.mode = v;
+}
+
 export async function loadBadgeMode() {
   const v = await api.getSetting("badge_mode");
   if (v === "all" || v === "off" || v === "new") badge.mode = v;

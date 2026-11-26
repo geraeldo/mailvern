@@ -6,4 +6,5 @@ members = ["crates/mail-core", "crates/mail-mcp", "src-tauri"]
 lto = true
 codegen-units = 1
 opt-level = 3
+panic = "abort"
 strip = true

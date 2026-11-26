@@ -2,8 +2,6 @@
   import Icon from "./Icon.svelte";
   import MailFrame from "./MailFrame.svelte";
   import ThreadMessage from "./ThreadMessage.svelte";
-  import AiAnswer from "./AiAnswer.svelte";
-  import { exitAi } from "../ai/search.svelte";
   import {
     ui, compose, archiveSelected, trashSelected, toggleJunk, toggleSeen, toggleFlag, selectedRows, roleOf, clearSelection,
     snoozeSelected, unsnoozeSelected, moveSelected, accountById, editQueued, deleteQueued, sendQueuedNow, copyThread, openMessage,
@@ -12,6 +10,10 @@
   import { hint, keymap, display } from "../shortcuts.svelte";
   import { whenLabel } from "../when";
   import { readerPool, type ReaderPane } from "../mail-cache.svelte";
+
+  let aiAnswerPromise: Promise<typeof import("./AiAnswer.svelte").default> | null = null;
+  const loadAiAnswer = () => (aiAnswerPromise ??= import("./AiAnswer.svelte").then((m) => m.default));
+  const closeAi = () => import("../ai/search.svelte").then((m) => m.exitAi());
 
   const multi = $derived(ui.selectedIds.length > 1);
   const d = $derived(ui.detail);
@@ -67,7 +69,7 @@
       </button>
     {/if}
     {#if answer}
-      <button type="button" class="btn ghost sm" title="Close answer  Esc" onclick={exitAi}>
+      <button type="button" class="btn ghost sm" title="Close answer  Esc" onclick={closeAi}>
         <Icon name="x" size={14} /> Close answer
       </button>
     {:else if outboxItem}
@@ -145,7 +147,9 @@
       </article>
     </div>
   {:else if answer && ui.ai}
-    <AiAnswer s={ui.ai} />
+    {#await loadAiAnswer() then AiAnswerComp}
+      <AiAnswerComp s={ui.ai} />
+    {/await}
   {:else if multi}
     <div class="center bulk">
       <div class="big">{ui.selectedIds.length}</div>

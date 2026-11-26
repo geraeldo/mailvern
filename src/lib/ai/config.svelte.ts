@@ -26,7 +26,12 @@ const DEFAULTS: Record<ModelRole, string[]> = {
   write: ["anthropic/claude-sonnet-5.5", "anthropic/claude-opus-5.5", "google/gemini-4-carbon"],
 };
 
-const KEYS = { search: "ai_search_model", write: "ai_write_model", private: "ai_private" } as const;
+const KEYS = {
+  search: "ai_search_model",
+  write: "ai_write_model",
+  private: "ai_private",
+  configured: "ai_configured",
+} as const;
 
 export const ai = $state({
   loaded: false,
@@ -50,21 +55,34 @@ function parse(json: string | null): ModelInfo | null {
   }
 }
 
+export function hydrateAi(settings: Record<string, string>) {
+  ai.search = parse(settings[KEYS.search] ?? null);
+  ai.write = parse(settings[KEYS.write] ?? null);
+  ai.privateOnly = (settings[KEYS.private] ?? null) !== "0";
+  const configured = settings[KEYS.configured];
+  if (configured === "1") {
+    ai.hasKey = true;
+    ai.loaded = true;
+  } else if (configured === "0") {
+    ai.hasKey = false;
+    ai.loaded = true;
+  } else {
+    // One-time migration for upgrades where a key may already exist in Keychain before `ai_configured` was recorded.
+    ai.loaded = true;
+    api.aiKey().then((key) => {
+      cachedKey = key;
+      ai.hasKey = !!key;
+    }).catch(() => {});
+  }
+}
+
 export async function loadAi() {
   try {
-    const [key, search, write, priv] = await Promise.all([
-      api.aiKey(),
-      api.getSetting(KEYS.search),
-      api.getSetting(KEYS.write),
-      api.getSetting(KEYS.private),
-    ]);
-    ai.hasKey = !!key;
-    cachedKey = key;
-    ai.search = parse(search);
-    ai.write = parse(write);
-    ai.privateOnly = priv !== "0";
-  } catch {}
-  ai.loaded = true;
+    const settings = await api.getSettings([KEYS.search, KEYS.write, KEYS.private, KEYS.configured]);
+    hydrateAi(settings);
+  } catch {
+    ai.loaded = true;
+  }
 }
 
 let cachedKey: string | null = null;

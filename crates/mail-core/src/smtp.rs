@@ -43,11 +43,31 @@ pub struct InlineImage {
 
 /// Replaces `src="data:image/...;base64,..."` with `cid:` references so mail apps
 /// show the images inline. Returns the rewritten HTML and the extracted images.
+#[cfg(test)]
 pub fn extract_inline_images(html: &str, domain: &str) -> (String, Vec<InlineImage>) {
+    extract_inline_images_with_resolver(html, domain, |_, _| None)
+}
+
+/// Replaces both `data:image/...;base64,...` and local `mailvern-cid://localhost/{msg_id}/{part_idx}`
+/// references with outgoing MIME `cid:` parts.
+pub fn extract_inline_images_with_resolver<F>(html: &str, domain: &str, resolve_cid: F) -> (String, Vec<InlineImage>)
+where
+    F: Fn(i64, usize) -> Option<(String, Vec<u8>)>,
+{
+    let cid_prefix = crate::parse::CID_URI_PREFIX;
     let mut out = String::with_capacity(html.len());
     let mut images = Vec::new();
+    let mut resolved_cache: std::collections::HashMap<(i64, usize), String> = std::collections::HashMap::new();
     let mut rest = html;
-    while let Some(pos) = rest.find("data:image/") {
+    loop {
+        let next_data = rest.find("data:image/");
+        let next_cid = rest.find(cid_prefix);
+        let (pos, is_cid) = match (next_data, next_cid) {
+            (Some(a), Some(b)) => if a <= b { (a, false) } else { (b, true) },
+            (Some(a), None) => (a, false),
+            (None, Some(b)) => (b, true),
+            (None, None) => break,
+        };
         let (before, tail) = rest.split_at(pos);
         let quote = before.chars().last();
         let end = match quote {
@@ -55,27 +75,51 @@ pub fn extract_inline_images(html: &str, domain: &str) -> (String, Vec<InlineIma
             _ => tail.find(|c: char| c.is_whitespace() || c == '>' || c == ')'),
         };
         let Some(end) = end else {
-            let skip = "data:image/".len();
+            let skip = if is_cid { cid_prefix.len() } else { "data:image/".len() };
             out.push_str(before);
             out.push_str(&tail[..skip]);
             rest = &tail[skip..];
             continue;
         };
         let uri = &tail[..end];
-        let decoded = uri.split_once(";base64,").and_then(|(head, data)| {
-            let mime = head.trim_start_matches("data:").to_string();
-            let clean: String = data.chars().filter(|c| !c.is_whitespace()).collect();
-            base64::engine::general_purpose::STANDARD.decode(clean).ok().map(|b| (mime, b))
-        });
         out.push_str(before);
-        match decoded {
-            Some((mime, bytes)) => {
-                let cid = format!("{}@{}", uuid::Uuid::new_v4(), domain);
-                out.push_str("cid:");
-                out.push_str(&cid);
-                images.push(InlineImage { cid, mime, bytes });
+        if is_cid {
+            let parsed = uri.strip_prefix(cid_prefix).and_then(|s| {
+                let (m, p) = s.split_once('/')?;
+                Some((m.parse::<i64>().ok()?, p.parse::<usize>().ok()?))
+            });
+            match parsed {
+                Some(key) => {
+                    if let Some(existing) = resolved_cache.get(&key) {
+                        out.push_str("cid:");
+                        out.push_str(existing);
+                    } else if let Some((mime, bytes)) = resolve_cid(key.0, key.1) {
+                        let cid = format!("{}@{}", uuid::Uuid::new_v4(), domain);
+                        out.push_str("cid:");
+                        out.push_str(&cid);
+                        resolved_cache.insert(key, cid.clone());
+                        images.push(InlineImage { cid, mime, bytes });
+                    } else {
+                        out.push_str(uri);
+                    }
+                }
+                None => out.push_str(uri),
             }
-            None => out.push_str(uri),
+        } else {
+            let decoded = uri.split_once(";base64,").and_then(|(head, data)| {
+                let mime = head.trim_start_matches("data:").to_string();
+                let clean: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+                base64::engine::general_purpose::STANDARD.decode(clean).ok().map(|b| (mime, b))
+            });
+            match decoded {
+                Some((mime, bytes)) => {
+                    let cid = format!("{}@{}", uuid::Uuid::new_v4(), domain);
+                    out.push_str("cid:");
+                    out.push_str(&cid);
+                    images.push(InlineImage { cid, mime, bytes });
+                }
+                None => out.push_str(uri),
+            }
         }
         rest = &tail[end..];
     }
@@ -124,7 +168,17 @@ impl lettre::message::header::Header for AutoSubmitted {
 /// depend on files that may be gone by the time it is sent.
 ///
 /// A draft keeps its Bcc header (so reopening it shows Bcc) and may have no recipients yet.
+#[cfg(test)]
 pub fn build(acc: &Account, out: &Outgoing, message_id: &str, draft: bool) -> Result<Built> {
+    build_with_resolver(acc, out, message_id, draft, |_, _| None)
+}
+
+/// Like `build`, but also resolves local `mailvern-cid://localhost/{msg_id}/{part_idx}` inline
+/// images (e.g. from quoted replies, forwards, or reopened drafts) directly into MIME `cid:` parts.
+pub fn build_with_resolver<F>(acc: &Account, out: &Outgoing, message_id: &str, draft: bool, resolve_cid: F) -> Result<Built>
+where
+    F: Fn(i64, usize) -> Option<(String, Vec<u8>)>,
+{
     let sender_email = out
         .from_email
         .as_deref()
@@ -182,7 +236,7 @@ pub fn build(acc: &Account, out: &Outgoing, message_id: &str, draft: bool) -> Re
         b = b.header(AutoSubmitted(v.clone()));
     }
 
-    let (html, images) = extract_inline_images(&out.html, domain);
+    let (html, images) = extract_inline_images_with_resolver(&out.html, domain, resolve_cid);
     let body = if images.is_empty() {
         MultiPart::alternative_plain_html(out.text.clone(), html)
     } else {
@@ -413,5 +467,20 @@ mod tests {
         let (out, imgs) = extract_inline_images(&html, "example.com");
         assert_eq!(imgs.len(), 1);
         assert!(out.contains(&format!("src=\"cid:{}\"", imgs[0].cid)));
+    }
+
+    #[test]
+    fn mailvern_cid_urls_resolve_into_inline_mime_parts() {
+        let html = r#"<img src="mailvern-cid://localhost/42/1"><img src="mailvern-cid://localhost/42/1">"#;
+        let (out, imgs) = extract_inline_images_with_resolver(html, "example.com", |mid, pidx| {
+            assert_eq!((mid, pidx), (42, 1));
+            Some(("image/png".into(), vec![1, 2, 3, 4]))
+        });
+        // Repeated references to the same local inline image share one outgoing cid part.
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].mime, "image/png");
+        assert_eq!(imgs[0].bytes, vec![1, 2, 3, 4]);
+        let expected = format!("src=\"cid:{}\"", imgs[0].cid);
+        assert_eq!(out.matches(&expected).count(), 2);
     }
 }

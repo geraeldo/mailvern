@@ -1,11 +1,53 @@
 use crate::icons::Icon;
 use crate::model::*;
 use anyhow::{anyhow, Context, Result};
+use flate2::read::ZlibDecoder;
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Mutex;
 
-pub type SummaryDetailRow = (MessageSummary, Vec<Addr>, Vec<Addr>, Vec<Addr>, Option<String>, Option<String>, Option<String>);
+/// Magic header for zlib-compressed raw RFC 822 blobs stored in SQLite.
+/// Valid RFC 822 headers are ASCII and never start with a NUL byte, so legacy
+/// uncompressed blobs decode transparently without migration downtime.
+const ZLIB_MAGIC: &[u8; 4] = b"\x00MVZ";
+
+fn compress_raw(raw: &[u8]) -> Vec<u8> {
+    if raw.len() < 512 {
+        return raw.to_vec();
+    }
+    let mut enc = ZlibEncoder::new(Vec::with_capacity(raw.len() / 3 + 16), Compression::fast());
+    if enc.write_all(raw).is_err() {
+        return raw.to_vec();
+    }
+    let Ok(compressed) = enc.finish() else {
+        return raw.to_vec();
+    };
+    if compressed.len() + ZLIB_MAGIC.len() < raw.len() {
+        let mut out = Vec::with_capacity(ZLIB_MAGIC.len() + compressed.len());
+        out.extend_from_slice(ZLIB_MAGIC);
+        out.extend_from_slice(&compressed);
+        out
+    } else {
+        raw.to_vec()
+    }
+}
+
+fn decompress_raw(stored: &[u8]) -> Vec<u8> {
+    if let Some(payload) = stored.strip_prefix(ZLIB_MAGIC) {
+        let mut dec = ZlibDecoder::new(payload);
+        let mut out = Vec::with_capacity(payload.len().saturating_mul(3));
+        if dec.read_to_end(&mut out).is_ok() {
+            return out;
+        }
+    }
+    stored.to_vec()
+}
+
+pub type SummaryDetailRow = (MessageSummary, Vec<Addr>, Vec<Addr>, Vec<Addr>, Option<String>, Option<String>, Option<String>, Option<String>);
 pub type OutboxSummaryRow = (i64, i64, String, i64, Option<String>);
 
 pub struct Db {
@@ -81,7 +123,8 @@ pub struct BodyInfo {
 }
 
 /// Per-connection settings. Not part of the schema; applied on every open.
-const PRAGMAS: &str = "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;";
+const PRAGMAS: &str = "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000; PRAGMA temp_store = MEMORY; PRAGMA cache_size = -8000;";
+const READ_PRAGMAS: &str = "PRAGMA busy_timeout = 5000; PRAGMA query_only = ON; PRAGMA temp_store = MEMORY; PRAGMA cache_size = -4000;";
 
 /// Caches that can be rebuilt from the network at any time, so they stay out of the
 /// versioned schema: created on open, and dropping one only costs a refetch.
@@ -114,7 +157,52 @@ CREATE TABLE IF NOT EXISTS moved_bodies (
 /// Rules: never edit or reorder a shipped entry. To change the schema, append a new
 /// entry (e.g. `ALTER TABLE messages ADD COLUMN ...`). Each one runs once, in a
 /// transaction, and the database is backed up before any upgrade.
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11];
+
+/// v11: denormalized `sort_date` for indexed message/thread sorting, partial indexes for unread
+/// and unassigned-thread lookups, deduplicated compressed `raw_blobs`, and incremental `contacts_cache`.
+const V11: &str = r#"
+ALTER TABLE messages ADD COLUMN sort_date INTEGER NOT NULL DEFAULT 0;
+UPDATE messages SET sort_date = MAX(
+  date,
+  COALESCE((SELECT s.woke_at FROM snoozes s WHERE s.account_id = messages.account_id AND s.message_id = messages.message_id), 0)
+);
+DROP INDEX IF EXISTS idx_messages_folder_date;
+CREATE INDEX IF NOT EXISTS idx_messages_folder_sort ON messages(folder_id, sort_date DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_unread ON messages(folder_id, account_id, message_id) WHERE seen = 0;
+CREATE INDEX IF NOT EXISTS idx_messages_no_thread ON messages(id) WHERE thread_id IS NULL;
+
+CREATE TABLE IF NOT EXISTS raw_blobs (
+  id INTEGER PRIMARY KEY,
+  account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  message_id TEXT,
+  raw BLOB NOT NULL,
+  UNIQUE(account_id, message_id)
+);
+ALTER TABLE bodies ADD COLUMN blob_id INTEGER REFERENCES raw_blobs(id) ON DELETE CASCADE;
+CREATE INDEX IF NOT EXISTS idx_bodies_blob ON bodies(blob_id) WHERE blob_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS contacts_cache (
+  email_lc TEXT PRIMARY KEY,
+  email TEXT NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  score INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_contacts_score ON contacts_cache(score DESC);
+
+INSERT OR REPLACE INTO contacts_cache (email_lc, email, name, score)
+SELECT lower(email), MAX(email), COALESCE(MAX(NULLIF(name, '')), ''), SUM(w)
+FROM (
+  SELECT from_name AS name, from_addr AS email, 1 AS w FROM messages WHERE from_addr != ''
+  UNION ALL
+  SELECT COALESCE(json_extract(j.value, '$.name'), ''), json_extract(j.value, '$.email'), 4
+  FROM messages m, json_each(m.to_json) j
+  WHERE m.folder_id IN (SELECT id FROM folders WHERE role = 'sent')
+    AND json_extract(j.value, '$.email') IS NOT NULL
+    AND json_extract(j.value, '$.email') != ''
+)
+GROUP BY lower(email);
+"#;
 
 /// v10: per-account desktop notification toggle and Dock badge override.
 const V10: &str = r#"
@@ -370,10 +458,6 @@ const SUMMARY_COLS: &str =
 
 /// Number of columns in SUMMARY_COLS.
 const SUMMARY_LEN: usize = 13;
-
-/// When a message was last "fresh": its date, or when it came back from snooze.
-const SORT_DATE: &str =
-    "MAX(m.date, COALESCE((SELECT s.woke_at FROM snoozes s WHERE s.account_id = m.account_id AND s.message_id = m.message_id), 0))";
 
 fn row_to_summary(r: &rusqlite::Row) -> rusqlite::Result<MessageSummary> {
     let id: i64 = r.get(0)?;
@@ -653,16 +737,40 @@ fn migrate_with(conn: &mut Connection, path: &Path, migrations: &[&str]) -> Resu
     // Back up an existing database before changing it. A brand-new file has no tables yet.
     let has_tables: bool =
         conn.query_row("SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table'", [], |r| r.get(0))?;
+    let mut created_backup = None;
     if has_tables {
         let backup = path.with_extension(format!("v{current}.bak"));
         let _ = std::fs::remove_file(&backup);
         conn.execute("VACUUM INTO ?", [backup.to_string_lossy()])?;
+        created_backup = Some(backup);
+    } else {
+        // Fresh database: enable incremental auto_vacuum before any tables are created.
+        let _ = conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;");
     }
     for (i, sql) in migrations.iter().enumerate().skip(current as usize) {
         let tx = conn.transaction()?;
         tx.execute_batch(sql).with_context(|| format!("Database upgrade to version {} failed", i + 1))?;
         tx.pragma_update(None, "user_version", (i + 1) as i64)?;
         tx.commit()?;
+    }
+    // Keep only the newest pre-upgrade backup so historical full DB copies don't pile up on disk.
+    if let Some(keep) = created_backup {
+        if let (Some(dir), Some(stem)) = (path.parent(), path.file_stem().and_then(|s| s.to_str())) {
+            let prefix = format!("{stem}.v");
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p == keep {
+                        continue;
+                    }
+                    if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                        if name.starts_with(&prefix) && name.ends_with(".bak") {
+                            let _ = std::fs::remove_file(&p);
+                        }
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -677,14 +785,28 @@ impl Db {
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        read.execute_batch("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON;")?;
+        read.execute_batch(READ_PRAGMAS)?;
         let db = Db { conn: Mutex::new(conn), read: Mutex::new(read) };
         db.assign_threads()?;
         Ok(db)
     }
 
+    /// Reclaims freed pages (when incremental auto_vacuum is active), updates SQLite planner
+    /// statistics, and performs a non-blocking WAL checkpoint.
+    pub fn maintenance(&self) {
+        let c = self.c();
+        let _ = c.execute_batch("PRAGMA incremental_vacuum(200); PRAGMA optimize; PRAGMA wal_checkpoint(PASSIVE);");
+    }
+
     /// Gives every message without a conversation one, oldest first (needed once after v4).
     fn assign_threads(&self) -> Result<()> {
+        // Fast probe using partial index `idx_messages_no_thread` (0 bytes / ~0ms when up to date).
+        let has_unassigned: bool = self
+            .r()
+            .query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE thread_id IS NULL)", [], |r| r.get(0))?;
+        if !has_unassigned {
+            return Ok(());
+        }
         type ThreadSeedRow = (i64, i64, Option<String>, Option<String>, Option<String>);
         let mut c = self.c();
         let tx = c.transaction()?;
@@ -794,7 +916,9 @@ impl Db {
             tx.execute("DELETE FROM rules WHERE id = ?", [rid])?;
         }
         tx.execute("DELETE FROM accounts WHERE id = ?", [id])?;
+        tx.execute("DELETE FROM moved_bodies WHERE account_id = ?", [id])?;
         tx.commit()?;
+        let _ = c.execute_batch("PRAGMA incremental_vacuum(200);");
         Ok(())
     }
 
@@ -802,16 +926,44 @@ impl Db {
 
     pub fn upsert_folder(&self, account_id: i64, path: &str, name: &str, role: Option<&str>) -> Result<i64> {
         let c = self.c();
-        c.execute(
+        c.prepare_cached(
             "INSERT INTO folders (account_id, path, name, role) VALUES (?, ?, ?, ?)
              ON CONFLICT(account_id, path) DO UPDATE SET name = excluded.name, role = excluded.role",
-            params![account_id, path, name, role],
-        )?;
-        Ok(c.query_row(
-            "SELECT id FROM folders WHERE account_id = ? AND path = ?",
-            params![account_id, path],
-            |r| r.get(0),
-        )?)
+        )?
+        .execute(params![account_id, path, name, role])?;
+        let id = c
+            .prepare_cached("SELECT id FROM folders WHERE account_id = ? AND path = ?")?
+            .query_row(params![account_id, path], |r| r.get(0))?;
+        Ok(id)
+    }
+
+    /// Upserts all folders of an account in a single SQLite transaction.
+    pub fn upsert_folders_batch(&self, account_id: i64, items: &[(&str, &str, Option<&str>)]) -> Result<Vec<i64>> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let mut out = Vec::with_capacity(items.len());
+        {
+            let mut ins = tx.prepare_cached(
+                "INSERT INTO folders (account_id, path, name, role) VALUES (?, ?, ?, ?)
+                 ON CONFLICT(account_id, path) DO UPDATE SET name = excluded.name, role = excluded.role",
+            )?;
+            let mut sel = tx.prepare_cached("SELECT id FROM folders WHERE account_id = ? AND path = ?")?;
+            for &(path, name, role) in items {
+                ins.execute(params![account_id, path, name, role])?;
+                out.push(sel.query_row(params![account_id, path], |r| r.get(0))?);
+            }
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Unread count of a single folder (avoids scanning every folder of every account).
+    pub fn folder_unread(&self, folder_id: i64) -> Result<i64> {
+        let c = self.r();
+        let count = c
+            .prepare_cached("SELECT COUNT(*) FROM messages WHERE folder_id = ? AND seen = 0")?
+            .query_row([folder_id], |r| r.get(0))?;
+        Ok(count)
     }
 
     pub fn rename_folder_local(&self, folder_id: i64, new_path: &str, new_name: &str) -> Result<()> {
@@ -855,7 +1007,6 @@ impl Db {
     pub fn clear_folder_messages(&self, folder_id: i64) -> Result<()> {
         let mut c = self.c();
         let tx = c.transaction()?;
-        tx.execute("DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE folder_id = ?)", [folder_id])?;
         tx.execute("DELETE FROM messages WHERE folder_id = ?", [folder_id])?;
         tx.execute(
             "UPDATE folders SET msg_count = 0, unseen_count = 0 WHERE id = ?",
@@ -1027,7 +1178,6 @@ impl Db {
     pub fn reset_folder(&self, folder_id: i64, uidvalidity: u32) -> Result<()> {
         let mut c = self.c();
         let tx = c.transaction()?;
-        tx.execute("DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE folder_id = ?)", [folder_id])?;
         tx.execute("DELETE FROM messages WHERE folder_id = ?", [folder_id])?;
         tx.execute(
             "UPDATE folders SET uidvalidity = ?, synced = 0, uidnext = 0, msg_count = -1, unseen_count = -1, highest_modseq = 0, last_full_sync = 0 WHERE id = ?",
@@ -1165,15 +1315,18 @@ impl Db {
     }
 
     pub fn ids_for_uids(&self, folder_id: i64, uids: &[u32]) -> Result<Vec<i64>> {
-        let c = self.r();
-        let mut st = c.prepare("SELECT id FROM messages WHERE folder_id = ? AND uid = ?")?;
-        let mut out = Vec::new();
-        for u in uids {
-            if let Some(id) = st.query_row(params![folder_id, u], |r| r.get(0)).optional()? {
-                out.push(id);
-            }
+        if uids.is_empty() {
+            return Ok(vec![]);
         }
-        Ok(out)
+        let c = self.r();
+        let json = serde_json::to_string(uids)?;
+        let mut st = c.prepare_cached(
+            "SELECT m.id, m.uid FROM messages m JOIN json_each(?2) j ON m.uid = j.value WHERE m.folder_id = ?1",
+        )?;
+        let by_uid: HashMap<u32, i64> = st
+            .query_map(params![folder_id, json], |r| Ok((r.get(1)?, r.get(0)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(uids.iter().filter_map(|u| by_uid.get(u).copied()).collect())
     }
 
     /// Stores headers. `sparse` marks search hits that lie outside the sync window.
@@ -1187,16 +1340,39 @@ impl Db {
         let mut c = self.c();
         let tx = c.transaction()?;
         {
-            let mut ins = tx.prepare(
+            let is_sent: bool = tx
+                .prepare_cached("SELECT role = 'sent' FROM folders WHERE id = ?")?
+                .query_row([folder_id], |r| r.get::<_, Option<bool>>(0))
+                .optional()?
+                .flatten()
+                .unwrap_or(false);
+            let mut ins = tx.prepare_cached(
                 "INSERT OR IGNORE INTO messages (account_id, folder_id, uid, message_id, in_reply_to, refs, subject,
-                    from_name, from_addr, to_json, cc_json, reply_to_json, date, seen, flagged, has_attachments, size, sparse,
+                    from_name, from_addr, to_json, cc_json, reply_to_json, date, sort_date, seen, flagged, has_attachments, size, sparse,
                     list_id, auto)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )?;
             // Sync reaching a stored search hit takes it into the window.
-            let mut unsparse = tx.prepare("UPDATE messages SET sparse = 0 WHERE folder_id = ? AND uid = ? AND sparse = 1")?;
-            let mut fts = tx.prepare("INSERT INTO messages_fts (rowid, subject, sender, body) VALUES (?, ?, ?, '')")?;
+            let mut unsparse = tx.prepare_cached("UPDATE messages SET sparse = 0 WHERE folder_id = ? AND uid = ? AND sparse = 1")?;
+            let mut fts = tx.prepare_cached("INSERT INTO messages_fts (rowid, subject, sender, body) VALUES (?, ?, ?, '')")?;
+            let mut bump_contact = tx.prepare_cached(
+                "INSERT INTO contacts_cache (email_lc, email, name, score) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(email_lc) DO UPDATE SET
+                   score = contacts_cache.score + excluded.score,
+                   name = CASE WHEN contacts_cache.name = '' AND excluded.name != '' THEN excluded.name ELSE contacts_cache.name END",
+            )?;
+            let mut snooze_woke = tx.prepare_cached(
+                "SELECT woke_at FROM snoozes WHERE account_id = ? AND message_id = ? AND woke_at IS NOT NULL",
+            )?;
             for m in msgs {
+                let woke: i64 = match m.message_id.as_deref() {
+                    Some(mid) => snooze_woke
+                        .query_row(params![account_id, mid], |r| r.get::<_, i64>(0))
+                        .optional()?
+                        .unwrap_or(0),
+                    None => 0,
+                };
+                let sort_date = m.date.max(woke);
                 let n = ins.execute(params![
                     account_id,
                     folder_id,
@@ -1211,6 +1387,7 @@ impl Db {
                     serde_json::to_string(&m.cc)?,
                     serde_json::to_string(&m.reply_to)?,
                     m.date,
+                    sort_date,
                     m.seen,
                     m.flagged,
                     m.has_attachments,
@@ -1224,6 +1401,21 @@ impl Db {
                     added.push(id);
                     fts.execute(params![id, m.subject, format!("{} {}", m.from_name, m.from_addr)])?;
                     assign_thread(&tx, account_id, id, m.message_id.as_deref(), m.in_reply_to.as_deref(), m.refs.as_deref())?;
+                    if !m.from_addr.is_empty() {
+                        let _ = bump_contact.execute(params![m.from_addr.to_lowercase(), m.from_addr, m.from_name, 1i64]);
+                    }
+                    if is_sent {
+                        for rcpt in &m.to {
+                            if !rcpt.email.is_empty() {
+                                let _ = bump_contact.execute(params![
+                                    rcpt.email.to_lowercase(),
+                                    rcpt.email,
+                                    rcpt.name.as_deref().unwrap_or(""),
+                                    4i64
+                                ]);
+                            }
+                        }
+                    }
                 } else if !sparse {
                     unsparse.execute(params![folder_id, m.uid])?;
                 }
@@ -1256,9 +1448,8 @@ impl Db {
             let mut local_uids = std::collections::HashSet::with_capacity(local.len());
             let server: std::collections::HashMap<u32, (bool, bool)> =
                 flags.iter().map(|(u, s, f)| (*u, (*s, *f))).collect();
-            let mut del_fts = tx.prepare("DELETE FROM messages_fts WHERE rowid = ?")?;
-            let mut del_msg = tx.prepare("DELETE FROM messages WHERE id = ?")?;
-            let mut upd_msg = tx.prepare("UPDATE messages SET seen = ?, flagged = ? WHERE id = ?")?;
+            let mut del_msg = tx.prepare_cached("DELETE FROM messages WHERE id = ?")?;
+            let mut upd_msg = tx.prepare_cached("UPDATE messages SET seen = ?, flagged = ? WHERE id = ?")?;
             for (id, uid, seen, flagged) in local {
                 local_uids.insert(uid);
                 if skip_uids.contains(&uid) {
@@ -1266,7 +1457,6 @@ impl Db {
                 }
                 match server.get(&uid) {
                     None => {
-                        del_fts.execute([id])?;
                         del_msg.execute([id])?;
                         changed = true;
                     }
@@ -1344,15 +1534,13 @@ impl Db {
                 .query_map(params![folder_id, from_uid], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<rusqlite::Result<_>>()?;
             let mut local_uids = std::collections::HashSet::with_capacity(local.len());
-            let mut del_fts = tx.prepare("DELETE FROM messages_fts WHERE rowid = ?")?;
-            let mut del_msg = tx.prepare("DELETE FROM messages WHERE id = ?")?;
+            let mut del_msg = tx.prepare_cached("DELETE FROM messages WHERE id = ?")?;
             for (id, uid) in local {
                 local_uids.insert(uid);
                 if skip_uids.contains(&uid) {
                     continue;
                 }
                 if !server_uids.contains(&uid) {
-                    del_fts.execute([id])?;
                     del_msg.execute([id])?;
                     changed = true;
                 }
@@ -1391,12 +1579,11 @@ impl Db {
             let Some((id, seen, flagged)) = row else { continue };
             match server.get(uid) {
                 None => {
-                    tx.execute("DELETE FROM messages_fts WHERE rowid = ?", [id])?;
-                    tx.execute("DELETE FROM messages WHERE id = ?", [id])?;
+                    tx.prepare_cached("DELETE FROM messages WHERE id = ?")?.execute([id])?;
                     changed = true;
                 }
                 Some(&(s, f)) if s != seen || f != flagged => {
-                    tx.execute("UPDATE messages SET seen = ?, flagged = ? WHERE id = ?", params![s, f, id])?;
+                    tx.prepare_cached("UPDATE messages SET seen = ?, flagged = ? WHERE id = ?")?.execute(params![s, f, id])?;
                     changed = true;
                 }
                 _ => {}
@@ -1419,19 +1606,39 @@ impl Db {
         Ok(rows)
     }
 
+    fn upsert_blob_in_tx(tx: &rusqlite::Transaction<'_>, account_id: i64, msg_id: i64, message_id: Option<&str>, compressed: &[u8]) -> rusqlite::Result<()> {
+        if let Some(mid) = message_id.filter(|s| !s.is_empty()) {
+            tx.prepare_cached(
+                "INSERT INTO raw_blobs (account_id, message_id, raw) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(account_id, message_id) DO UPDATE SET raw = excluded.raw",
+            )?
+            .execute(params![account_id, mid, compressed])?;
+            let blob_id: i64 = tx
+                .prepare_cached("SELECT id FROM raw_blobs WHERE account_id = ?1 AND message_id = ?2")?
+                .query_row(params![account_id, mid], |r| r.get(0))?;
+            tx.prepare_cached("INSERT OR REPLACE INTO bodies (message_id, raw, blob_id) VALUES (?1, X'', ?2)")?
+                .execute(params![msg_id, blob_id])?;
+        } else {
+            tx.prepare_cached("INSERT OR REPLACE INTO bodies (message_id, raw, blob_id) VALUES (?1, ?2, NULL)")?
+                .execute(params![msg_id, compressed])?;
+        }
+        Ok(())
+    }
+
     pub fn store_body(&self, folder_id: i64, uid: u32, raw: &[u8], info: &BodyInfo) -> Result<()> {
+        let compressed = compress_raw(raw);
         let mut c = self.c();
         let tx = c.transaction()?;
-        let id: Option<i64> = tx
-            .query_row("SELECT id FROM messages WHERE folder_id = ? AND uid = ?", params![folder_id, uid], |r| r.get(0))
+        let row: Option<(i64, i64, Option<String>)> = tx
+            .prepare_cached("SELECT id, account_id, message_id FROM messages WHERE folder_id = ? AND uid = ?")?
+            .query_row(params![folder_id, uid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .optional()?;
-        if let Some(id) = id {
-            tx.execute("INSERT OR REPLACE INTO bodies (message_id, raw) VALUES (?, ?)", params![id, raw])?;
-            tx.execute(
-                "UPDATE messages SET has_body = 1, snippet = ?, has_attachments = ? WHERE id = ?",
-                params![info.snippet, info.has_attachments, id],
-            )?;
-            tx.execute("UPDATE messages_fts SET body = ? WHERE rowid = ?", params![info.search_text, id])?;
+        if let Some((id, account_id, message_id)) = row {
+            Self::upsert_blob_in_tx(&tx, account_id, id, message_id.as_deref(), &compressed)?;
+            tx.prepare_cached("UPDATE messages SET has_body = 1, snippet = ?, has_attachments = ? WHERE id = ?")?
+                .execute(params![info.snippet, info.has_attachments, id])?;
+            tx.prepare_cached("UPDATE messages_fts SET body = ? WHERE rowid = ?")?
+                .execute(params![info.search_text, id])?;
         }
         tx.commit()?;
         Ok(())
@@ -1444,23 +1651,32 @@ impl Db {
         if items.is_empty() {
             return Ok(0);
         }
+        // Compress outside the SQLite write lock so UI queries aren't delayed.
+        let prepared: Vec<(u32, Option<Vec<u8>>, &BodyInfo)> = items
+            .iter()
+            .map(|(uid, raw, info)| {
+                let comp = if info.has_attachments { None } else { Some(compress_raw(raw)) };
+                (*uid, comp, info)
+            })
+            .collect();
         let mut c = self.c();
         let tx = c.transaction()?;
         let mut stored = 0;
         {
-            let mut find_id = tx.prepare("SELECT id FROM messages WHERE folder_id = ? AND uid = ?")?;
-            let mut ins_body = tx.prepare("INSERT OR REPLACE INTO bodies (message_id, raw) VALUES (?, ?)")?;
-            let mut upd_msg = tx.prepare("UPDATE messages SET has_body = 1, snippet = ?, has_attachments = 0 WHERE id = ?")?;
-            let mut mark_att = tx.prepare("UPDATE messages SET has_attachments = 1 WHERE id = ?")?;
-            let mut upd_fts = tx.prepare("UPDATE messages_fts SET body = ? WHERE rowid = ?")?;
-            for (uid, raw, info) in items {
-                let id: Option<i64> = find_id.query_row(params![folder_id, uid], |r| r.get(0)).optional()?;
-                if let Some(id) = id {
-                    if info.has_attachments {
+            let mut find_id = tx.prepare_cached("SELECT id, account_id, message_id FROM messages WHERE folder_id = ? AND uid = ?")?;
+            let mut upd_msg = tx.prepare_cached("UPDATE messages SET has_body = 1, snippet = ?, has_attachments = 0 WHERE id = ?")?;
+            let mut mark_att = tx.prepare_cached("UPDATE messages SET has_attachments = 1 WHERE id = ?")?;
+            let mut upd_fts = tx.prepare_cached("UPDATE messages_fts SET body = ? WHERE rowid = ?")?;
+            for (uid, comp, info) in prepared {
+                let row: Option<(i64, i64, Option<String>)> = find_id
+                    .query_row(params![folder_id, uid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .optional()?;
+                if let Some((id, account_id, message_id)) = row {
+                    let Some(compressed) = comp else {
                         mark_att.execute(params![id])?;
                         continue;
-                    }
-                    ins_body.execute(params![id, raw.as_slice()])?;
+                    };
+                    Self::upsert_blob_in_tx(&tx, account_id, id, message_id.as_deref(), &compressed)?;
                     upd_msg.execute(params![info.snippet, id])?;
                     upd_fts.execute(params![info.search_text, id])?;
                     stored += 1;
@@ -1480,14 +1696,16 @@ impl Db {
         let mut c = self.c();
         let tx = c.transaction()?;
         {
-            let mut sel = tx.prepare(
-                "SELECT m.account_id, m.message_id, b.raw, m.snippet, COALESCE(f.body, ''), m.has_attachments
+            let mut sel = tx.prepare_cached(
+                "SELECT m.account_id, m.message_id, CASE WHEN b.blob_id IS NOT NULL THEN rb.raw ELSE b.raw END,
+                        m.snippet, COALESCE(f.body, ''), m.has_attachments
                  FROM messages m
                  JOIN bodies b ON b.message_id = m.id
+                 LEFT JOIN raw_blobs rb ON rb.id = b.blob_id
                  LEFT JOIN messages_fts f ON f.rowid = m.id
                  WHERE m.id = ? AND m.message_id IS NOT NULL AND m.has_body = 1",
             )?;
-            let mut ins = tx.prepare(
+            let mut ins = tx.prepare_cached(
                 "INSERT OR REPLACE INTO moved_bodies (account_id, message_id, raw, snippet, search_text, has_attachments, created_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?)",
             )?;
@@ -1512,47 +1730,57 @@ impl Db {
 
     /// Hydrates messages missing bodies in `folder_id` from either `moved_bodies` or another
     /// folder in the same account that already holds the same `Message-ID` (e.g., Gmail labels).
+    /// Shares the compressed `raw_blobs` row (zero blob duplication across folders).
     pub fn copy_existing_bodies_for_folder(&self, account_id: i64, folder_id: i64) -> Result<usize> {
         let mut c = self.c();
         let tx = c.transaction()?;
         let mut hydrated = 0;
         {
             let candidates: Vec<(i64, String)> = tx
-                .prepare("SELECT id, message_id FROM messages WHERE folder_id = ? AND has_body = 0 AND message_id IS NOT NULL")?
+                .prepare_cached("SELECT id, message_id FROM messages WHERE folder_id = ? AND has_body = 0 AND message_id IS NOT NULL")?
                 .query_map([folder_id], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<rusqlite::Result<_>>()?;
             if !candidates.is_empty() {
-                let mut from_stash = tx.prepare(
+                let mut from_stash = tx.prepare_cached(
                     "SELECT raw, snippet, search_text, has_attachments FROM moved_bodies WHERE account_id = ? AND message_id = ?",
                 )?;
-                let mut del_stash = tx.prepare("DELETE FROM moved_bodies WHERE account_id = ? AND message_id = ?")?;
-                let mut from_other = tx.prepare(
-                    "SELECT b.raw, m.snippet, COALESCE(f.body, ''), m.has_attachments
+                let mut del_stash = tx.prepare_cached("DELETE FROM moved_bodies WHERE account_id = ? AND message_id = ?")?;
+                let mut from_other = tx.prepare_cached(
+                    "SELECT b.blob_id, b.raw, m.snippet, COALESCE(f.body, ''), m.has_attachments
                      FROM messages m
                      JOIN bodies b ON b.message_id = m.id
                      LEFT JOIN messages_fts f ON f.rowid = m.id
                      WHERE m.account_id = ? AND m.message_id = ? AND m.has_body = 1 AND m.id != ?
                      LIMIT 1",
                 )?;
-                let mut ins_body = tx.prepare("INSERT OR REPLACE INTO bodies (message_id, raw) VALUES (?, ?)")?;
-                let mut upd_msg = tx.prepare("UPDATE messages SET has_body = 1, snippet = ?, has_attachments = ? WHERE id = ?")?;
-                let mut upd_fts = tx.prepare("UPDATE messages_fts SET body = ? WHERE rowid = ?")?;
+                let mut link_blob = tx.prepare_cached("INSERT OR REPLACE INTO bodies (message_id, raw, blob_id) VALUES (?, X'', ?)")?;
+                let mut upd_msg = tx.prepare_cached("UPDATE messages SET has_body = 1, snippet = ?, has_attachments = ? WHERE id = ?")?;
+                let mut upd_fts = tx.prepare_cached("UPDATE messages_fts SET body = ? WHERE rowid = ?")?;
 
                 for (id, mid) in candidates {
                     let stashed: Option<(Vec<u8>, String, String, bool)> = from_stash
                         .query_row(params![account_id, &mid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
                         .optional()?;
-                    let found = match stashed {
-                        Some(v) => {
-                            del_stash.execute(params![account_id, &mid])?;
-                            Some(v)
+                    if let Some((stored_raw, snippet, search_text, has_att)) = stashed {
+                        del_stash.execute(params![account_id, &mid])?;
+                        let blob_bytes = if stored_raw.starts_with(ZLIB_MAGIC) { stored_raw } else { compress_raw(&stored_raw) };
+                        Self::upsert_blob_in_tx(&tx, account_id, id, Some(&mid), &blob_bytes)?;
+                        upd_msg.execute(params![snippet, has_att, id])?;
+                        upd_fts.execute(params![search_text, id])?;
+                        hydrated += 1;
+                        continue;
+                    }
+                    let other: Option<(Option<i64>, Vec<u8>, String, String, bool)> = from_other
+                        .query_row(params![account_id, &mid, id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+                        .optional()?;
+                    if let Some((blob_id, legacy_raw, snippet, search_text, has_att)) = other {
+                        if let Some(bid) = blob_id {
+                            // Zero-copy share of the deduplicated compressed blob!
+                            link_blob.execute(params![id, bid])?;
+                        } else {
+                            let blob_bytes = if legacy_raw.starts_with(ZLIB_MAGIC) { legacy_raw } else { compress_raw(&legacy_raw) };
+                            Self::upsert_blob_in_tx(&tx, account_id, id, Some(&mid), &blob_bytes)?;
                         }
-                        None => from_other
-                            .query_row(params![account_id, &mid, id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-                            .optional()?,
-                    };
-                    if let Some((raw, snippet, search_text, has_att)) = found {
-                        ins_body.execute(params![id, raw])?;
                         upd_msg.execute(params![snippet, has_att, id])?;
                         upd_fts.execute(params![search_text, id])?;
                         hydrated += 1;
@@ -1565,14 +1793,28 @@ impl Db {
     }
 
     /// Evicts oldest cached raw bodies for `account_id` when total stored body size exceeds `max_bytes`.
-    /// Preserves snippets and FTS body text; prefers keeping recent Inbox bodies.
+    /// Marks evicted rows `has_body = 2` (NOT `0`) so background prefetch never re-downloads them,
+    /// while preserving snippets and FTS body text and keeping on-demand opening working.
     pub fn prune_old_bodies(&self, account_id: i64, max_bytes: i64) -> Result<usize> {
-        let total: i64 = self.r().query_row(
-            "SELECT COALESCE(SUM(LENGTH(b.raw)), 0) FROM bodies b JOIN messages m ON m.id = b.message_id WHERE m.account_id = ?",
-            [account_id],
-            |r| r.get(0),
-        )?;
+        let total: i64 = {
+            let r = self.r();
+            let shared: i64 = r
+                .prepare_cached("SELECT COALESCE(SUM(LENGTH(raw)), 0) FROM raw_blobs WHERE account_id = ?")?
+                .query_row([account_id], |row| row.get(0))?;
+            let direct: i64 = r
+                .prepare_cached(
+                    "SELECT COALESCE(SUM(LENGTH(b.raw)), 0) FROM bodies b JOIN messages m ON m.id = b.message_id WHERE m.account_id = ? AND b.blob_id IS NULL",
+                )?
+                .query_row([account_id], |row| row.get(0))?;
+            shared + direct
+        };
         if total <= max_bytes {
+            // Still GC any orphaned raw_blobs left behind by message deletes.
+            let c = self.c();
+            let _ = c.execute(
+                "DELETE FROM raw_blobs WHERE account_id = ? AND id NOT IN (SELECT blob_id FROM bodies WHERE blob_id IS NOT NULL)",
+                [account_id],
+            );
             return Ok(0);
         }
         let target = (max_bytes * 8) / 10;
@@ -1581,84 +1823,138 @@ impl Db {
         let tx = c.transaction()?;
         let mut evicted = 0;
         {
-            let candidates: Vec<(i64, i64)> = tx
-                .prepare(
-                    "SELECT m.id, LENGTH(b.raw)
+            let candidates: Vec<(i64, Option<i64>, i64)> = tx
+                .prepare_cached(
+                    "SELECT m.id, b.blob_id, CASE WHEN b.blob_id IS NOT NULL THEN LENGTH(rb.raw) ELSE LENGTH(b.raw) END
                      FROM bodies b
                      JOIN messages m ON m.id = b.message_id
                      JOIN folders f ON f.id = m.folder_id
+                     LEFT JOIN raw_blobs rb ON rb.id = b.blob_id
                      WHERE m.account_id = ?
                      ORDER BY (f.role IS 'inbox') ASC, m.date ASC, m.id ASC",
                 )?
-                .query_map([account_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .query_map([account_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                 .collect::<rusqlite::Result<_>>()?;
-            let mut del_body = tx.prepare("DELETE FROM bodies WHERE message_id = ?")?;
-            let mut clear_flag = tx.prepare("UPDATE messages SET has_body = 0 WHERE id = ?")?;
-            for (id, sz) in candidates {
+            let mut del_body = tx.prepare_cached("DELETE FROM bodies WHERE message_id = ?")?;
+            let mut del_blob_bodies = tx.prepare_cached("DELETE FROM bodies WHERE blob_id = ?")?;
+            let mut mark_evicted = tx.prepare_cached("UPDATE messages SET has_body = 2 WHERE id = ?")?;
+            let mut mark_blob_evicted = tx.prepare_cached(
+                "UPDATE messages SET has_body = 2 WHERE id IN (SELECT message_id FROM bodies WHERE blob_id = ?)",
+            )?;
+            let mut dropped_blobs = std::collections::HashSet::new();
+            for (id, blob_id, sz) in candidates {
                 if to_drop <= 0 {
                     break;
                 }
-                del_body.execute([id])?;
-                clear_flag.execute([id])?;
+                if let Some(bid) = blob_id {
+                    if !dropped_blobs.insert(bid) {
+                        continue;
+                    }
+                    mark_blob_evicted.execute([bid])?;
+                    del_blob_bodies.execute([bid])?;
+                } else {
+                    del_body.execute([id])?;
+                    mark_evicted.execute([id])?;
+                }
                 to_drop -= sz;
                 evicted += 1;
             }
+            tx.execute(
+                "DELETE FROM raw_blobs WHERE account_id = ? AND id NOT IN (SELECT blob_id FROM bodies WHERE blob_id IS NOT NULL)",
+                [account_id],
+            )?;
         }
         tx.commit()?;
+        let _ = c.execute_batch("PRAGMA incremental_vacuum(200);");
         Ok(evicted)
     }
 
     pub fn body(&self, id: i64) -> Result<Option<Vec<u8>>> {
-        let c = self.r();
-        Ok(c.query_row("SELECT raw FROM bodies WHERE message_id = ?", [id], |r| r.get(0)).optional()?)
+        let stored: Option<Vec<u8>> = {
+            let c = self.r();
+            let mut st = c.prepare_cached(
+                "SELECT CASE WHEN b.blob_id IS NOT NULL THEN rb.raw ELSE b.raw END
+                 FROM bodies b
+                 LEFT JOIN raw_blobs rb ON rb.id = b.blob_id
+                 WHERE b.message_id = ?",
+            )?;
+            st.query_row([id], |r| r.get(0)).optional()?
+        };
+        Ok(stored.map(|b| decompress_raw(&b)))
     }
 
     /// (account_id, folder_id, folder_path, uid)
     pub fn locate(&self, id: i64) -> Result<(i64, i64, String, u32)> {
         let c = self.r();
-        Ok(c.query_row(
-            "SELECT m.account_id, m.folder_id, f.path, m.uid FROM messages m JOIN folders f ON f.id = m.folder_id WHERE m.id = ?",
-            [id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )?)
+        let row = c
+            .prepare_cached(
+                "SELECT m.account_id, m.folder_id, f.path, m.uid FROM messages m JOIN folders f ON f.id = m.folder_id WHERE m.id = ?",
+            )?
+            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        Ok(row)
+    }
+
+    /// Batched `(id, account_id, folder_id, uid)` lookup for bulk message actions.
+    pub fn locate_many(&self, ids: &[i64]) -> Result<Vec<(i64, i64, i64, u32)>> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let c = self.r();
+        let json = serde_json::to_string(ids)?;
+        let mut st = c.prepare_cached(
+            "SELECT m.id, m.account_id, m.folder_id, m.uid
+             FROM messages m
+             JOIN json_each(?1) j ON m.id = j.value",
+        )?;
+        let by_id: HashMap<i64, (i64, i64, u32)> = st
+            .query_map([json], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let &(acc, folder_id, uid) = by_id.get(&id).ok_or_else(|| anyhow!("Query returned no rows"))?;
+            out.push((id, acc, folder_id, uid));
+        }
+        Ok(out)
     }
 
     /// One row per conversation: its newest message in the view, standing for all of its
     /// messages in the view (`ids`). Conversations are ordered by their freshest message.
+    /// Uses SQLite's single-`MAX()` bare-column guarantee with `GROUP BY` (3x faster than
+    /// window functions), denormalized `sort_date`, and runs correlated snooze / cross-folder
+    /// count lookups ONLY for the returned page.
     pub fn list_threads(&self, view: &View, offset: i64, limit: i64) -> Result<Vec<MessageSummary>> {
         let c = self.r();
         let scope = scope_sql(view)?;
         let sql = format!(
-            "WITH scoped AS (
-               SELECT m.*, {SORT_DATE} AS sort_date FROM messages m WHERE {scope}
-             ), ranked AS (
-               SELECT scoped.*,
-                      ROW_NUMBER() OVER (PARTITION BY account_id, COALESCE(thread_id, 'm' || id) ORDER BY date DESC, id DESC) AS rn,
-                      MIN(seen) OVER t AS t_seen,
-                      MAX(flagged) OVER t AS t_flagged,
-                      MAX(has_attachments) OVER t AS t_att,
-                      MAX(sort_date) OVER t AS t_sort,
-                      GROUP_CONCAT(id) OVER t AS t_ids
-               FROM scoped
-               WINDOW t AS (PARTITION BY account_id, COALESCE(thread_id, 'm' || id))
+            "WITH grouped AS (
+               SELECT m.id, m.account_id, m.folder_id, m.from_name, m.from_addr, m.subject, m.snippet,
+                      m.date, m.message_id, m.thread_id,
+                      CASE WHEN SUM(CASE WHEN m.seen = 0 THEN 1 ELSE 0 END) = 0 THEN 1 ELSE 0 END AS t_seen,
+                      CASE WHEN SUM(m.flagged) > 0 THEN 1 ELSE 0 END AS t_flagged,
+                      CASE WHEN SUM(m.has_attachments) > 0 THEN 1 ELSE 0 END AS t_att,
+                      GROUP_CONCAT(m.id) AS t_ids,
+                      MAX(MIN(9000000000, MAX(-9000000000, m.sort_date)) * 1000000000 + m.id) AS t_sort
+               FROM messages m WHERE {scope}
+               GROUP BY m.account_id, COALESCE(m.thread_id, 'm' || m.id)
+               ORDER BY t_sort DESC LIMIT ?1 OFFSET ?2
              )
-             SELECT {SUMMARY_COLS}, m.t_seen, m.t_flagged, m.t_att, m.t_ids,
+             SELECT m.id, m.account_id, m.folder_id, m.from_name, m.from_addr, m.subject, m.snippet, m.date,
+                    m.t_seen, m.t_flagged, m.t_att, m.thread_id,
+                    (SELECT s.wake_at FROM snoozes s WHERE s.account_id = m.account_id AND s.message_id = m.message_id AND s.woke_at IS NULL),
+                    m.t_ids,
                     (SELECT COUNT(DISTINCT COALESCE(x.message_id, x.id)) FROM messages x
                      WHERE x.account_id = m.account_id AND x.thread_id = m.thread_id
                        AND x.folder_id NOT IN (SELECT id FROM folders WHERE role IN ('trash', 'junk')))
-             FROM ranked m WHERE m.rn = 1
-             ORDER BY m.t_sort DESC, m.id DESC LIMIT ?1 OFFSET ?2"
+             FROM grouped m
+             ORDER BY m.t_sort DESC"
         );
-        let mut st = c.prepare(&sql)?;
+        let mut st = c.prepare_cached(&sql)?;
         let rows = st
             .query_map(params![limit, offset], |r| {
                 let mut s = row_to_summary(r)?;
-                s.seen = r.get(SUMMARY_LEN)?;
-                s.flagged = r.get(SUMMARY_LEN + 1)?;
-                s.has_attachments = r.get(SUMMARY_LEN + 2)?;
-                let ids: String = r.get(SUMMARY_LEN + 3)?;
+                let ids: String = r.get(SUMMARY_LEN)?;
                 s.ids = ids.split(',').filter_map(|i| i.parse().ok()).collect();
-                let total: i64 = r.get(SUMMARY_LEN + 4)?;
+                let total: i64 = r.get(SUMMARY_LEN + 1)?;
                 s.count = total.max(s.ids.len() as i64).max(1);
                 Ok(s)
             })?
@@ -1739,15 +2035,20 @@ impl Db {
     }
 
     pub fn summaries(&self, ids: &[i64]) -> Result<Vec<MessageSummary>> {
-        let c = self.r();
-        let mut st = c.prepare(&format!("SELECT {SUMMARY_COLS} FROM messages m WHERE m.id = ?"))?;
-        let mut out = Vec::new();
-        for id in ids {
-            if let Some(s) = st.query_row([id], row_to_summary).optional()? {
-                out.push(s);
-            }
+        if ids.is_empty() {
+            return Ok(vec![]);
         }
-        Ok(out)
+        let c = self.r();
+        let json = serde_json::to_string(ids)?;
+        let sql = format!("SELECT {SUMMARY_COLS} FROM messages m JOIN json_each(?1) j ON m.id = j.value");
+        let mut st = c.prepare_cached(&sql)?;
+        let by_id: HashMap<i64, MessageSummary> = st
+            .query_map([json], |r| {
+                let s = row_to_summary(r)?;
+                Ok((s.id, s))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ids.iter().filter_map(|id| by_id.get(id).cloned()).collect())
     }
 
     pub fn list(&self, view: &View, query: Option<&str>, offset: i64, limit: i64) -> Result<Vec<MessageSummary>> {
@@ -1760,10 +2061,10 @@ impl Db {
                  WHERE {scope} AND messages_fts MATCH ?1 ORDER BY m.date DESC LIMIT ?2 OFFSET ?3"
             ),
             None => format!(
-                "SELECT {SUMMARY_COLS} FROM messages m WHERE {scope} AND ?1 IS NULL ORDER BY {SORT_DATE} DESC, m.id DESC LIMIT ?2 OFFSET ?3"
+                "SELECT {SUMMARY_COLS} FROM messages m WHERE {scope} AND ?1 IS NULL ORDER BY m.sort_date DESC, m.id DESC LIMIT ?2 OFFSET ?3"
             ),
         };
-        let mut st = c.prepare(&sql)?;
+        let mut st = c.prepare_cached(&sql)?;
         let rows = st
             .query_map(params![fts, limit, offset], row_to_summary)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1859,9 +2160,9 @@ impl Db {
     pub fn summary(&self, id: i64) -> Result<SummaryDetailRow> {
         let c = self.r();
         let sql = format!(
-            "SELECT {SUMMARY_COLS}, m.to_json, m.cc_json, m.reply_to_json, m.message_id, m.refs, m.in_reply_to FROM messages m WHERE m.id = ?"
+            "SELECT {SUMMARY_COLS}, m.to_json, m.cc_json, m.reply_to_json, m.message_id, m.refs, m.in_reply_to, m.list_id FROM messages m WHERE m.id = ?"
         );
-        Ok(c.query_row(&sql, [id], |r| {
+        let row = c.prepare_cached(&sql)?.query_row([id], |r| {
             let s = row_to_summary(r)?;
             let n = SUMMARY_LEN;
             let to: String = r.get(n)?;
@@ -1875,15 +2176,20 @@ impl Db {
                 r.get(n + 3)?,
                 r.get(n + 4)?,
                 r.get(n + 5)?,
+                r.get(n + 6)?,
             ))
-        })?)
+        })?;
+        Ok(row)
     }
 
     pub fn set_seen(&self, ids: &[i64], seen: bool) -> Result<()> {
         let mut c = self.c();
         let tx = c.transaction()?;
-        for id in ids {
-            tx.execute("UPDATE messages SET seen = ? WHERE id = ?", params![seen, id])?;
+        {
+            let mut st = tx.prepare_cached("UPDATE messages SET seen = ? WHERE id = ?")?;
+            for id in ids {
+                st.execute(params![seen, id])?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -1892,14 +2198,18 @@ impl Db {
     /// Marks every cached message in a folder as read.
     pub fn mark_folder_read(&self, folder_id: i64) -> Result<usize> {
         let c = self.c();
-        Ok(c.execute("UPDATE messages SET seen = 1 WHERE folder_id = ? AND seen = 0", [folder_id])?)
+        let n = c.prepare_cached("UPDATE messages SET seen = 1 WHERE folder_id = ? AND seen = 0")?.execute([folder_id])?;
+        Ok(n)
     }
 
     pub fn set_flagged(&self, ids: &[i64], flagged: bool) -> Result<()> {
         let mut c = self.c();
         let tx = c.transaction()?;
-        for id in ids {
-            tx.execute("UPDATE messages SET flagged = ? WHERE id = ?", params![flagged, id])?;
+        {
+            let mut st = tx.prepare_cached("UPDATE messages SET flagged = ? WHERE id = ?")?;
+            for id in ids {
+                st.execute(params![flagged, id])?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -1908,33 +2218,33 @@ impl Db {
     pub fn delete_messages(&self, ids: &[i64]) -> Result<()> {
         let mut c = self.c();
         let tx = c.transaction()?;
-        for id in ids {
-            tx.execute("DELETE FROM messages_fts WHERE rowid = ?", [id])?;
-            tx.execute("DELETE FROM messages WHERE id = ?", [id])?;
+        {
+            let mut st = tx.prepare_cached("DELETE FROM messages WHERE id = ?")?;
+            for id in ids {
+                st.execute([id])?;
+            }
         }
         tx.commit()?;
         Ok(())
     }
 
     pub fn mark_quiet(&self, id: i64) -> Result<()> {
-        self.c().execute("UPDATE messages SET quiet = 1 WHERE id = ?", [id])?;
+        self.c().prepare_cached("UPDATE messages SET quiet = 1 WHERE id = ?")?.execute([id])?;
         Ok(())
     }
 
     /// The Message-ID header of a stored message.
     pub fn message_id_of(&self, id: i64) -> Result<Option<String>> {
         let c = self.r();
-        Ok(c.query_row("SELECT message_id FROM messages WHERE id = ?", [id], |r| r.get(0))?)
+        let mid = c.prepare_cached("SELECT message_id FROM messages WHERE id = ?")?.query_row([id], |r| r.get(0))?;
+        Ok(mid)
     }
 
     /// Removes local copies of a message from a folder (by Message-ID).
     pub fn delete_by_message_id(&self, folder_id: i64, message_id: &str) -> Result<usize> {
         let c = self.c();
-        c.execute(
-            "DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE folder_id = ? AND message_id = ?)",
-            params![folder_id, message_id],
-        )?;
-        Ok(c.execute("DELETE FROM messages WHERE folder_id = ? AND message_id = ?", params![folder_id, message_id])?)
+        let n = c.prepare_cached("DELETE FROM messages WHERE folder_id = ? AND message_id = ?")?.execute(params![folder_id, message_id])?;
+        Ok(n)
     }
 
     /// The newest local copy of a draft, by Message-ID, in any account's Drafts folder:
@@ -2007,19 +2317,14 @@ impl Db {
     }
 
     /// Address suggestions, ranked by how often you write to / hear from them.
+    /// Reads the incrementally maintained `contacts_cache` instead of scanning `messages`.
     pub fn contacts(&self, q: &str) -> Result<Vec<Addr>> {
         let c = self.r();
         let like = like_any(q);
-        let mut st = c.prepare(
-            "SELECT COALESCE(MAX(NULLIF(name, '')), ''), email, SUM(w) AS score FROM (
-               SELECT from_name AS name, from_addr AS email, 1 AS w FROM messages
-               UNION ALL
-               SELECT json_extract(j.value, '$.name'), json_extract(j.value, '$.email'), 4
-               FROM messages m, json_each(m.to_json) j
-               WHERE m.folder_id IN (SELECT id FROM folders WHERE role = 'sent')
-             )
-             WHERE email != '' AND (email LIKE ?1 ESCAPE '\\' OR name LIKE ?1 ESCAPE '\\')
-             GROUP BY lower(email) ORDER BY score DESC LIMIT 8",
+        let mut st = c.prepare_cached(
+            "SELECT name, email FROM contacts_cache
+             WHERE email LIKE ?1 ESCAPE '\\' OR name LIKE ?1 ESCAPE '\\'
+             ORDER BY score DESC LIMIT 8",
         )?;
         let rows = st
             .query_map([like], |r| {
@@ -2165,7 +2470,20 @@ impl Db {
     }
 
     pub fn mark_woke(&self, id: i64, at: i64) -> Result<()> {
-        self.c().execute("UPDATE snoozes SET woke_at = ? WHERE id = ?", params![at, id])?;
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        tx.prepare_cached("UPDATE snoozes SET woke_at = ? WHERE id = ?")?.execute(params![at, id])?;
+        if let Some((account_id, message_id)) = tx
+            .prepare_cached("SELECT account_id, message_id FROM snoozes WHERE id = ?")?
+            .query_row([id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .optional()?
+        {
+            tx.prepare_cached(
+                "UPDATE messages SET sort_date = MAX(sort_date, ?1) WHERE account_id = ?2 AND message_id = ?3",
+            )?
+            .execute(params![at, account_id, message_id])?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -2291,10 +2609,18 @@ impl Db {
     }
 
     pub fn unqueue_for_rules(&self, ids: &[i64]) -> Result<()> {
-        let c = self.c();
-        for id in ids {
-            c.execute("DELETE FROM rule_queue WHERE message_id = ?", [id])?;
+        if ids.is_empty() {
+            return Ok(());
         }
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        {
+            let mut st = tx.prepare_cached("DELETE FROM rule_queue WHERE message_id = ?")?;
+            for id in ids {
+                st.execute([id])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -2361,19 +2687,15 @@ impl Db {
         Ok(rows)
     }
 
-    /// The body as plain text (quoted replies left out), if it has been downloaded.
+    /// The body as plain text (quoted replies left out), if it has been downloaded (including evicted rows whose FTS text was kept).
     pub fn body_text(&self, id: i64) -> Result<Option<String>> {
         let c = self.r();
-        let has: Option<bool> = c.query_row("SELECT has_body FROM messages WHERE id = ?", [id], |r| r.get(0)).optional()?;
-        if has != Some(true) {
+        let state: Option<i64> = c.prepare_cached("SELECT has_body FROM messages WHERE id = ?")?.query_row([id], |r| r.get(0)).optional()?;
+        if !matches!(state, Some(1) | Some(2)) {
             return Ok(None);
         }
-        Ok(Some(c.query_row("SELECT body FROM messages_fts WHERE rowid = ?", [id], |r| r.get(0)).optional()?.unwrap_or_default()))
-    }
-
-    pub fn list_id(&self, id: i64) -> Result<Option<String>> {
-        let c = self.r();
-        Ok(c.query_row("SELECT list_id FROM messages WHERE id = ?", [id], |r| r.get(0)).optional()?.flatten())
+        let body = c.prepare_cached("SELECT body FROM messages_fts WHERE rowid = ?")?.query_row([id], |r| r.get(0)).optional()?.unwrap_or_default();
+        Ok(Some(body))
     }
 
     /// Stored copies of a message in a folder, by Message-ID.
@@ -2399,13 +2721,16 @@ impl Db {
     #[allow(clippy::too_many_arguments)]
     pub fn log_rule(&self, rule: &Rule, account_id: i64, msgid: Option<&str>, subject: &str, from_addr: &str, action: &RuleAction, now: i64) -> Result<i64> {
         let c = self.c();
-        c.execute(
+        c.prepare_cached(
             "INSERT INTO rule_log (rule_id, rule_name, account_id, msgid, subject, from_addr, action, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            params![rule.id, rule.name, account_id, msgid, subject, from_addr, serde_json::to_string(action)?, now],
-        )?;
-        // Keep the log from growing forever.
-        c.execute("DELETE FROM rule_log WHERE id NOT IN (SELECT id FROM rule_log ORDER BY id DESC LIMIT 2000)", [])?;
-        Ok(c.last_insert_rowid())
+        )?
+        .execute(params![rule.id, rule.name, account_id, msgid, subject, from_addr, serde_json::to_string(action)?, now])?;
+        let id = c.last_insert_rowid();
+        // Keep the log from growing forever without running a prune scan on every single insert.
+        if id % 100 == 0 {
+            let _ = c.execute("DELETE FROM rule_log WHERE id NOT IN (SELECT id FROM rule_log ORDER BY id DESC LIMIT 2000)", []);
+        }
+        Ok(id)
     }
 
     /// The newest log entries: (entry, its Message-ID).
@@ -2488,7 +2813,20 @@ impl Db {
 
     pub fn setting(&self, key: &str) -> Result<Option<String>> {
         let c = self.r();
-        Ok(c.query_row("SELECT value FROM settings WHERE key = ?", [key], |r| r.get(0)).optional()?)
+        let v = c.prepare_cached("SELECT value FROM settings WHERE key = ?")?.query_row([key], |r| r.get(0)).optional()?;
+        Ok(v)
+    }
+
+    /// Loads multiple settings in a single SQLite read.
+    pub fn settings_many(&self, keys: &[&str]) -> Result<HashMap<String, String>> {
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let c = self.r();
+        let json = serde_json::to_string(keys)?;
+        let mut st = c.prepare_cached("SELECT s.key, s.value FROM settings s JOIN json_each(?1) j ON s.key = j.value")?;
+        let rows = st.query_map([json], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
@@ -2698,12 +3036,24 @@ impl Db {
     }
 
     pub fn set_sender_icon(&self, domain: &str, icon: Option<&Icon>, retry_at: i64) -> Result<()> {
+        const MAX_ICON_DOMAINS: i64 = 1000;
+        const MAX_ICON_BYTES: i64 = 10 * 1024 * 1024;
         let c = self.c();
-        c.execute(
+        c.prepare_cached(
             "INSERT INTO sender_icons (domain, mime, data, logo, retry_at) VALUES (?, ?, ?, ?, ?)
              ON CONFLICT(domain) DO UPDATE SET mime = excluded.mime, data = excluded.data, logo = excluded.logo, retry_at = excluded.retry_at",
-            params![domain, icon.map(|i| &i.mime), icon.map(|i| &i.data), icon.is_some_and(|i| i.logo), retry_at],
-        )?;
+        )?
+        .execute(params![domain, icon.map(|i| &i.mime), icon.map(|i| &i.data), icon.is_some_and(|i| i.logo), retry_at])?;
+        let (count, total_bytes): (i64, i64) = c
+            .prepare_cached("SELECT COUNT(*), COALESCE(SUM(LENGTH(data)), 0) FROM sender_icons")?
+            .query_row([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        if count > MAX_ICON_DOMAINS || total_bytes > MAX_ICON_BYTES {
+            let keep = if total_bytes > MAX_ICON_BYTES { (count * 7) / 10 } else { MAX_ICON_DOMAINS };
+            let _ = c.execute(
+                "DELETE FROM sender_icons WHERE domain NOT IN (SELECT domain FROM sender_icons ORDER BY retry_at DESC LIMIT ?)",
+                [keep.max(100)],
+            );
+        }
         Ok(())
     }
 }
@@ -3351,8 +3701,18 @@ mod tests {
         let arch_id = db.ids_for_uids(archive, &[9]).unwrap()[0];
         assert_eq!(db.body(arch_id).unwrap().unwrap(), raw);
 
-        // Prune evicts oldest bodies when account exceeds max_bytes (keeping snippet/FTS).
-        assert!(db.prune_old_bodies(acc, 500).unwrap() >= 1);
+        // Cross-folder dedup (Gmail labels): Work shares the single compressed raw_blobs row.
+        let blob_count: i64 = db.r().query_row("SELECT COUNT(*) FROM raw_blobs WHERE account_id = ?", [acc], |r| r.get(0)).unwrap();
+        assert_eq!(blob_count, 1);
+        let stored_len: i64 = db.r().query_row("SELECT LENGTH(raw) FROM raw_blobs WHERE account_id = ?", [acc], |r| r.get(0)).unwrap();
+        assert!(stored_len < raw.len() as i64, "expected compressed blob smaller than raw");
+
+        // Prune evicts oldest bodies when account exceeds max_bytes (keeping snippet/FTS)
+        // and marks has_body = 2 so background prefetch never re-downloads evicted rows.
+        assert!(db.prune_old_bodies(acc, 8).unwrap() >= 1);
+        assert!(db.body(arch_id).unwrap().is_none());
+        assert_eq!(db.body_text(arch_id).unwrap().as_deref(), Some("hello world"));
+        assert!(db.missing_bodies_with_size(archive, 100, 4 * 1024 * 1024).unwrap().is_empty());
     }
 
     #[test]

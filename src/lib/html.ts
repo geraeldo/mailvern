@@ -1,5 +1,6 @@
-import type { Addr, Detail } from "./api";
+import type { Addr, Detail, SecurityWarning } from "./api";
 import { formatAddr, longDate } from "./format";
+import { scanDocPhishing } from "./phishing";
 
 export function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
@@ -101,13 +102,7 @@ function stripTrackingImages(doc: Document) {
   }
 }
 
-/**
- * Extracts deduplicated remote http(s) image URLs from email HTML for background preloading
- * (only called for explicitly trusted senders). Skips explicit 0x0 / 1x1 tracking pixels.
- */
-export function extractRemoteImageUrls(html: string): string[] {
-  if (!hasRemoteContent(html)) return [];
-  const doc = new DOMParser().parseFromString(html, "text/html");
+function extractRemoteUrlsFromDoc(doc: Document): string[] {
   const urls: string[] = [];
   const seen = new Set<string>();
   const add = (raw: string | null | undefined) => {
@@ -135,28 +130,51 @@ export function extractRemoteImageUrls(html: string): string[] {
 }
 
 /**
- * Prepares untrusted email HTML for the sandboxed reading frame:
- * - Removes `<meta>` (preventing `<meta http-equiv="refresh">` zero-click navigation),
- *   `<base>` (preventing link hijacking), `<script>`, and active embeds.
- * - Drops `target` attributes via DOM APIs so every link navigates the frame itself
- *   and is intercepted cleanly by the app's external-link handler.
+ * Extracts deduplicated remote http(s) image URLs from email HTML for background preloading
+ * (only called for explicitly trusted senders). Skips explicit 0x0 / 1x1 tracking pixels.
  */
-function prepareFrameBody(html: string, stripTrackers = false): string {
+export function extractRemoteImageUrls(html: string): string[] {
+  if (!hasRemoteContent(html)) return [];
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  return extractRemoteUrlsFromDoc(doc);
+}
+
+export type AnalyzedEmailHtml = {
+  preparedBody: string;
+  remoteImageUrls: string[];
+  warnings: SecurityWarning[];
+};
+
+/**
+ * Single-pass DOMParser pipeline for an email body:
+ * - Scans links for phishing indicators (`scanDocPhishing`)
+ * - Extracts non-tracker remote image URLs (`extractRemoteUrlsFromDoc`)
+ * - Removes `<meta>`, `<base>`, `<script>`, active embeds, and `target` attributes
+ * - Optionally strips tracking pixels (`stripTrackers`)
+ * Avoids running 3 separate `DOMParser.parseFromString` passes over large HTML emails.
+ */
+export function analyzeEmailHtml(html: string, stripTrackers = false, scanPhishing = true): AnalyzedEmailHtml {
   const doc = new DOMParser().parseFromString(html, "text/html");
   doc.querySelectorAll("script, meta, base, iframe, object, embed, applet, frame, frameset, portal").forEach((n) => n.remove());
   doc.querySelectorAll("a[target], area[target]").forEach((el) => el.removeAttribute("target"));
+  const warnings = scanPhishing ? scanDocPhishing(doc) : [];
+  const remoteImageUrls = hasRemoteContent(html) ? extractRemoteUrlsFromDoc(doc) : [];
   if (stripTrackers) stripTrackingImages(doc);
   // Preserve <style> blocks that originally lived in <head> (DOMParser puts them in doc.head).
   const headStyles = Array.from(doc.head.querySelectorAll("style"))
     .map((s) => s.outerHTML)
     .join("");
-  return headStyles + doc.body.innerHTML;
+  return {
+    preparedBody: headStyles + doc.body.innerHTML,
+    remoteImageUrls,
+    warnings,
+  };
 }
 
-/** A self-contained document for the sandboxed reading frame. Scripts never run. */
-export function frameDoc(body: string, allowRemote: boolean, plain = false, stripTrackers = false): string {
+/** Wraps an already-prepared email body in its sandboxed srcdoc HTML shell. */
+export function wrapFrameDoc(preparedBody: string, allowRemote: boolean, plain = false): string {
   const remote = allowRemote ? " https: http:" : "";
-  const csp = `default-src 'none'; img-src data: cid:${remote}; style-src 'unsafe-inline'${remote}; font-src data:${remote}; media-src data:${remote}`;
+  const csp = `default-src 'none'; img-src data: cid: mailvern-cid:${remote}; style-src 'unsafe-inline'${remote}; font-src data:${remote}; media-src data:${remote}`;
   const colorScheme = plain ? "light dark" : "light";
   const darkOverride = plain
     ? `<style>
@@ -178,7 +196,13 @@ export function frameDoc(body: string, allowRemote: boolean, plain = false, stri
   pre{white-space:pre-wrap}
   a{color:#2459e0}
   blockquote{margin:0 0 0 2px;padding-left:12px;border-left:2px solid #e3e1dc;color:#55524c}
-</style>${darkOverride}</head><body>${prepareFrameBody(body, stripTrackers)}</body></html>`;
+</style>${darkOverride}</head><body>${preparedBody}</body></html>`;
+}
+
+/** A self-contained document for the sandboxed reading frame. Scripts never run. */
+export function frameDoc(body: string, allowRemote: boolean, plain = false, stripTrackers = false): string {
+  const { preparedBody } = analyzeEmailHtml(body, stripTrackers, false);
+  return wrapFrameDoc(preparedBody, allowRemote, plain);
 }
 
 const XHTML_NS = "http://www.w3.org/1999/xhtml";
@@ -211,6 +235,7 @@ const SAFE_CSS_PROPS = new Set([
 ]);
 
 const SAFE_DATA_IMAGE = /^data:image\/(?:png|jpeg|jpg|gif|webp);base64,[a-z0-9+/=\s]+$/i;
+const SAFE_CID_IMAGE = /^mailvern-cid:\/\/localhost\/[1-9]\d*\/\d+$/;
 
 function isSafeHref(raw: string): boolean {
   // Strip ASCII control characters and whitespace that browsers ignore when parsing URL schemes.
@@ -272,7 +297,7 @@ export function sanitize(html: string): string {
       } else if (tag === "A" && name === "href") {
         if (isSafeHref(val)) copy.setAttribute("href", val.trim());
       } else if (tag === "IMG") {
-        if (name === "src" && SAFE_DATA_IMAGE.test(val.trim())) copy.setAttribute("src", val.trim());
+        if (name === "src" && (SAFE_DATA_IMAGE.test(val.trim()) || SAFE_CID_IMAGE.test(val.trim()))) copy.setAttribute("src", val.trim());
         else if (name === "alt") copy.setAttribute("alt", val);
         else if ((name === "width" || name === "height") && /^\d{1,4}$/.test(val.trim())) copy.setAttribute(name, val.trim());
       } else if (tag === "BLOCKQUOTE" && name === "type" && val.toLowerCase() === "cite") {

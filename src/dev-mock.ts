@@ -452,8 +452,21 @@ export function installMock() {
       case "summaries": return args.ids.map((id: number) => messages.find((m) => m.id === id)).filter(Boolean);
       case "attachment_content":
         return { kind: "text", filename: "Q4-agenda.pdf", mime: "application/pdf", format: "pdf", text: "--- Page 1 ---\nINVOICE #2041\nAmount due: $1,240.00\nDue: 14 days from receipt", totalChars: 72, offset: 0, parts: 1 };
-      case "ai_key": return settings.__ai_key ?? null;
-      case "set_ai_key": if (args.key) settings.__ai_key = args.key; else delete settings.__ai_key; return null;
+      case "ai_key": {
+        const k = settings.__ai_key ?? null;
+        settings.ai_configured = k ? "1" : "0";
+        return k;
+      }
+      case "set_ai_key": {
+        if (args.key) {
+          settings.__ai_key = args.key;
+          settings.ai_configured = "1";
+        } else {
+          delete settings.__ai_key;
+          settings.ai_configured = "0";
+        }
+        return null;
+      }
       case "badge_count": return messages.filter((m) => !m.seen).length;
       case "mark_badge_seen": return null;
       case "message":
@@ -493,6 +506,51 @@ export function installMock() {
         return icon ? { url: `data:image/svg+xml,${encodeURIComponent(icon.svg)}`, logo: icon.logo } : null;
       }
       case "get_setting": return settings[args.key] ?? null;
+      case "get_settings": {
+        const out: Record<string, string> = {};
+        for (const k of (args.keys as string[]) ?? []) {
+          if (settings[k] !== undefined) out[k] = settings[k];
+        }
+        return out;
+      }
+      case "bootstrap": {
+        const order = (id: number) => accounts.findIndex((a) => a.id === id);
+        const sortedFolders = [...folders].sort((x, y) => order(x.accountId) - order(y.accountId) || (x.position ?? 99) - (y.position ?? 99));
+        const v = args.view;
+        const threaded = settings.threads !== "off";
+        const rows = messages
+          .filter((m) => (v.kind === "unified" ? folders.find((f) => f.id === m.folderId)?.role === v.role : m.folderId === v.folderId))
+          .sort((a, b) => b.date - a.date);
+        let initial: M[];
+        if (!threaded) {
+          initial = rows.slice(0, args.limit).map((m) => ({ ...m, count: 1, ids: [m.id] }));
+        } else {
+          const groups = new Map<string, M[]>();
+          for (const m of rows) groups.set(m.threadId ?? `m${m.id}`, [...(groups.get(m.threadId ?? `m${m.id}`) ?? []), m]);
+          initial = [...groups.values()].map((g) => ({
+            ...g[0],
+            seen: g.every((m) => m.seen),
+            ids: g.map((m) => m.id),
+            count: messages.filter((m) => m.threadId === g[0].threadId).length,
+          })).slice(0, args.limit);
+        }
+        const settingMap: Record<string, string> = {};
+        for (const k of (args.settingKeys as string[]) ?? []) {
+          if (settings[k] !== undefined) settingMap[k] = settings[k];
+        }
+        return {
+          accounts,
+          folders: sortedFolders,
+          smartCounts: {
+            flagged: messages.filter((m) => m.flagged).length,
+            unread: messages.filter((m) => !m.seen).length,
+          },
+          messages: initial,
+          outbox,
+          pendingAgentActions: agentActions.filter((a) => a.status === "pending").length,
+          settings: settingMap,
+        };
+      }
       case "set_setting": settings[args.key] = args.value; return null;
       case "save_account": {
         const i = accounts.findIndex((a) => a.id === args.account.id);
