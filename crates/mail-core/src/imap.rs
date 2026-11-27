@@ -749,6 +749,16 @@ pub fn quote(s: &str) -> String {
     format!("\"{}\"", clean.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// Splits free text into IMAP SEARCH terms, normalizing `×`/`✕`/`✖` to `x` and dropping
+/// punctuation-only tokens (such as standalone `-`) that servers ignore or fail to match.
+pub(crate) fn search_terms(s: &str) -> Vec<String> {
+    crate::db::normalize_fts(s)
+        .split_whitespace()
+        .map(|t| t.trim_matches('"').to_string())
+        .filter(|t| t.chars().any(char::is_alphanumeric))
+        .collect()
+}
+
 /// SEARCH criteria matching every term anywhere in a message (headers or body).
 pub fn search_criteria(terms: &[String]) -> String {
     let parts: Vec<String> = terms.iter().map(|t| format!("TEXT {}", quote(t))).collect();
@@ -769,14 +779,7 @@ fn imap_date(t: i64) -> Option<String> {
 /// (asking for every message would be pointless). Dates are whole days on the server, so they
 /// are widened by a day; the local query applies the exact bounds afterwards.
 pub fn query_criteria(q: &crate::model::MailQuery) -> Option<String> {
-    let words = |s: &Option<String>| -> Vec<String> {
-        s.as_deref()
-            .unwrap_or("")
-            .split_whitespace()
-            .map(|t| t.trim_matches('"').to_string())
-            .filter(|t| !t.is_empty())
-            .collect()
-    };
+    let words = |s: &Option<String>| -> Vec<String> { s.as_deref().map(search_terms).unwrap_or_default() };
     let mut parts = Vec::new();
     let mut texts = Vec::new();
     for t in words(&q.text) {
@@ -863,6 +866,11 @@ mod tests {
         assert_eq!(query_criteria(&q).unwrap(), r#"TEXT "invoice" FROM "tokopedia" SINCE 4-Nov-2026 UNSEEN"#);
         let q = MailQuery { subject: Some("rapat".into()), to: Some("budi@contoh.id".into()), ..Default::default() };
         assert_eq!(query_criteria(&q).unwrap(), r#"SUBJECT "rapat" TO "budi@contoh.id""#);
+        let q = MailQuery { text: Some("Quotation - AQUA × MPL S18".into()), ..Default::default() };
+        assert_eq!(
+            query_criteria(&q).unwrap(),
+            r#"TEXT "Quotation" TEXT "AQUA" TEXT "x" TEXT "MPL" TEXT "S18""#
+        );
     }
 
     #[test]

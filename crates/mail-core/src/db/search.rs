@@ -3,12 +3,36 @@ use crate::model::*;
 use anyhow::{anyhow, Result};
 use rusqlite::params;
 
-/// Turns free text into a safe FTS5 prefix query.
+use std::borrow::Cow;
+
+/// Characters that look like ASCII `x` (commonly used in collaborations and dimensions like
+/// `AQUA × MPL` or `1920×1080`) but are treated as separators by FTS5's `unicode61` tokenizer.
+const FTS_X_LOOKALIKES: [char; 3] = ['×', '✕', '✖'];
+
+/// Normalizes text for FTS5 indexing and querying so `×`/`✕`/`✖` match ASCII `x`.
+pub(crate) fn normalize_fts(s: &str) -> Cow<'_, str> {
+    if !s.contains(FTS_X_LOOKALIKES) {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if FTS_X_LOOKALIKES.contains(&c) {
+            out.push('x');
+        } else {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Turns free text into a safe FTS5 prefix query, dropping punctuation-only tokens that
+/// `unicode61` strips (such as standalone `-`), which would otherwise match zero rows.
 pub(super) fn fts_query(q: &str) -> Option<String> {
-    let terms: Vec<String> = q
+    let norm = normalize_fts(q);
+    let terms: Vec<String> = norm
         .split_whitespace()
         .map(|t| t.replace(['"', '\0'], ""))
-        .filter(|t| !t.is_empty())
+        .filter(|t| t.chars().any(char::is_alphanumeric))
         .map(|t| format!("\"{}\"*", t))
         .collect();
     if terms.is_empty() {
@@ -20,12 +44,13 @@ pub(super) fn fts_query(q: &str) -> Option<String> {
 
 /// Turns a quoted phrase into a safe FTS5 exact phrase query (no trailing wildcard).
 fn fts_phrase(q: &str) -> Option<String> {
-    let cleaned: Vec<String> = q
+    let norm = normalize_fts(q);
+    let cleaned: Vec<String> = norm
         .split_whitespace()
         .map(|t| t.replace(['"', '\0'], ""))
         .filter(|t| !t.is_empty())
         .collect();
-    if cleaned.is_empty() {
+    if !cleaned.iter().any(|t| t.chars().any(char::is_alphanumeric)) {
         None
     } else {
         Some(format!("\"{}\"", cleaned.join(" ")))

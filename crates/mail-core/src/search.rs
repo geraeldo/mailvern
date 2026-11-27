@@ -231,10 +231,14 @@ enum AtomOutcome {
     IncompleteOp,
 }
 
+fn has_searchable_char(s: &str) -> bool {
+    s.chars().any(|c| c.is_alphanumeric() || matches!(c, '×' | '✕' | '✖'))
+}
+
 fn parse_atom(text: &str, quoted: bool, now: chrono::DateTime<Local>) -> Option<AtomOutcome> {
     if quoted {
         let t = text.trim();
-        return (!t.is_empty()).then(|| AtomOutcome::Term(SearchTerm::Phrase(t.to_string()), false));
+        return has_searchable_char(t).then(|| AtomOutcome::Term(SearchTerm::Phrase(t.to_string()), false));
     }
     if let Some((k, v_raw)) = text.split_once(':') {
         let key = k.to_ascii_lowercase();
@@ -261,7 +265,7 @@ fn parse_atom(text: &str, quoted: bool, now: chrono::DateTime<Local>) -> Option<
                 return Some(AtomOutcome::IncompleteOp);
             }
             let clean = unquote(text);
-            return (!clean.is_empty()).then(|| AtomOutcome::Term(SearchTerm::Text(clean), false));
+            return has_searchable_char(&clean).then_some(AtomOutcome::Term(SearchTerm::Text(clean), false));
         }
         let val_lc = val.to_ascii_lowercase();
         match key.as_str() {
@@ -318,7 +322,7 @@ fn parse_atom(text: &str, quoted: bool, now: chrono::DateTime<Local>) -> Option<
         }
     }
     let clean = unquote(text);
-    (!clean.is_empty()).then(|| AtomOutcome::Term(SearchTerm::Text(clean), false))
+    has_searchable_char(&clean).then_some(AtomOutcome::Term(SearchTerm::Text(clean), false))
 }
 
 struct Parser {
@@ -646,5 +650,27 @@ mod tests {
         assert_eq!(parse_size("2G"), Some(2 * 1024 * 1024 * 1024));
         assert_eq!(parse_size("512"), Some(512));
         assert_eq!(parse_size("-5M"), None);
+    }
+
+    #[test]
+    fn drops_standalone_punctuation_and_keeps_cross_lookalikes() {
+        let p = parse_search_query_at("Quotation - AQUA x MPL S18", &SearchScope::All, fixed_now());
+        assert_eq!(
+            p.expr,
+            Some(SearchExpr::And(vec![
+                SearchExpr::Term(SearchTerm::Text("Quotation".into())),
+                SearchExpr::Term(SearchTerm::Text("AQUA".into())),
+                SearchExpr::Term(SearchTerm::Text("x".into())),
+                SearchExpr::Term(SearchTerm::Text("MPL".into())),
+                SearchExpr::Term(SearchTerm::Text("S18".into())),
+            ]))
+        );
+        assert_eq!(p.query.text.as_deref(), Some("Quotation AQUA x MPL S18"));
+
+        let p2 = parse_search_query_at("AQUA × MPL / S18 & 2026", &SearchScope::All, fixed_now());
+        assert_eq!(p2.query.text.as_deref(), Some("AQUA × MPL S18 2026"));
+
+        let p3 = parse_search_query_at("--", &SearchScope::All, fixed_now());
+        assert!(p3.expr.is_none());
     }
 }

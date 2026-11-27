@@ -1,4 +1,4 @@
-use super::search::{fts_query, like_any};
+use super::search::{fts_query, like_any, normalize_fts};
 use super::{row_to_summary, scope_sql, BodyInfo, Db, NewMessage, SummaryDetailRow, SUMMARY_COLS, SUMMARY_LEN};
 use crate::model::*;
 use anyhow::{anyhow, Result};
@@ -232,7 +232,7 @@ impl Db {
                 if n > 0 {
                     let id = tx.last_insert_rowid();
                     added.push(id);
-                    fts.execute(params![id, m.subject, format!("{} {}", m.from_name, m.from_addr)])?;
+                    fts.execute(params![id, normalize_fts(&m.subject), normalize_fts(&format!("{} {}", m.from_name, m.from_addr))])?;
                     assign_thread(&tx, account_id, id, m.message_id.as_deref(), m.in_reply_to.as_deref(), m.refs.as_deref())?;
                     if !m.from_addr.is_empty() {
                         let _ = bump_contact.execute(params![m.from_addr.to_lowercase(), m.from_addr, m.from_name, 1i64]);
@@ -471,7 +471,7 @@ impl Db {
             tx.prepare_cached("UPDATE messages SET has_body = 1, snippet = ?, has_attachments = ?, attachment_names = ? WHERE id = ?")?
                 .execute(params![info.snippet, info.has_attachments, info.attachment_names, id])?;
             tx.prepare_cached("UPDATE messages_fts SET body = ? WHERE rowid = ?")?
-                .execute(params![info.search_text, id])?;
+                .execute(params![normalize_fts(&info.search_text), id])?;
         }
         tx.commit()?;
         Ok(())
@@ -511,7 +511,7 @@ impl Db {
                     };
                     Self::upsert_blob_in_tx(&tx, account_id, id, message_id.as_deref(), &compressed)?;
                     upd_msg.execute(params![info.snippet, id])?;
-                    upd_fts.execute(params![info.search_text, id])?;
+                    upd_fts.execute(params![normalize_fts(&info.search_text), id])?;
                     stored += 1;
                 }
             }
@@ -599,7 +599,7 @@ impl Db {
                         let blob_bytes = if stored_raw.starts_with(ZLIB_MAGIC) { stored_raw } else { compress_raw(&stored_raw) };
                         Self::upsert_blob_in_tx(&tx, account_id, id, Some(&mid), &blob_bytes)?;
                         upd_msg.execute(params![snippet, has_att, id])?;
-                        upd_fts.execute(params![search_text, id])?;
+                        upd_fts.execute(params![normalize_fts(&search_text), id])?;
                         hydrated += 1;
                         continue;
                     }
@@ -615,7 +615,7 @@ impl Db {
                             Self::upsert_blob_in_tx(&tx, account_id, id, Some(&mid), &blob_bytes)?;
                         }
                         upd_msg.execute(params![snippet, has_att, id])?;
-                        upd_fts.execute(params![search_text, id])?;
+                        upd_fts.execute(params![normalize_fts(&search_text), id])?;
                         hydrated += 1;
                     }
                 }

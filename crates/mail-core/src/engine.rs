@@ -524,7 +524,7 @@ impl Engine {
     /// bodies not cached yet. Hits are stored locally; returns them newest first.
     pub async fn search_server(&self, query: &str, scope: &SearchScope) -> Result<Vec<MessageSummary>> {
         let parsed = crate::search::parse_search_query(query, scope);
-        if parsed.has_operators {
+        if parsed.has_operators || parsed.has_boolean {
             if !crate::search::has_criteria(&parsed.query) {
                 return Ok(vec![]);
             }
@@ -536,9 +536,14 @@ impl Engine {
                     return Err(anyhow!(err));
                 }
             }
+            if parsed.has_boolean {
+                if let Some(expr) = parsed.expr {
+                    return self.db.search_expr(&expr, scope, parsed.has_in_scope, 300);
+                }
+            }
             return Ok(res.rows);
         }
-        let terms: Vec<String> = query.split_whitespace().map(|t| t.trim_matches('"').to_string()).filter(|t| !t.is_empty()).collect();
+        let terms = imap::search_terms(query);
         if terms.is_empty() {
             return Ok(vec![]);
         }

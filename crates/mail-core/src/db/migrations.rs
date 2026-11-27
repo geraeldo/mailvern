@@ -34,7 +34,23 @@ CREATE TABLE IF NOT EXISTS moved_bodies (
 /// Rules: never edit or reorder a shipped entry. To change the schema, append a new
 /// entry (e.g. `ALTER TABLE messages ADD COLUMN ...`). Each one runs once, in a
 /// transaction, and the database is backed up before any upgrade.
-pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12];
+pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13];
+
+/// v13: normalize multiplication/cross lookalikes (`×`, `✕`, `✖`) to ASCII `x` in `messages_fts`
+/// so queries like `AQUA x MPL` match subjects indexed with `AQUA × MPL`.
+pub(super) const V13: &str = r#"
+UPDATE messages_fts
+SET subject = replace(replace(replace(subject, '×', 'x'), '✕', 'x'), '✖', 'x')
+WHERE subject LIKE '%×%' OR subject LIKE '%✕%' OR subject LIKE '%✖%';
+
+UPDATE messages_fts
+SET sender = replace(replace(replace(sender, '×', 'x'), '✕', 'x'), '✖', 'x')
+WHERE sender LIKE '%×%' OR sender LIKE '%✕%' OR sender LIKE '%✖%';
+
+UPDATE messages_fts
+SET body = replace(replace(replace(body, '×', 'x'), '✕', 'x'), '✖', 'x')
+WHERE body LIKE '%×%' OR body LIKE '%✕%' OR body LIKE '%✖%';
+"#;
 
 /// v12: attachment filename search column, saved searches, and per-account/per-folder MCP read access.
 pub(super) const V12: &str = r#"

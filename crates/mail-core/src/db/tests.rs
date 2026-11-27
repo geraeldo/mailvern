@@ -896,3 +896,71 @@ fn boolean_search_filename_size_saved_searches_and_mcp_allowlist_work() {
     assert_eq!(r.total, 1);
     assert_eq!(r.rows[0].from_addr, "billing@stripe.com");
 }
+
+#[test]
+fn search_handles_standalone_punctuation_and_multiplication_sign() {
+    let db = Db::open(&temp_db()).unwrap();
+    let acc = db.save_account(&account()).unwrap();
+    let inbox = db.upsert_folder(acc, "INBOX", "Inbox", Some("inbox")).unwrap();
+
+    let mut m1 = msg(1, false);
+    m1.subject = "Quotation - AQUA x MPL S18".into();
+    m1.has_attachments = true;
+
+    let mut m2 = msg(2, false);
+    m2.subject = "Quotation - AQUA × MPL S18".into();
+    m2.has_attachments = true;
+
+    let mut m3 = msg(3, false);
+    m3.subject = "Quotation - Other Project".into();
+
+    db.insert_messages(acc, inbox, &[m1, m2, m3]).unwrap();
+
+    // Plain FTS search with standalone `-` and both `x` and `×` matches both m1 and m2.
+    assert_eq!(db.search("Quotation - AQUA x MPL S18", &SearchScope::All, 50).unwrap().len(), 2);
+    assert_eq!(db.search("Quotation - AQUA × MPL S18", &SearchScope::All, 50).unwrap().len(), 2);
+
+    // Operator/boolean search_expr path must not fail on standalone `-`.
+    let run_expr = |q: &str| {
+        let p = crate::search::parse_search_query(q, &SearchScope::All);
+        db.search_expr(&p.expr.unwrap(), &SearchScope::All, p.has_in_scope, 50).unwrap()
+    };
+    assert_eq!(run_expr("has:attachment Quotation - AQUA x MPL S18").len(), 2);
+    assert_eq!(run_expr("in:inbox Quotation - AQUA × MPL S18").len(), 2);
+    assert_eq!(run_expr(r#""Quotation - AQUA x MPL S18""#).len(), 2);
+    assert_eq!(run_expr(r#"subject:"Quotation - AQUA x MPL S18""#).len(), 2);
+}
+
+#[test]
+fn v12_upgrades_to_v13_and_normalizes_fts_multiplication_signs() {
+    let path = temp_db();
+    {
+        let mut conn = Connection::open(&path).unwrap();
+        migrate_with(&mut conn, &path, &MIGRATIONS[..12]).unwrap();
+        conn.execute(
+            "INSERT INTO accounts (name, email, imap_host, imap_port, smtp_host, smtp_port) VALUES ('Me', 'me@x.com', 'i', 993, 's', 465)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO folders (account_id, path, name, role, uidvalidity, synced) VALUES (1, 'INBOX', 'Inbox', 'inbox', 1, 1)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO messages (account_id, folder_id, uid, subject, from_name, from_addr, date, sort_date)
+             VALUES (1, 1, 1, 'Quotation - AQUA × MPL S18', 'Sales', 'sales@example.com', 100, 100)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages_fts (rowid, subject, sender, body)
+             VALUES (1, 'Quotation - AQUA × MPL S18', 'Sales sales@example.com', 'Collab AQUA ✕ MPL')",
+            [],
+        )
+        .unwrap();
+    }
+    let db = Db::open(&path).unwrap();
+    assert_eq!(version(&path), SCHEMA_VERSION);
+    let hits = db.search("Quotation - AQUA x MPL S18", &SearchScope::All, 50).unwrap();
+    assert_eq!(hits.len(), 1);
+    // Displayed subject in `messages` keeps the original `×` character.
+    assert_eq!(hits[0].subject, "Quotation - AQUA × MPL S18");
+}

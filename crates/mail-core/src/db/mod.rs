@@ -5,6 +5,7 @@ mod migrations;
 mod outbox;
 mod rules;
 mod search;
+pub(crate) use search::normalize_fts;
 #[cfg(test)]
 mod tests;
 
@@ -224,7 +225,7 @@ impl Db {
             let mut upd_fts = tx.prepare_cached("UPDATE messages_fts SET body = ? WHERE rowid = ?")?;
             for (id, snippet, search_text) in updates {
                 upd_msg.execute(params![snippet, id])?;
-                upd_fts.execute(params![search_text, id])?;
+                upd_fts.execute(params![search::normalize_fts(&search_text), id])?;
             }
         }
         tx.execute(
