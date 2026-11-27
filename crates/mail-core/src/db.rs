@@ -92,6 +92,7 @@ pub struct PendingOp {
 }
 
 /// Header-level data for a message, as stored after a sync.
+#[derive(Clone)]
 pub struct NewMessage {
     pub uid: u32,
     pub message_id: Option<String>,
@@ -116,10 +117,12 @@ pub struct NewMessage {
 }
 
 /// Summary fields computed from a full message body.
+#[derive(Default)]
 pub struct BodyInfo {
     pub snippet: String,
     pub search_text: String,
     pub has_attachments: bool,
+    pub attachment_names: String,
 }
 
 /// Per-connection settings. Not part of the schema; applied on every open.
@@ -157,7 +160,30 @@ CREATE TABLE IF NOT EXISTS moved_bodies (
 /// Rules: never edit or reorder a shipped entry. To change the schema, append a new
 /// entry (e.g. `ALTER TABLE messages ADD COLUMN ...`). Each one runs once, in a
 /// transaction, and the database is backed up before any upgrade.
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12];
+
+/// v12: attachment filename search column, saved searches, and per-account/per-folder MCP read access.
+const V12: &str = r#"
+ALTER TABLE messages ADD COLUMN attachment_names TEXT NOT NULL DEFAULT '';
+
+CREATE TABLE IF NOT EXISTS saved_searches (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  query TEXT NOT NULL,
+  scope_json TEXT NOT NULL DEFAULT '{"kind":"all"}',
+  position INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS agent_account_access (
+  account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+  allowed INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_folder_access (
+  folder_id INTEGER PRIMARY KEY REFERENCES folders(id) ON DELETE CASCADE,
+  allowed INTEGER NOT NULL
+);
+"#;
 
 /// v11: denormalized `sort_date` for indexed message/thread sorting, partial indexes for unread
 /// and unassigned-thread lookups, deduplicated compressed `raw_blobs`, and incremental `contacts_cache`.
@@ -626,9 +652,112 @@ fn fts_query(q: &str) -> Option<String> {
     }
 }
 
+/// Turns a quoted phrase into a safe FTS5 exact phrase query (no trailing wildcard).
+fn fts_phrase(q: &str) -> Option<String> {
+    let cleaned: Vec<String> = q
+        .split_whitespace()
+        .map(|t| t.replace(['"', '\0'], ""))
+        .filter(|t| !t.is_empty())
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(format!("\"{}\"", cleaned.join(" ")))
+    }
+}
+
 /// A LIKE pattern matching `s` anywhere (with `ESCAPE '\'`).
 fn like_any(s: &str) -> String {
     format!("%{}%", s.trim().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
+}
+
+/// Compiles a `SearchExpr` AST into a parameterized SQLite predicate over `messages m`.
+fn compile_search_expr(expr: &crate::search::SearchExpr, args: &mut Vec<rusqlite::types::Value>) -> String {
+    use crate::search::{SearchExpr, SearchTerm};
+    use rusqlite::types::Value;
+    let mut arg = |v: Value| {
+        args.push(v);
+        format!("?{}", args.len())
+    };
+    match expr {
+        SearchExpr::Term(term) => match term {
+            SearchTerm::Text(t) => match fts_query(t) {
+                Some(fts) => {
+                    let p = arg(Value::Text(fts));
+                    format!("m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH {p})")
+                }
+                None => "1".into(),
+            },
+            SearchTerm::Phrase(p) => match fts_phrase(p) {
+                Some(fts) => {
+                    let param = arg(Value::Text(fts));
+                    format!("m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH {param})")
+                }
+                None => "1".into(),
+            },
+            SearchTerm::Subject(s) => match fts_query(s) {
+                Some(fts) => {
+                    let p = arg(Value::Text(format!("subject : ({fts})")));
+                    format!("m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH {p})")
+                }
+                None => "1".into(),
+            },
+            SearchTerm::Body(b) => match fts_query(b) {
+                Some(fts) => {
+                    let p = arg(Value::Text(format!("body : ({fts})")));
+                    format!("m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH {p})")
+                }
+                None => "1".into(),
+            },
+            SearchTerm::From(f) => {
+                let p = arg(Value::Text(like_any(f)));
+                format!("(m.from_name LIKE {p} ESCAPE '\\' OR m.from_addr LIKE {p} ESCAPE '\\')")
+            }
+            SearchTerm::To(t) => {
+                let p = arg(Value::Text(like_any(t)));
+                format!(
+                    "(EXISTS (SELECT 1 FROM json_each(m.to_json) j WHERE json_extract(j.value, '$.email') LIKE {p} ESCAPE '\\' OR COALESCE(json_extract(j.value, '$.name'), '') LIKE {p} ESCAPE '\\') \
+                      OR EXISTS (SELECT 1 FROM json_each(m.cc_json) j WHERE json_extract(j.value, '$.email') LIKE {p} ESCAPE '\\' OR COALESCE(json_extract(j.value, '$.name'), '') LIKE {p} ESCAPE '\\'))"
+                )
+            }
+            SearchTerm::Filename(f) => {
+                let p = arg(Value::Text(like_any(f)));
+                format!("m.attachment_names LIKE {p} ESCAPE '\\'")
+            }
+            SearchTerm::After(ts) => format!("m.date >= {}", arg(Value::Integer(*ts))),
+            SearchTerm::Before(ts) => format!("m.date < {}", arg(Value::Integer(*ts))),
+            SearchTerm::Larger(bytes) => format!("m.size >= {}", arg(Value::Integer(*bytes))),
+            SearchTerm::Smaller(bytes) => format!("m.size < {}", arg(Value::Integer(*bytes))),
+            SearchTerm::Unread(u) => format!("m.seen = {}", if *u { 0 } else { 1 }),
+            SearchTerm::Flagged(f) => format!("m.flagged = {}", *f as i32),
+            SearchTerm::HasAttachment(a) => format!("m.has_attachments = {}", *a as i32),
+            SearchTerm::InRole(role) => {
+                if role == "all" {
+                    "1".into()
+                } else {
+                    let p = arg(Value::Text(role.clone()));
+                    format!("m.folder_id IN (SELECT id FROM folders WHERE role = {p})")
+                }
+            }
+        },
+        SearchExpr::Not(inner) => format!("NOT ({})", compile_search_expr(inner, args)),
+        SearchExpr::And(parts) => {
+            if parts.is_empty() {
+                "1".into()
+            } else {
+                let sqls: Vec<String> = parts.iter().map(|p| compile_search_expr(p, args)).collect();
+                format!("({})", sqls.join(" AND "))
+            }
+        }
+        SearchExpr::Or(parts) => {
+            if parts.is_empty() {
+                "0".into()
+            } else {
+                let sqls: Vec<String> = parts.iter().map(|p| compile_search_expr(p, args)).collect();
+                format!("({})", sqls.join(" OR "))
+            }
+        }
+    }
 }
 
 /// The WHERE clause (over `messages m`) and its parameters for a structured query.
@@ -676,6 +805,16 @@ fn query_where(q: &MailQuery) -> Result<(String, Vec<rusqlite::types::Value>)> {
             w.push(format!("(({all}) OR m.id IN ({}))", ids.join(",")));
         }
     }
+    if let Some(fname) = nonempty(&q.filename) {
+        let p = arg(Value::Text(like_any(&fname)));
+        w.push(format!("m.attachment_names LIKE {p} ESCAPE '\\'"));
+    }
+    if let Some(bytes) = q.larger {
+        w.push(format!("m.size >= {}", arg(Value::Integer(bytes))));
+    }
+    if let Some(bytes) = q.smaller {
+        w.push(format!("m.size < {}", arg(Value::Integer(bytes))));
+    }
     if let Some(t) = q.after {
         w.push(format!("m.date >= {}", arg(Value::Integer(t))));
     }
@@ -704,14 +843,37 @@ fn query_where(q: &MailQuery) -> Result<(String, Vec<rusqlite::types::Value>)> {
         }
         w.push(format!("m.folder_id IN (SELECT id FROM folders WHERE role = {})", arg(Value::Text(role))));
     }
+    if let Some(allowed) = &q.allowed_folders {
+        if allowed.is_empty() {
+            w.push("0".into());
+        } else {
+            let list: String = allowed.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+            w.push(format!("m.folder_id IN ({list})"));
+            // Also exclude messages whose Message-ID sits in a hidden folder of the same account
+            // (e.g. a Spam/Trash copy also present in Gmail's All Mail).
+            w.push(format!(
+                "(m.message_id IS NULL OR NOT EXISTS (SELECT 1 FROM messages h WHERE h.account_id = m.account_id AND h.message_id = m.message_id AND h.folder_id NOT IN ({list})))"
+            ));
+        }
+    }
     // The same message can sit in several folders (Gmail keeps everything in All Mail too).
     // Without a folder filter, count it once, preferring a folder other than All Mail.
     if q.folder_id.is_none() && nonempty(&q.role).is_none() {
-        w.push(
-            "(m.message_id IS NULL OR m.id = (SELECT d.id FROM messages d JOIN folders df ON df.id = d.folder_id
-              WHERE d.account_id = m.account_id AND d.message_id = m.message_id ORDER BY df.role IS 'all', d.id LIMIT 1))"
-                .into(),
-        );
+        if let Some(allowed) = &q.allowed_folders {
+            if !allowed.is_empty() {
+                let list: String = allowed.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+                w.push(format!(
+                    "(m.message_id IS NULL OR m.id = (SELECT d.id FROM messages d JOIN folders df ON df.id = d.folder_id
+                      WHERE d.account_id = m.account_id AND d.message_id = m.message_id AND d.folder_id IN ({list}) ORDER BY df.role IS 'all', d.id LIMIT 1))"
+                ));
+            }
+        } else {
+            w.push(
+                "(m.message_id IS NULL OR m.id = (SELECT d.id FROM messages d JOIN folders df ON df.id = d.folder_id
+                  WHERE d.account_id = m.account_id AND d.message_id = m.message_id ORDER BY df.role IS 'all', d.id LIMIT 1))"
+                    .into(),
+            );
+        }
     }
     Ok((if w.is_empty() { "1".into() } else { w.join(" AND ") }, args))
 }
@@ -1690,8 +1852,8 @@ impl Db {
             .optional()?;
         if let Some((id, account_id, message_id)) = row {
             Self::upsert_blob_in_tx(&tx, account_id, id, message_id.as_deref(), &compressed)?;
-            tx.prepare_cached("UPDATE messages SET has_body = 1, snippet = ?, has_attachments = ? WHERE id = ?")?
-                .execute(params![info.snippet, info.has_attachments, id])?;
+            tx.prepare_cached("UPDATE messages SET has_body = 1, snippet = ?, has_attachments = ?, attachment_names = ? WHERE id = ?")?
+                .execute(params![info.snippet, info.has_attachments, info.attachment_names, id])?;
             tx.prepare_cached("UPDATE messages_fts SET body = ? WHERE rowid = ?")?
                 .execute(params![info.search_text, id])?;
         }
@@ -1720,7 +1882,7 @@ impl Db {
         {
             let mut find_id = tx.prepare_cached("SELECT id, account_id, message_id FROM messages WHERE folder_id = ? AND uid = ?")?;
             let mut upd_msg = tx.prepare_cached("UPDATE messages SET has_body = 1, snippet = ?, has_attachments = 0 WHERE id = ?")?;
-            let mut mark_att = tx.prepare_cached("UPDATE messages SET has_attachments = 1 WHERE id = ?")?;
+            let mut mark_att = tx.prepare_cached("UPDATE messages SET has_attachments = 1, attachment_names = ? WHERE id = ?")?;
             let mut upd_fts = tx.prepare_cached("UPDATE messages_fts SET body = ? WHERE rowid = ?")?;
             for (uid, comp, info) in prepared {
                 let row: Option<(i64, i64, Option<String>)> = find_id
@@ -1728,7 +1890,7 @@ impl Db {
                     .optional()?;
                 if let Some((id, account_id, message_id)) = row {
                     let Some(compressed) = comp else {
-                        mark_att.execute(params![id])?;
+                        mark_att.execute(params![info.attachment_names, id])?;
                         continue;
                     };
                     Self::upsert_blob_in_tx(&tx, account_id, id, message_id.as_deref(), &compressed)?;
@@ -2143,6 +2305,71 @@ impl Db {
         let mut st = c.prepare(&sql)?;
         let rows = st.query_map(params![fts, limit], row_to_summary)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    fn search_expr_where(
+        expr: &crate::search::SearchExpr,
+        scope: &SearchScope,
+        has_in_scope: bool,
+        unread_only: bool,
+    ) -> Result<(String, Vec<rusqlite::types::Value>)> {
+        let mut args: Vec<rusqlite::types::Value> = Vec::new();
+        let mut w: Vec<String> = Vec::new();
+        match scope {
+            SearchScope::All => {}
+            SearchScope::Account { account_id } => {
+                args.push(rusqlite::types::Value::Integer(*account_id));
+                w.push(format!("m.account_id = ?{}", args.len()));
+            }
+            SearchScope::Unified { role } if !has_in_scope => {
+                w.push(scope_sql(&View::Unified { role: role.clone() })?);
+            }
+            SearchScope::Folder { folder_id } if !has_in_scope => {
+                w.push(scope_sql(&View::Folder { folder_id: *folder_id })?);
+            }
+            SearchScope::Unified { .. } | SearchScope::Folder { .. } => {}
+        }
+        w.push(compile_search_expr(expr, &mut args));
+        if unread_only {
+            w.push("m.seen = 0".into());
+        }
+        // Deduplicate copies across Gmail's All Mail when not pinned to a single folder/role.
+        if has_in_scope || matches!(scope, SearchScope::All | SearchScope::Account { .. }) {
+            w.push(
+                "(m.message_id IS NULL OR m.id = (SELECT d.id FROM messages d JOIN folders df ON df.id = d.folder_id
+                  WHERE d.account_id = m.account_id AND d.message_id = m.message_id ORDER BY df.role IS 'all', d.id LIMIT 1))"
+                    .into(),
+            );
+        }
+        Ok((w.join(" AND "), args))
+    }
+
+    /// Evaluates a parsed boolean search AST (`OR`, parentheses, `-negation`, phrases, `filename:`, `larger:`/`smaller:`, etc.).
+    pub fn search_expr(
+        &self,
+        expr: &crate::search::SearchExpr,
+        scope: &SearchScope,
+        has_in_scope: bool,
+        limit: i64,
+    ) -> Result<Vec<MessageSummary>> {
+        let (filter, args) = Self::search_expr_where(expr, scope, has_in_scope, false)?;
+        let c = self.r();
+        let sql = format!("SELECT {SUMMARY_COLS} FROM messages m WHERE {filter} ORDER BY m.date DESC, m.id DESC LIMIT {limit}");
+        let mut st = c.prepare(&sql)?;
+        let rows = st.query_map(rusqlite::params_from_iter(args.iter()), row_to_summary)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Counts unread messages matching a parsed boolean search AST (for Saved Search badges).
+    pub fn count_search_expr_unread(&self, expr: &crate::search::SearchExpr, scope: &SearchScope, has_in_scope: bool) -> Result<i64> {
+        let (filter, args) = Self::search_expr_where(expr, scope, has_in_scope, true)?;
+        let c = self.r();
+        let n: i64 = c.query_row(
+            &format!("SELECT COUNT(*) FROM messages m WHERE {filter}"),
+            rusqlite::params_from_iter(args.iter()),
+            |r| r.get(0),
+        )?;
+        Ok(n)
     }
 
     /// Structured search: one page of matches, newest first (or oldest first), and the total.
@@ -2950,6 +3177,161 @@ impl Db {
         Ok(())
     }
 
+    /// Account ids explicitly hidden from MCP agents.
+    pub fn agent_disabled_accounts(&self) -> Result<Vec<i64>> {
+        let c = self.r();
+        let mut s = c.prepare("SELECT account_id FROM agent_account_access WHERE allowed = 0 ORDER BY account_id")?;
+        let rows = s.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn set_agent_account_allowed(&self, account_id: i64, allowed: bool) -> Result<()> {
+        let c = self.c();
+        if allowed {
+            c.execute("DELETE FROM agent_account_access WHERE account_id = ?", [account_id])?;
+        } else {
+            c.execute(
+                "INSERT INTO agent_account_access (account_id, allowed) VALUES (?, 0)
+                 ON CONFLICT(account_id) DO UPDATE SET allowed = 0",
+                [account_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Explicit per-folder MCP read visibility overrides (`folder_id -> allowed`).
+    pub fn agent_folder_overrides(&self) -> Result<std::collections::HashMap<i64, bool>> {
+        let c = self.r();
+        let mut s = c.prepare("SELECT folder_id, allowed FROM agent_folder_access")?;
+        let mut out = std::collections::HashMap::new();
+        for r in s.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? != 0)))? {
+            let (id, allowed) = r?;
+            out.insert(id, allowed);
+        }
+        Ok(out)
+    }
+
+    pub fn set_agent_folder_allowed(&self, folder_id: i64, allowed: Option<bool>) -> Result<()> {
+        let c = self.c();
+        match allowed {
+            Some(v) => {
+                c.execute(
+                    "INSERT INTO agent_folder_access (folder_id, allowed) VALUES (?, ?)
+                     ON CONFLICT(folder_id) DO UPDATE SET allowed = excluded.allowed",
+                    params![folder_id, v as i64],
+                )?;
+            }
+            None => {
+                c.execute("DELETE FROM agent_folder_access WHERE folder_id = ?", [folder_id])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns `(account_id, folder_id, role)` for the given message AND every other folder copy
+    /// sharing its `(account_id, message_id)` (e.g. Spam/Trash vs Gmail's All Mail).
+    pub fn message_folder_copies(&self, message_id: i64) -> Result<Vec<(i64, i64, Option<String>)>> {
+        let c = self.r();
+        let Some((account_id, folder_id, role, mid)): Option<(i64, i64, Option<String>, Option<String>)> = c
+            .query_row(
+                "SELECT m.account_id, m.folder_id, f.role, m.message_id
+                 FROM messages m JOIN folders f ON f.id = m.folder_id WHERE m.id = ?",
+                [message_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?
+        else {
+            return Ok(vec![]);
+        };
+        let Some(mid) = mid else {
+            return Ok(vec![(account_id, folder_id, role)]);
+        };
+        let mut s = c.prepare(
+            "SELECT DISTINCT m.account_id, m.folder_id, f.role
+             FROM messages m JOIN folders f ON f.id = m.folder_id
+             WHERE m.account_id = ?1 AND m.message_id = ?2",
+        )?;
+        let rows = s.query_map(params![account_id, mid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    // ---------- saved searches ----------
+
+    pub fn saved_searches(&self) -> Result<Vec<SavedSearch>> {
+        let c = self.r();
+        let mut s = c.prepare("SELECT id, name, query, scope_json, position FROM saved_searches ORDER BY position ASC, id ASC")?;
+        let rows = s.query_map([], |r| {
+            let scope_json: String = r.get(3)?;
+            let scope: SearchScope = serde_json::from_str(&scope_json).unwrap_or_default();
+            Ok(SavedSearch {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                query: r.get(2)?,
+                scope,
+                position: r.get(4)?,
+                unread: 0,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn save_saved_search(&self, id: i64, name: &str, query: &str, scope: &SearchScope) -> Result<SavedSearch> {
+        let name = name.trim();
+        let query = query.trim();
+        if name.is_empty() {
+            return Err(anyhow!("Give the saved search a name"));
+        }
+        if query.is_empty() {
+            return Err(anyhow!("Enter a search query"));
+        }
+        let scope_json = serde_json::to_string(scope)?;
+        let c = self.c();
+        let final_id = if id > 0 {
+            let n = c.execute(
+                "UPDATE saved_searches SET name = ?, query = ?, scope_json = ? WHERE id = ?",
+                params![name, query, scope_json, id],
+            )?;
+            if n == 0 {
+                return Err(anyhow!("Saved search {id} no longer exists"));
+            }
+            id
+        } else {
+            let pos: i64 = c.query_row("SELECT COALESCE(MAX(position), -1) + 1 FROM saved_searches", [], |r| r.get(0))?;
+            c.execute(
+                "INSERT INTO saved_searches (name, query, scope_json, position) VALUES (?, ?, ?, ?)",
+                params![name, query, scope_json, pos],
+            )?;
+            c.last_insert_rowid()
+        };
+        let pos: i64 = c.query_row("SELECT position FROM saved_searches WHERE id = ?", [final_id], |r| r.get(0))?;
+        Ok(SavedSearch {
+            id: final_id,
+            name: name.to_string(),
+            query: query.to_string(),
+            scope: scope.clone(),
+            position: pos,
+            unread: 0,
+        })
+    }
+
+    pub fn delete_saved_search(&self, id: i64) -> Result<()> {
+        self.c().execute("DELETE FROM saved_searches WHERE id = ?", [id])?;
+        Ok(())
+    }
+
+    pub fn reorder_saved_searches(&self, ids: &[i64]) -> Result<()> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        {
+            let mut st = tx.prepare_cached("UPDATE saved_searches SET position = ? WHERE id = ?")?;
+            for (pos, id) in ids.iter().enumerate() {
+                st.execute(params![pos as i64, id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn insert_agent_action(
         &self,
@@ -3304,7 +3686,7 @@ mod tests {
             to: vec![Addr { name: Some("Budi".into()), email: "budi@contoh.id".into() }],
             ..from(9, "Me", "me@example.com", "Re: Notulen rapat", 400)
         }]).unwrap();
-        db.store_body(inbox, 3, b"", &BodyInfo { snippet: "".into(), search_text: "agenda anggaran kuartal".into(), has_attachments: true }).unwrap();
+        db.store_body(inbox, 3, b"", &BodyInfo { snippet: "".into(), search_text: "agenda anggaran kuartal".into(), has_attachments: true, attachment_names: "report.pdf".into() }).unwrap();
 
         let q = |q: MailQuery| db.query_mail(&q).unwrap();
         let subjects = |r: MailQueryResult| r.rows.into_iter().map(|m| m.subject).collect::<Vec<_>>();
@@ -3739,7 +4121,7 @@ mod tests {
 
         let ids = db.insert_messages(acc, inbox, &[mail(1, "<m1>", None, None, 100)]).unwrap();
         let raw = vec![b'x'; 1024];
-        let info = BodyInfo { snippet: "hello".into(), search_text: "hello world".into(), has_attachments: false };
+        let info = BodyInfo { snippet: "hello".into(), search_text: "hello world".into(), has_attachments: false, ..Default::default() };
         db.store_bodies_batch(inbox, &[(1, raw.clone(), info)]).unwrap();
 
         // Cross-folder dedup (Gmail labels): Work has same Message-ID -> hydrates locally.
@@ -3796,8 +4178,8 @@ mod tests {
             .store_bodies_batch(
                 inbox,
                 &[
-                    (1, b"plain body".to_vec(), BodyInfo { snippet: "plain".into(), search_text: "plain".into(), has_attachments: false }),
-                    (4, b"has pdf".to_vec(), BodyInfo { snippet: "pdf".into(), search_text: "pdf".into(), has_attachments: true }),
+                    (1, b"plain body".to_vec(), BodyInfo { snippet: "plain".into(), search_text: "plain".into(), has_attachments: false, ..Default::default() }),
+                    (4, b"has pdf".to_vec(), BodyInfo { snippet: "pdf".into(), search_text: "pdf".into(), has_attachments: true, attachment_names: "doc.pdf".into() }),
                 ],
             )
             .unwrap();
@@ -3903,6 +4285,7 @@ mod tests {
                     snippet: "<!DOCTYPE html><html><head><style>p{color:red}</style></head>".into(),
                     search_text: "<!DOCTYPE html><html>".into(),
                     has_attachments: false,
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -3914,6 +4297,7 @@ mod tests {
                     snippet: "Use Vec<String> instead of <div>.".into(),
                     search_text: "Use Vec<String> instead of <div>.".into(),
                     has_attachments: false,
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -3932,5 +4316,83 @@ mod tests {
         let fts_hits = db.search("Semangat", &SearchScope::Folder { folder_id: inbox }, 10).unwrap();
         assert_eq!(fts_hits.len(), 1);
         assert_eq!(fts_hits[0].id, id_html);
+    }
+
+    #[test]
+    fn boolean_search_filename_size_saved_searches_and_mcp_allowlist_work() {
+        let db = Db::open(&temp_db()).unwrap();
+        let acc = db.save_account(&account()).unwrap();
+        let inbox = db.upsert_folder(acc, "INBOX", "Inbox", Some("inbox")).unwrap();
+        let spam = db.upsert_folder(acc, "Spam", "Spam", Some("junk")).unwrap();
+        let all_mail = db.upsert_folder(acc, "[Gmail]/All Mail", "All Mail", Some("all")).unwrap();
+
+        let mut m1 = msg(1, false);
+        m1.message_id = Some("<inv1@x>".into());
+        m1.from_addr = "billing@stripe.com".into();
+        m1.subject = "Quarterly report invoice".into();
+        m1.size = 6 * 1024 * 1024;
+        m1.has_attachments = true;
+
+        let mut m2 = msg(2, true);
+        m2.message_id = Some("<rec2@x>".into());
+        m2.from_addr = "ana@acme.co".into();
+        m2.subject = "Receipt for coffee".into();
+        m2.size = 50 * 1024;
+
+        let mut m3 = msg(3, false);
+        m3.message_id = Some("<spam3@x>".into());
+        m3.from_addr = "promo@spam.example".into();
+        m3.subject = "Invoice urgent prize".into();
+        m3.size = 10 * 1024;
+
+        db.insert_messages(acc, inbox, &[m1, m2]).unwrap();
+        db.insert_messages(acc, spam, &[m3.clone()]).unwrap();
+        // Gmail-style copy of spam in All Mail.
+        db.insert_messages(acc, all_mail, &[NewMessage { uid: 99, ..m3 }]).unwrap();
+        db.store_body(
+            inbox,
+            1,
+            b"",
+            &BodyInfo {
+                snippet: "Q4".into(),
+                search_text: "quarterly report attached".into(),
+                has_attachments: true,
+                attachment_names: "Q4-invoice.pdf\nsummary.xlsx".into(),
+            },
+        )
+        .unwrap();
+
+        let run = |q: &str| {
+            let p = crate::search::parse_search_query(q, &SearchScope::All);
+            db.search_expr(&p.expr.unwrap(), &SearchScope::All, p.has_in_scope, 50).unwrap()
+        };
+        assert_eq!(run("invoice OR receipt").len(), 3);
+        assert_eq!(run("(invoice OR receipt) -from:spam.example").len(), 2);
+        assert_eq!(run(r#""quarterly report""#).len(), 1);
+        assert_eq!(run("filename:pdf").len(), 1);
+        assert_eq!(run("filename:xlsx").len(), 1);
+        assert_eq!(run("larger:5M").len(), 1);
+        assert_eq!(run("smaller:100K -from:spam.example").len(), 1);
+
+        // Saved searches CRUD + reorder + unread count.
+        let s1 = db.save_saved_search(0, "Invoices", "invoice -from:spam.example", &SearchScope::All).unwrap();
+        let s2 = db.save_saved_search(0, "Receipts", "receipt", &SearchScope::All).unwrap();
+        db.reorder_saved_searches(&[s2.id, s1.id]).unwrap();
+        let list = db.saved_searches().unwrap();
+        assert_eq!(list.iter().map(|s| s.id).collect::<Vec<_>>(), vec![s2.id, s1.id]);
+        let p = crate::search::parse_search_query(&s1.query, &s1.scope);
+        assert_eq!(db.count_search_expr_unread(&p.expr.unwrap(), &s1.scope, p.has_in_scope).unwrap(), 1);
+        db.delete_saved_search(s2.id).unwrap();
+        assert_eq!(db.saved_searches().unwrap().len(), 1);
+
+        // MCP allowlist excludes spam AND its All Mail copy.
+        let q = MailQuery {
+            text: Some("invoice".into()),
+            allowed_folders: Some(vec![inbox, all_mail]),
+            ..Default::default()
+        };
+        let r = db.query_mail(&q).unwrap();
+        assert_eq!(r.total, 1);
+        assert_eq!(r.rows[0].from_addr, "billing@stripe.com");
     }
 }

@@ -5,7 +5,7 @@
   import {
     ui, openMessage, loadMore, viewTitle, setQuery, openAccountSettings, openSettings, clickRow, isSelected, roleOf,
     editDraft, accountById, folderById, beginSearch, searchScopes, scopeKey, scopeLabel, setSearchScope, setView,
-    compose, toggleSidebar, aiSourceTurn, aiRunning, prewarmMessage, emptyFolderView,
+    compose, toggleSidebar, aiSourceTurn, aiRunning, prewarmMessage, emptyFolderView, openSaveSearchModal,
   } from "../state.svelte";
   import { hint } from "../shortcuts.svelte";
   import { messageMenu } from "../menus";
@@ -44,6 +44,7 @@
   // Picks up a search already in progress (an AI answer, or words typed before a reload).
   let searchOpen = $state(!!ui.query || !!ui.ai);
   let draft = $state(ui.query);
+  let showTips = $state(false);
   let loadingMore = false;
 
   const start = $derived(Math.max(0, Math.floor(scrollTop / ROW) - OVERSCAN));
@@ -167,9 +168,10 @@
   const FILTER_CHIPS: FilterChip[] = [
     makeChip("is:unread", "Unread", true),
     makeChip("is:flagged", "Flagged", true),
-    makeChip("has:attachment", "Has attachment", true),
+    makeChip("has:attachment", "Attachment", true),
     makeChip("from:", "from:"),
-    makeChip("subject:", "subject:"),
+    makeChip("filename:", "filename:"),
+    makeChip("larger:5M", "≥ 5 MB", true),
     makeChip("after:7d", "Last 7d", true),
   ];
 
@@ -201,11 +203,23 @@
     return null;
   });
 
+  function saveCurrentSearch() {
+    if (!draft.trim()) return;
+    if (ui.query !== draft) {
+      clearTimeout(timer);
+      lastQuery = draft;
+      setQuery(draft);
+    }
+    const existing = ui.activeSavedSearchId ? ui.savedSearches.find((s) => s.id === ui.activeSavedSearchId) : undefined;
+    openSaveSearchModal(existing);
+  }
+
   function closeSearch() {
     clearTimeout(timer);
     stopAiIfLoaded();
     lastQuery = "";
     draft = "";
+    showTips = false;
     searchOpen = false;
     if (ui.query) setQuery("");
   }
@@ -244,6 +258,17 @@
           }}
           placeholder="Search {scopeLabel(ui.searchScope)}"
           spellcheck="false" />
+        {#if draft.trim()}
+          <button
+            type="button"
+            class="icon-btn small save-search-btn"
+            class:saved={ui.activeSavedSearchId != null}
+            title={ui.activeSavedSearchId != null ? "Edit saved search" : "Save search…"}
+            aria-label={ui.activeSavedSearchId != null ? "Edit saved search" : "Save search"}
+            onclick={saveCurrentSearch}>
+            <Icon name="bookmark" size={14} />
+          </button>
+        {/if}
         <button type="button" class="icon-btn small" onclick={closeSearch} aria-label="Close search"><Icon name="x" size={14} /></button>
       </div>
     {:else}
@@ -271,7 +296,15 @@
         {@const on = !!chip.toggle && chip.testRe.test(draft)}
         <button type="button" class="op" class:on onclick={() => applyChip(chip)}>{chip.label}</button>
       {/each}
+      <button type="button" class="op tips-btn" class:on={showTips} title="Search syntax" aria-label="Search syntax tips" onclick={() => (showTips = !showTips)}>?</button>
     </div>
+    {#if showTips}
+      <div class="search-tips">
+        <span><code>from:</code> <code>to:</code> <code>subject:</code> <code>body:</code> <code>filename:pdf</code></span>
+        <span><code>larger:5M</code> <code>smaller:100K</code> <code>after:7d</code> <code>in:sent</code></span>
+        <span><code>OR</code> · <code>(a OR b)</code> · <code>-exclude</code> · <code>"exact phrase"</code></span>
+      </div>
+    {/if}
   {/if}
 
   {#if searchOpen && draft.trim() && !ui.ai}
@@ -651,4 +684,23 @@
   }
   .empty-title { margin: 0; font-size: 14px; font-weight: 550; color: var(--text-2); }
   .empty-sub { margin: 0; font-size: 12.5px; color: var(--muted); max-width: 240px; line-height: 1.45; }
+  .save-search-btn.saved { color: var(--accent); }
+  .tips-btn { min-width: 22px; justify-content: center; font-weight: 600; }
+  .search-tips {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    margin: 0 12px 6px;
+    padding: 7px 10px;
+    border-radius: 7px;
+    background: var(--hover);
+    font-size: 11px;
+    color: var(--muted);
+    line-height: 1.45;
+  }
+  .search-tips code {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 10.5px;
+    color: var(--text-2);
+  }
 </style>

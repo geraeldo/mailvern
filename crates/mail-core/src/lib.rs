@@ -1,3 +1,4 @@
+pub mod autoconfig;
 mod db;
 mod engine;
 pub mod extract;

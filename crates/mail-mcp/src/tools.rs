@@ -6,7 +6,7 @@ use crate::draft::{compose, edit, DraftArgs, EditArgs};
 use crate::fmt::{addr_list, clip, kb, row, stamp, subject, to_unix, who, Names};
 use crate::Ctx;
 use anyhow::{anyhow, bail, Result};
-use mail_core::model::{Account, AttachmentContent, MailQuery, Outgoing};
+use mail_core::model::{Account, AgentActionPreview, AgentActionSpec, AttachmentContent, MailQuery, MessageReadability, Outgoing};
 use mail_core::text::{body_text, quarantine_file, safe_filename};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -177,6 +177,32 @@ pub fn list(allow_send: bool) -> Value {
             },
             "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false },
         },
+        {
+            "name": "request_folder_access",
+            "title": "Ask to include Spam or Trash",
+            "description": "Ask the user for approval to read Spam (junk) and/or Trash folders, which are hidden from agents by default to protect against prompt injection. Always queues an approval request in Mailvern › Settings › Agent access. Only call this when the user specifically asks you to check Spam or Trash.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "roles": {
+                        "type": "array",
+                        "items": { "type": "string", "enum": ["junk", "trash"] },
+                        "description": "Which hidden folders to include: 'junk' (Spam), 'trash' (Trash), or both. Defaults to ['junk', 'trash']."
+                    },
+                    "accountId": {
+                        "type": "integer",
+                        "description": "Only request for this account (from list_folders). Omit for all shared accounts."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Short explanation shown to the user of why you need to check Spam or Trash."
+                    },
+                },
+                "required": ["reason"],
+                "additionalProperties": false,
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
+        },
     ]);
     let list = tools.as_array_mut().expect("a list");
     list.extend(crate::actions::list(allow_send));
@@ -214,6 +240,9 @@ impl Filters {
             subject: word(&self.subject),
             from: word(&self.from),
             to: word(&self.to),
+            filename: None,
+            larger: None,
+            smaller: None,
             after: word(&self.after).map(|s| to_unix(&s, "after")).transpose()?,
             before: word(&self.before).map(|s| to_unix(&s, "before")).transpose()?,
             unread: self.unread,
@@ -226,6 +255,7 @@ impl Filters {
             offset: self.offset,
             oldest_first: self.oldest_first,
             server_hits: Vec::new(),
+            allowed_folders: None,
         })
     }
 }
@@ -251,6 +281,84 @@ pub(crate) fn parse<T: DeserializeOwned>(args: Value) -> Result<T> {
     serde_json::from_value(args).map_err(|e| anyhow!("Invalid arguments: {e}"))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RequestFolderAccessArgs {
+    #[serde(default)]
+    roles: Vec<String>,
+    account_id: Option<i64>,
+    reason: String,
+}
+
+pub(crate) fn role_label(role: &str) -> &'static str {
+    match role {
+        "junk" => "Spam",
+        "trash" => "Trash",
+        _ => "that folder",
+    }
+}
+
+/// Ensures an agent is allowed to read `message_id`.
+pub(crate) fn ensure_readable(ctx: &Ctx, message_id: i64) -> Result<()> {
+    match ctx.engine.is_message_agent_readable(message_id)? {
+        MessageReadability::Allowed => Ok(()),
+        MessageReadability::HiddenSpamTrash { role, .. } => {
+            let label = role_label(&role);
+            bail!(
+                "Message #{message_id} is in {label}, which is hidden from agents by default to protect against prompt injection. \
+                 If the user specifically asked you to check {label}, call request_folder_access so they can approve access in Mailvern."
+            );
+        }
+        MessageReadability::Denied => {
+            bail!("Message #{message_id} is not accessible (it doesn't exist or its account/folder is not shared with agents).");
+        }
+    }
+}
+
+/// Restricts a `MailQuery` to folders the user shares with agents, returning a helpful
+/// prompt-injection explanation if the agent explicitly asked for hidden Spam/Trash.
+fn apply_read_scope(names: &Names, q: &mut MailQuery) -> Result<()> {
+    if let Some(acc_id) = q.account_id {
+        if !names.perms.is_account_allowed(acc_id) {
+            bail!("Account {acc_id} is not shared with agents (check Mailvern › Settings › Agent access).");
+        }
+    }
+    if let Some(fid) = q.folder_id {
+        let Some(f) = names.folders.iter().find(|x| x.id == fid) else {
+            bail!("No folder {fid}. Use list_folders to see available folders.");
+        };
+        if !names.perms.is_account_allowed(f.account_id) {
+            bail!("Folder {fid} is not shared with agents.");
+        }
+        if !names.perms.is_folder_allowed(f) {
+            if let Some(role) = f.role.as_deref().filter(|r| matches!(*r, "junk" | "trash")) {
+                let label = role_label(role);
+                bail!(
+                    "{label} is hidden from agents by default to protect against prompt injection. \
+                     If the user specifically asked you to check {label}, call request_folder_access so they can approve access in Mailvern."
+                );
+            }
+            bail!("Folder {fid} ({}) is not shared with agents (check Mailvern › Settings › Agent access).", f.name);
+        }
+    }
+    if let Some(role) = q.role.as_deref().map(str::trim).filter(|s| matches!(*s, "junk" | "trash")) {
+        let any_allowed = names.folders.iter().any(|f| {
+            f.role.as_deref() == Some(role)
+                && q.account_id.is_none_or(|a| a == f.account_id)
+                && names.perms.is_folder_allowed(f)
+        });
+        if !any_allowed {
+            let label = role_label(role);
+            bail!(
+                "{label} is hidden from agents by default to protect against prompt injection. \
+                 If the user specifically asked you to check {label}, call request_folder_access so they can approve access in Mailvern."
+            );
+        }
+    }
+    q.allowed_folders = Some(names.perms.allowed_folder_ids(&names.folders));
+    Ok(())
+}
+
 /// Runs a tool. `None` when there is no tool of that name; a failure is a result the
 /// agent can read and react to, not a protocol error.
 pub async fn call(ctx: &Ctx, name: &str, args: Value) -> Option<Out> {
@@ -264,6 +372,7 @@ pub async fn call(ctx: &Ctx, name: &str, args: Value) -> Option<Out> {
         "save_attachment" => save_attachment(ctx, args).await,
         "create_draft" => create_draft(ctx, args).await,
         "edit_draft" => edit_draft(ctx, args).await,
+        "request_folder_access" => request_folder_access(ctx, args),
         _ => match crate::actions::call(ctx, name, args.clone()).await {
             Some(r) => r,
             None => crate::rules::call(ctx, name, args)?,
@@ -276,14 +385,104 @@ fn list_folders(ctx: &Ctx) -> Result<Out> {
     Ok(text(Names::load(ctx)?.listing()))
 }
 
+fn request_folder_access(ctx: &Ctx, args: Value) -> Result<Out> {
+    let a: RequestFolderAccessArgs = parse(args)?;
+    let reason = a.reason.trim();
+    if reason.is_empty() {
+        bail!("Provide a brief reason explaining why the user wants you to check Spam or Trash.");
+    }
+    let roles: Vec<String> = if a.roles.is_empty() {
+        vec!["junk".into(), "trash".into()]
+    } else {
+        let mut norm = Vec::new();
+        for r in &a.roles {
+            let low = r.trim().to_ascii_lowercase();
+            let mapped = match low.as_str() {
+                "junk" | "spam" => "junk",
+                "trash" | "bin" => "trash",
+                _ => bail!("request_folder_access only accepts roles 'junk' or 'trash'."),
+            };
+            if !norm.iter().any(|x| x == mapped) {
+                norm.push(mapped.to_string());
+            }
+        }
+        norm
+    };
+    let names = Names::load(ctx)?;
+    if let Some(acc_id) = a.account_id {
+        if !names.accounts.iter().any(|acc| acc.id == acc_id) || !names.perms.is_account_allowed(acc_id) {
+            bail!("Account {acc_id} is not shared with agents.");
+        }
+    }
+    let targets: Vec<_> = names
+        .folders
+        .iter()
+        .filter(|f| {
+            names.perms.is_account_allowed(f.account_id)
+                && a.account_id.is_none_or(|acc| acc == f.account_id)
+                && f.role.as_deref().is_some_and(|r| roles.iter().any(|want| want == r))
+                && !names.perms.is_folder_allowed(f)
+        })
+        .collect();
+    if targets.is_empty() {
+        return Ok(text("Access to those Spam/Trash folders is already enabled (or no such folders exist). You can search them now."));
+    }
+    let mut folder_ids: Vec<i64> = targets.iter().map(|f| f.id).collect();
+    folder_ids.sort_unstable();
+
+    // Reuse an identical pending request instead of cluttering the approval queue.
+    for existing in ctx.engine.agent_actions(0)? {
+        if existing.status == "pending" {
+            if let AgentActionSpec::AllowFolders { folder_ids: mut ids } = existing.spec {
+                ids.sort_unstable();
+                if ids == folder_ids {
+                    return Ok(text(format!(
+                        "Already queued for approval (#{}): {}.\nAsk the user to approve it in Mailvern › Settings › Agent access, then retry your search.",
+                        existing.id, existing.summary
+                    )));
+                }
+            }
+        }
+    }
+
+    let has_junk = targets.iter().any(|f| f.role.as_deref() == Some("junk"));
+    let has_trash = targets.iter().any(|f| f.role.as_deref() == Some("trash"));
+    let what = match (has_junk, has_trash) {
+        (true, true) => "Spam and Trash",
+        (true, false) => "Spam",
+        (false, true) => "Trash",
+        (false, false) => "requested folders",
+    };
+    let summary = format!("Allow reading {what}");
+    let folder_list = targets.iter().map(|f| names.folder(f.id)).collect::<Vec<_>>().join(", ");
+    let preview = AgentActionPreview {
+        messages: vec![],
+        target_folder: Some(folder_list.clone()),
+        until: None,
+        detail: Some(reason.to_string()),
+    };
+    // Always requires user approval (even on Auto accounts) to defend against prompt injection.
+    let queued = ctx.engine.queue_agent_action(
+        a.account_id,
+        AgentActionSpec::AllowFolders { folder_ids },
+        summary.clone(),
+        preview,
+    )?;
+    Ok(text(format!(
+        "Queued for approval (#{}): {summary} ({folder_list}).\nAsk the user to approve it in Mailvern › Settings › Agent access, then retry your search.",
+        queued.id
+    )))
+}
+
 async fn search_mail(ctx: &Ctx, args: Value) -> Result<Out> {
     let f: Filters = parse(args)?;
     let mut q = f.query()?;
+    let names = Names::load(ctx)?;
+    apply_read_scope(&names, &mut q)?;
     q.limit = Some(f.limit.unwrap_or(20).clamp(1, 50));
     let offset = f.offset.unwrap_or(0).max(0);
     q.offset = Some(offset);
     let (r, server_error) = if f.server { ctx.engine.query_mail_server(&q).await? } else { (ctx.engine.query_mail(&q)?, None) };
-    let names = Names::load(ctx)?;
     let mut out = if r.total == 1 { "1 message matches".to_string() } else { format!("{} messages match", r.total) };
     if let Some(e) = server_error {
         out.push_str(&format!(" (server search failed: {e}; local results only)"));
@@ -306,6 +505,8 @@ async fn search_mail(ctx: &Ctx, args: Value) -> Result<Out> {
 fn count_mail(ctx: &Ctx, args: Value) -> Result<Out> {
     let f: Filters = parse(args)?;
     let mut q = f.query()?;
+    let names = Names::load(ctx)?;
+    apply_read_scope(&names, &mut q)?;
     let Some(by) = f.group_by.as_deref() else {
         q.limit = Some(1);
         return Ok(text(format!("{} messages match.", ctx.engine.query_mail(&q)?.total)));
@@ -314,7 +515,6 @@ fn count_mail(ctx: &Ctx, args: Value) -> Result<Out> {
         bail!("groupBy must be one of sender, domain, recipient, month, year, folder, account");
     }
     let (total, groups) = ctx.engine.group_mail(&q, by)?;
-    let names = Names::load(ctx)?;
     let lines: Vec<String> = groups
         .iter()
         .map(|g| {
@@ -333,6 +533,7 @@ fn count_mail(ctx: &Ctx, args: Value) -> Result<Out> {
 
 async fn read_message(ctx: &Ctx, args: Value) -> Result<Out> {
     let a: ReadArgs = parse(args)?;
+    ensure_readable(ctx, a.id)?;
     let d = ctx.engine.message(a.id).await?;
     let names = Names::load(ctx)?;
     let s = &d.summary;
@@ -369,9 +570,17 @@ async fn read_message(ctx: &Ctx, args: Value) -> Result<Out> {
 
 async fn read_conversation(ctx: &Ctx, args: Value) -> Result<Out> {
     let a: ReadArgs = parse(args)?;
-    let thread = ctx.engine.thread(a.id)?;
-    if thread.is_empty() {
+    ensure_readable(ctx, a.id)?;
+    let raw_thread = ctx.engine.thread(a.id)?;
+    if raw_thread.is_empty() {
         bail!("No message {}", a.id);
+    }
+    let thread: Vec<_> = raw_thread
+        .into_iter()
+        .filter(|m| matches!(ctx.engine.is_message_agent_readable(m.id), Ok(MessageReadability::Allowed)))
+        .collect();
+    if thread.is_empty() {
+        bail!("No readable messages in that conversation.");
     }
     let names = Names::load(ctx)?;
     let skipped = thread.len().saturating_sub(15);
@@ -401,6 +610,7 @@ async fn read_conversation(ctx: &Ctx, args: Value) -> Result<Out> {
 
 async fn read_attachment(ctx: &Ctx, args: Value) -> Result<Out> {
     let a: AttachmentArgs = parse(args)?;
+    ensure_readable(ctx, a.message_id)?;
     match ctx.engine.attachment_content(a.message_id, a.index, a.offset, 30_000).await? {
         AttachmentContent::Unsupported { filename, mime, reason, .. } => {
             Ok(Out { is_error: true, ..text(format!("{filename} ({mime}) can't be read as text: {reason} Use save_attachment to get the file itself.")) })
@@ -431,6 +641,7 @@ async fn read_attachment(ctx: &Ctx, args: Value) -> Result<Out> {
 
 async fn save_attachment(ctx: &Ctx, args: Value) -> Result<Out> {
     let a: AttachmentArgs = parse(args)?;
+    ensure_readable(ctx, a.message_id)?;
     let (name, bytes) = ctx.engine.attachment(a.message_id, a.index).await?;
     // Always the same private temp folder: where the file lands is not the agent's choice,
     // so a mail attachment can't be dropped somewhere it would be run or loaded.
@@ -470,14 +681,24 @@ async fn create_draft(ctx: &Ctx, args: Value) -> Result<Out> {
         bail!("The draft has no body. Write the message in body.");
     }
     let source = match a.reply_to {
-        Some(id) => Some(ctx.engine.message(id).await?),
+        Some(id) => {
+            ensure_readable(ctx, id)?;
+            Some(ctx.engine.message(id).await?)
+        }
         None => None,
     };
+    let perms = ctx.engine.agent_permissions()?;
     let accounts = ctx.engine.accounts()?;
-    let account_id = a.account_id.or(source.as_ref().map(|s| s.summary.account_id)).or(accounts.first().map(|x| x.id));
+    let account_id = a
+        .account_id
+        .or(source.as_ref().map(|s| s.summary.account_id))
+        .or(accounts.iter().find(|x| perms.is_account_allowed(x.id)).map(|x| x.id));
     let account = account_id
         .and_then(|id| accounts.iter().find(|x| x.id == id))
         .ok_or_else(|| anyhow!("No such account. Use list_folders to see the accounts."))?;
+    if !perms.is_account_allowed(account.id) {
+        bail!("Account {} is not shared with agents.", account.id);
+    }
     let mine: Vec<String> = accounts.iter().map(|x| x.email.clone()).collect();
     let out = compose(&a, account, &mine, source.as_ref())?;
     let summary = draft_summary(account, &out);
@@ -497,6 +718,7 @@ async fn edit_draft(ctx: &Ctx, args: Value) -> Result<Out> {
     let (message_id, account_id) = ctx.engine.find_draft(&a.draft_id)?.ok_or_else(|| {
         anyhow!("No draft {} in any Drafts folder. Find drafts with search_mail (folder \"drafts\"); read_message shows each one's draftId.", a.draft_id.trim())
     })?;
+    ensure_readable(ctx, message_id)?;
     let existing = ctx.engine.message(message_id).await?;
     let accounts = ctx.engine.accounts()?;
     let account = accounts.iter().find(|x| x.id == account_id).ok_or_else(|| anyhow!("The draft's account is gone."))?;
@@ -556,7 +778,7 @@ mod tests {
             approval_names,
             [
                 "list_folders", "search_mail", "count_mail", "read_message", "read_conversation", "read_attachment", "save_attachment",
-                "create_draft", "edit_draft",
+                "create_draft", "edit_draft", "request_folder_access",
                 "mark_messages", "flag_messages", "archive_messages", "move_messages", "trash_messages", "mark_junk",
                 "snooze_messages", "unsnooze_messages", "delete_draft",
                 "list_rules", "create_rule", "update_rule", "delete_rule", "test_rule",

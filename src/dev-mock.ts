@@ -243,6 +243,12 @@ export function installMock() {
   };
 
   const agentAccountModes: Record<number, "approval" | "auto"> = { 2: "auto" };
+  const agentDisabledAccounts = new Set<number>();
+  const agentFolderOverrides: Record<number, boolean> = {};
+  let savedSearchId = 1;
+  const savedSearches: any[] = [
+    { id: 1, name: "Invoices & receipts", query: "invoice OR receipt", scope: { kind: "all" }, position: 0, unread: 2 },
+  ];
   const agentActions: any[] = [
     {
       id: 1,
@@ -296,6 +302,8 @@ export function installMock() {
       error: null,
       mode: (settings.mcp_mode as "approval" | "auto") ?? "approval",
       accountModes: { ...agentAccountModes },
+      disabledAccounts: [...agentDisabledAccounts],
+      folderOverrides: { ...agentFolderOverrides },
     };
   };
 
@@ -548,6 +556,7 @@ export function installMock() {
             flagged: messages.filter((m) => m.flagged).length,
             unread: messages.filter((m) => !m.seen).length,
           },
+          savedSearches: savedSearches.map((s) => ({ ...s })),
           messages: initial,
           outbox,
           pendingAgentActions: agentActions.filter((a) => a.status === "pending").length,
@@ -559,6 +568,41 @@ export function installMock() {
         const i = accounts.findIndex((a) => a.id === args.account.id);
         if (i >= 0) accounts[i] = { ...args.account };
         return args.account;
+      }
+      case "discover_servers": {
+        const dom = String(args.email ?? "").split("@")[1]?.toLowerCase() ?? "";
+        if (!dom || !dom.includes(".")) return null;
+        return {
+          providerName: dom,
+          imapHost: `imap.${dom}`,
+          imapPort: 993,
+          smtpHost: `smtp.${dom}`,
+          smtpPort: 465,
+          source: "autoconfig_https",
+          sourceLabel: `Found via ${dom} autoconfig (HTTPS)`,
+          verified: true,
+        };
+      }
+      case "saved_searches": return savedSearches.map((s) => ({ ...s }));
+      case "save_saved_search": {
+        const i = savedSearches.findIndex((s) => s.id === args.id);
+        if (i >= 0) {
+          savedSearches[i] = { ...savedSearches[i], name: args.name, query: args.query, scope: args.scope };
+          return { ...savedSearches[i] };
+        }
+        const item = { id: ++savedSearchId, name: args.name, query: args.query, scope: args.scope, position: savedSearches.length, unread: 1 };
+        savedSearches.push(item);
+        return { ...item };
+      }
+      case "delete_saved_search": {
+        const i = savedSearches.findIndex((s) => s.id === args.id);
+        if (i >= 0) savedSearches.splice(i, 1);
+        return null;
+      }
+      case "reorder_saved_searches": {
+        const ids: number[] = args.ids;
+        savedSearches.sort((a, b) => ids.indexOf(a.id) - ids.indexOf(b.id));
+        return null;
       }
       case "set_account_alerts": {
         const a = accounts.find((x) => x.id === args.accountId);
@@ -583,6 +627,14 @@ export function installMock() {
       case "set_agent_account_mode":
         if (args.mode) agentAccountModes[args.accountId] = args.mode;
         else delete agentAccountModes[args.accountId];
+        return agentStatus();
+      case "set_agent_account_allowed":
+        if (args.allowed) agentDisabledAccounts.delete(args.accountId);
+        else agentDisabledAccounts.add(args.accountId);
+        return agentStatus();
+      case "set_agent_folder_allowed":
+        if (args.allowed == null) delete agentFolderOverrides[args.folderId];
+        else agentFolderOverrides[args.folderId] = !!args.allowed;
         return agentStatus();
       case "agent_actions":
         return agentActions.map((a) => ({ ...a }));

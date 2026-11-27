@@ -16,7 +16,7 @@
     archiveSelected, trashSelected, toggleJunk, toggleSeen, toggleFlag, accountById, openSettings, openAccountSettings,
     moveSelected, snoozeSelected, unsnoozeSelected, selectAll, extendSelection, clearSelection, snoozeRows, moveRows,
     selectedRows, roleOf, toast, undoToast, runToastAction, copyThread, openMessage, commitPending, setPaneWidths, toggleSidebar, submitFolderPrompt,
-    openMailto, printOpenThread,
+    openMailto, printOpenThread, submitSavedSearch, deleteSavedSearch,
   } from "./lib/state.svelte";
   import { snoozePresets } from "./lib/when";
   import { loadRules, rulesUi } from "./lib/rules.svelte";
@@ -33,6 +33,7 @@
   const loadWhenPicker = lazyComponent(() => import("./lib/components/WhenPicker.svelte"));
   const loadMovePicker = lazyComponent(() => import("./lib/components/MovePicker.svelte"));
   const loadPromptModal = lazyComponent(() => import("./lib/components/PromptModal.svelte"));
+  const loadSavedSearchModal = lazyComponent(() => import("./lib/components/SavedSearchModal.svelte"));
   const loadSourceModal = lazyComponent(() => import("./lib/components/SourceModal.svelte"));
 
   let list: MessageList;
@@ -391,6 +392,26 @@
       action={fp.kind === "create" ? "Create" : "Rename"}
       onsubmit={submitFolderPrompt}
       onclose={() => (ui.folderPrompt = null)} />
+  {/await}
+{/if}
+
+{#if ui.savedSearchModal}
+  {@const sm = ui.savedSearchModal}
+  {#await loadSavedSearchModal() then SavedSearchModalComp}
+    <SavedSearchModalComp
+      id={sm.id}
+      initialName={sm.name}
+      initialQuery={sm.query}
+      initialScope={sm.scope}
+      onsubmit={submitSavedSearch}
+      ondelete={sm.id > 0
+        ? () => {
+            const target = ui.savedSearches.find((x) => x.id === sm.id);
+            ui.savedSearchModal = null;
+            if (target) deleteSavedSearch(target);
+          }
+        : undefined}
+      onclose={() => (ui.savedSearchModal = null)} />
   {/await}
 {/if}
 

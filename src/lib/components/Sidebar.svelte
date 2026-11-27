@@ -2,10 +2,10 @@
   import Icon from "./Icon.svelte";
   import {
     ui, setView, compose, openSettings, openAccountSettings, accountLabel,
-    reorderAccounts, reorderFolders, unifiedRoles, toggleSidebar,
+    reorderAccounts, reorderFolders, reorderSavedSearches, openSavedSearch, unifiedRoles, toggleSidebar,
   } from "../state.svelte";
   import { sortable } from "../sortable";
-  import { accountMenu, allAccountsMenu, folderMenu } from "../menus";
+  import { accountMenu, allAccountsMenu, folderMenu, savedSearchMenu } from "../menus";
   import { hint } from "../shortcuts.svelte";
   import { api, type Folder, type MailView } from "../api";
 
@@ -14,6 +14,7 @@
 
   let collapsed = $state<Record<number, boolean>>({});
   let allCollapsed = $state(false);
+  let savedCollapsed = $state(false);
   let showMore = $state<Record<number, boolean>>({});
 
   /**
@@ -222,6 +223,35 @@
       {/each}
     </div>
 
+    {#if ui.savedSearches.length}
+      <div class="group saved">
+        <div class="head-row">
+          <button class="group-head" onclick={() => (savedCollapsed = !savedCollapsed)}>
+            <span class="glyph"><Icon name="bookmark" size={12} stroke={2} /></span>
+            <span class="label">Saved Searches</span>
+            <span class="chev" class:open={!savedCollapsed} class:closed={savedCollapsed}><Icon name="chevron" size={12} stroke={2} /></span>
+          </button>
+        </div>
+        {#if !savedCollapsed}
+          <div class="folders" use:sortable={{ item: ".item", onsort: (ids) => reorderSavedSearches(ids.map(Number)) }}>
+            {#each ui.savedSearches as s (s.id)}
+              <button
+                class="item"
+                data-id={s.id}
+                class:active={searching && ui.activeSavedSearchId === s.id}
+                title={s.query}
+                onclick={() => openSavedSearch(s)}
+                oncontextmenu={(e) => { e.preventDefault(); savedSearchMenu(s); }}>
+                <Icon name="search" size={14} />
+                <span class="label">{s.name}</span>
+                {#if s.unread > 0}<span class="count">{s.unread}</span>{/if}
+              </button>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    {/if}
+
     {#if !ui.accounts.length}
       <button class="add" onclick={() => openAccountSettings("new")}>
         <Icon name="plus" /> Add account
@@ -313,6 +343,7 @@
   .group-head { font-size: 12px; font-weight: 600; color: var(--muted); height: 28px; }
   .group-head.scoped { background: var(--active); color: var(--text); }
   .group.all { margin-bottom: 8px; }
+  .group.saved { margin-top: 8px; }
   .glyph { display: grid; place-items: center; width: 16px; flex: none; color: var(--muted); }
   /* Vertical bar instead of a round dot so account colors never resemble unread dots. */
   .acc-bar { width: 3px; height: 12px; border-radius: 2px; flex: none; margin: 0 6px 0 7px; }

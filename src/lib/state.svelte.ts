@@ -1,5 +1,5 @@
 import {
-  api, type Account, type AccountBadgeMode, type Detail, type FileInfo, type Folder, type MailView, type OutboxItem, type Outgoing, type SearchScope, type SmartCounts, type Summary, type View,
+  api, type Account, type AccountBadgeMode, type Detail, type FileInfo, type Folder, type MailView, type OutboxItem, type Outgoing, type SavedSearch, type SearchScope, type SmartCounts, type Summary, type View,
 } from "./api";
 import { hydrateAi } from "./ai/config.svelte";
 import { hydrateBadgeMode, refreshBadge } from "./badge.svelte";
@@ -98,6 +98,9 @@ export const ui = $state({
   accounts: [] as Account[],
   folders: [] as Folder[],
   smartCounts: { flagged: 0, unread: 0 } as SmartCounts,
+  savedSearches: [] as SavedSearch[],
+  activeSavedSearchId: null as number | null,
+  savedSearchModal: null as { id: number; name: string; query: string; scope: SearchScope } | null,
   view: { kind: "unified", role: "inbox" } as View,
   list: [] as Summary[],
   hasMore: false,
@@ -311,6 +314,7 @@ export function bootstrapApp(): Promise<void> {
     ui.accounts = data.accounts;
     ui.folders = data.folders;
     ui.smartCounts = data.smartCounts;
+    ui.savedSearches = data.savedSearches ?? [];
     ui.outbox = data.outbox;
     ui.pendingAgentActions = data.pendingAgentActions;
     applyPrefs(data.settings);
@@ -410,12 +414,67 @@ export async function reorderFolders(accountId: number, visibleIds: number[]) {
 }
 
 export async function loadFolders() {
-  const [folders, counts] = await Promise.all([
+  const [folders, counts, saved] = await Promise.all([
     api.folders(),
     api.smartCounts().catch(() => ui.smartCounts),
+    api.savedSearches().catch(() => ui.savedSearches),
   ]);
   ui.folders = folders;
   ui.smartCounts = counts;
+  ui.savedSearches = saved;
+}
+
+export async function loadSavedSearches() {
+  try {
+    ui.savedSearches = await api.savedSearches();
+  } catch {}
+}
+
+export function openSavedSearch(s: SavedSearch) {
+  ui.activeSavedSearchId = s.id;
+  ui.searchScope = s.scope;
+  setQuery(s.query, true);
+}
+
+export function openSaveSearchModal(existing?: SavedSearch) {
+  if (existing) {
+    ui.savedSearchModal = { id: existing.id, name: existing.name, query: existing.query, scope: existing.scope };
+  } else {
+    const q = ui.query.trim();
+    ui.savedSearchModal = { id: 0, name: q.slice(0, 40), query: q, scope: ui.searchScope };
+  }
+}
+
+export async function submitSavedSearch(id: number, name: string, query: string, scope: SearchScope) {
+  const saved = await api.saveSavedSearch(id, name, query, scope);
+  await loadSavedSearches();
+  ui.savedSearchModal = null;
+  if (ui.query.trim() === saved.query && scopeKey(ui.searchScope) === scopeKey(saved.scope)) {
+    ui.activeSavedSearchId = saved.id;
+  }
+  toast(id > 0 ? "Saved search updated" : `Saved “${saved.name}”`);
+}
+
+export async function deleteSavedSearch(s: SavedSearch) {
+  try {
+    await api.deleteSavedSearch(s.id);
+    if (ui.activeSavedSearchId === s.id) ui.activeSavedSearchId = null;
+    await loadSavedSearches();
+    toast(`Deleted “${s.name}”`);
+  } catch (e) {
+    toast(String(e));
+  }
+}
+
+export async function reorderSavedSearches(ids: number[]) {
+  const byId = new Map(ui.savedSearches.map((s) => [s.id, s]));
+  ui.savedSearches = ids.map((id) => byId.get(id)).filter((s): s is SavedSearch => !!s);
+  try {
+    await api.reorderSavedSearches(ids);
+  } catch (e) {
+    toast(String(e));
+  }
+  await loadSavedSearches();
 }
 
 export async function loadOutbox() {
@@ -576,9 +635,15 @@ export function refreshAi() {
 }
 
 let serverTimer: ReturnType<typeof setTimeout> | undefined;
-export function setQuery(q: string) {
+export function setQuery(q: string, keepSavedId = false) {
   ui.ai = null;
   ui.query = q;
+  if (!keepSavedId) {
+    const match = q.trim()
+      ? ui.savedSearches.find((s) => s.query === q.trim() && scopeKey(s.scope) === scopeKey(ui.searchScope))
+      : null;
+    ui.activeSavedSearchId = match?.id ?? null;
+  }
   // The last results stay until the new ones replace them, so the list doesn't blank between keys.
   remote = null;
   ui.searchingServer = false;

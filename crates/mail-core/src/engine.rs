@@ -475,15 +475,49 @@ impl Engine {
 
     pub fn search(&self, query: &str, scope: &SearchScope) -> Result<Vec<MessageSummary>> {
         let parsed = crate::search::parse_search_query(query, scope);
-        if parsed.has_operators {
-            if !crate::search::has_criteria(&parsed.query) {
+        if parsed.has_operators || parsed.has_boolean {
+            let Some(expr) = parsed.expr else {
                 return Ok(vec![]);
-            }
-            let mut q = parsed.query;
-            q.limit = Some(300);
-            return Ok(self.db.query_mail(&q)?.rows);
+            };
+            return self.db.search_expr(&expr, scope, parsed.has_in_scope, 300);
         }
         self.db.search(query, scope, 300)
+    }
+
+    /// Auto-discovers IMAP/SMTP servers for an email address (domain HTTPS autoconfig, ISPDB, DNS MX/SRV).
+    pub async fn discover_servers(&self, email: &str) -> Option<DiscoveredServers> {
+        crate::autoconfig::discover(email).await
+    }
+
+    /// Saved searches with live local unread counts.
+    pub fn saved_searches(&self) -> Result<Vec<SavedSearch>> {
+        let mut items = self.db.saved_searches()?;
+        for s in &mut items {
+            let parsed = crate::search::parse_search_query(&s.query, &s.scope);
+            s.unread = match parsed.expr {
+                Some(expr) => self.db.count_search_expr_unread(&expr, &s.scope, parsed.has_in_scope).unwrap_or(0),
+                None => 0,
+            };
+        }
+        Ok(items)
+    }
+
+    pub fn save_saved_search(&self, id: i64, name: &str, query: &str, scope: &SearchScope) -> Result<SavedSearch> {
+        let mut saved = self.db.save_saved_search(id, name, query, scope)?;
+        let parsed = crate::search::parse_search_query(&saved.query, &saved.scope);
+        saved.unread = match parsed.expr {
+            Some(expr) => self.db.count_search_expr_unread(&expr, &saved.scope, parsed.has_in_scope).unwrap_or(0),
+            None => 0,
+        };
+        Ok(saved)
+    }
+
+    pub fn delete_saved_search(&self, id: i64) -> Result<()> {
+        self.db.delete_saved_search(id)
+    }
+
+    pub fn reorder_saved_searches(&self, ids: &[i64]) -> Result<()> {
+        self.db.reorder_saved_searches(ids)
     }
 
     /// Asks the servers behind a scope, which also finds mail never downloaded and words in
@@ -574,7 +608,33 @@ impl Engine {
         let mut server_error = None;
         if let Some(criteria) = imap::query_criteria(&q) {
             let accounts: Vec<i64> = self.workers.lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
-            let targets: Vec<(i64, Option<Vec<i64>>)> = if let Some(folder_id) = q.folder_id {
+            let targets: Vec<(i64, Option<Vec<i64>>)> = if let Some(allowed) = &q.allowed_folders {
+                if allowed.is_empty() {
+                    Vec::new()
+                } else {
+                    let allowed_set: std::collections::HashSet<i64> = allowed.iter().copied().collect();
+                    let role_filter = q.role.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_lowercase);
+                    let mut by_acc: HashMap<i64, Vec<i64>> = HashMap::new();
+                    for f in self.db.folders()? {
+                        if !allowed_set.contains(&f.id) {
+                            continue;
+                        }
+                        if q.account_id.is_some_and(|a| a != f.account_id) {
+                            continue;
+                        }
+                        if q.folder_id.is_some_and(|fid| fid != f.id) {
+                            continue;
+                        }
+                        if let Some(ref r) = role_filter {
+                            if f.role.as_deref() != Some(r.as_str()) {
+                                continue;
+                            }
+                        }
+                        by_acc.entry(f.account_id).or_default().push(f.id);
+                    }
+                    by_acc.into_iter().map(|(a, fs)| (a, Some(fs))).collect()
+                }
+            } else if let Some(folder_id) = q.folder_id {
                 vec![(self.db.folder(folder_id)?.0, Some(vec![folder_id]))]
             } else if let Some(role) = q.role.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_lowercase) {
                 self.role_targets(&role)?.into_iter().filter(|(a, _)| q.account_id.is_none_or(|x| x == *a)).collect()
@@ -1273,6 +1333,7 @@ impl Engine {
         let accounts = self.db.accounts()?;
         let folders = self.db.folders()?;
         let smart_counts = self.db.smart_counts().unwrap_or_default();
+        let saved_searches = self.saved_searches().unwrap_or_default();
         let messages = self.messages(view, None, 0, limit, threaded)?;
         let outbox = self.outbox().unwrap_or_default();
         let pending_agent_actions = self.db.pending_agent_actions_count().unwrap_or(0);
@@ -1280,6 +1341,7 @@ impl Engine {
             accounts,
             folders,
             smart_counts,
+            saved_searches,
             messages,
             outbox,
             pending_agent_actions,

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
   import { ask } from "@tauri-apps/plugin-dialog";
-  import { api, type AgentAccess, type AgentAction, type AgentMode } from "../api";
+  import { api, type AgentAccess, type AgentAction, type AgentMode, type Folder } from "../api";
   import { shortDate } from "../format";
   import { ui, accountById, accountLabel, loadPendingAgentActions, toast } from "../state.svelte";
   import Icon from "./Icon.svelte";
@@ -25,6 +25,27 @@
   let card = $state<HTMLElement>();
   let approvalRadio = $state<HTMLInputElement>();
   let autoRadio = $state<HTMLInputElement>();
+  let expandedFolders = $state<Record<number, boolean>>({});
+
+  const isAccountAllowed = (accountId: number): boolean =>
+    !(access?.disabledAccounts ?? []).includes(accountId);
+
+  const isSpamOrTrash = (f: Folder): boolean => f.role === "junk" || f.role === "trash";
+
+  const isFolderAllowed = (f: Folder): boolean => {
+    if (!isAccountAllowed(f.accountId)) return false;
+    const ov = access?.folderOverrides?.[f.id];
+    return ov !== undefined ? ov : !isSpamOrTrash(f);
+  };
+
+  const foldersForAccount = (accountId: number): Folder[] =>
+    ui.folders.filter((f) => f.accountId === accountId && f.role !== "all");
+
+  async function toggleFolderAllowed(f: Folder, allowed: boolean) {
+    if (!access || busy) return;
+    const defaultAllowed = !isSpamOrTrash(f);
+    await change(api.setAgentFolderAllowed(f.id, allowed === defaultAllowed ? null : allowed));
+  }
 
   const pending = $derived(actions.filter((a) => a.status === "pending"));
   const recent = $derived(actions.filter((a) => a.status !== "pending"));
@@ -62,24 +83,32 @@
   const effectiveMode = (accountId: number): AgentMode =>
     access?.accountModes[accountId] ?? access?.mode ?? "approval";
 
+  const enabledAccounts = $derived(ui.accounts.filter((a) => isAccountAllowed(a.id)));
+
   const anyAuto = $derived.by(() => {
     if (!access) return false;
     if (!ui.accounts.length) return access.mode === "auto";
-    return ui.accounts.some((a) => effectiveMode(a.id) === "auto");
+    return enabledAccounts.some((a) => effectiveMode(a.id) === "auto");
   });
 
   const allAuto = $derived.by(() => {
     if (!access) return false;
     if (!ui.accounts.length) return access.mode === "auto";
-    return access.mode === "auto" && ui.accounts.every((a) => effectiveMode(a.id) === "auto");
+    return (
+      enabledAccounts.length === ui.accounts.length &&
+      access.mode === "auto" &&
+      enabledAccounts.every((a) => effectiveMode(a.id) === "auto")
+    );
   });
 
   const toggleDetail = $derived(
-    allAuto
-      ? "Read, organize, and send mail, and manage rules automatically."
-      : anyAuto
-        ? "Permissions set per account. Sending and automatic changes only run where allowed."
-        : "Read mail and save drafts. Changes to mail and rules wait for your approval.",
+    ui.accounts.length > 0 && enabledAccounts.length === 0
+      ? "No accounts are shared with agents."
+      : allAuto
+        ? "Read, organize, and send mail, and manage rules automatically."
+        : anyAuto || (ui.accounts.length > 0 && enabledAccounts.length < ui.accounts.length)
+          ? "Permissions set per account. Agents only access accounts where allowed."
+          : "Read mail and save drafts. Changes to mail and rules wait for your approval.",
   );
 
   const footerNote = $derived(
@@ -116,23 +145,39 @@
     if (!anyAuto) reconnectHint = false;
   }
 
-  const accountModeOptions = $derived<{ value: "default" | AgentMode; label: string; detail?: string }[]>([
+  type AccountAccessChoice = "default" | AgentMode | "none";
+
+  const accountModeOptions = $derived<{ value: AccountAccessChoice; label: string; detail?: string }[]>([
     { value: "default", label: "Default", detail: access?.mode === "auto" ? "Run automatically" : "Ask before acting" },
     { value: "approval", label: "Ask before acting" },
     { value: "auto", label: "Run automatically" },
+    { value: "none", label: "No access", detail: "Hidden from agents" },
   ]);
 
-  async function pickAccountMode(accountId: number, choice: "default" | AgentMode) {
+  async function pickAccountMode(accountId: number, choice: AccountAccessChoice) {
     if (!access || busy) return;
-    const prevEffective = effectiveMode(accountId);
-    const nextEffective: AgentMode = choice === "default" ? access.mode : choice;
+    const wasAllowed = isAccountAllowed(accountId);
     const hadAuto = anyAuto;
+    if (choice === "none") {
+      if (!wasAllowed) return;
+      expandedFolders[accountId] = false;
+      await change(api.setAgentAccountAllowed(accountId, false));
+      if (!anyAuto) reconnectHint = false;
+      return;
+    }
+    const prevEffective = wasAllowed ? effectiveMode(accountId) : null;
+    const nextEffective: AgentMode = choice === "default" ? access.mode : choice;
     if (prevEffective !== "auto" && nextEffective === "auto") {
       const acc = accountById(accountId);
       const label = acc ? accountLabel(acc) : "this account";
       if (!(await confirmAuto(`Let agents act automatically on “${label}”?`))) return;
     }
-    await change(api.setAgentAccountMode(accountId, choice === "default" ? null : choice));
+    await change(
+      (async () => {
+        if (!wasAllowed) await api.setAgentAccountAllowed(accountId, true);
+        return api.setAgentAccountMode(accountId, choice === "default" ? null : choice);
+      })(),
+    );
     if (!failed && !hadAuto && anyAuto && access?.running) reconnectHint = true;
     if (!anyAuto) reconnectHint = false;
   }
@@ -147,7 +192,7 @@
       toast(String(e), { ms: 6000 });
     }
     actingId = null;
-    await Promise.all([loadActions(), loadPendingAgentActions()]);
+    await Promise.all([loadActions(), loadPendingAgentActions(), change(api.agentAccess())]);
   }
 
   async function reject(a: AgentAction) {
@@ -159,7 +204,7 @@
       toast(String(e));
     }
     actingId = null;
-    await Promise.all([loadActions(), loadPendingAgentActions()]);
+    await Promise.all([loadActions(), loadPendingAgentActions(), change(api.agentAccess())]);
   }
 
   async function approveAll() {
@@ -176,7 +221,7 @@
       toast(String(e), { ms: 6000 });
     }
     actingId = null;
-    await Promise.all([loadActions(), loadPendingAgentActions()]);
+    await Promise.all([loadActions(), loadPendingAgentActions(), change(api.agentAccess())]);
   }
 
   async function rejectAll() {
@@ -189,7 +234,7 @@
       toast(String(e));
     }
     actingId = null;
-    await Promise.all([loadActions(), loadPendingAgentActions()]);
+    await Promise.all([loadActions(), loadPendingAgentActions(), change(api.agentAccess())]);
   }
 
   function actionIcon(kind: string): string {
@@ -210,6 +255,7 @@
       case "createRule":
       case "updateRule":
       case "deleteRule": return "filter";
+      case "allowFolders": return "shieldAlert";
       default: return "code";
     }
   }
@@ -313,8 +359,13 @@
                   <li class="qmore">+{msgs.length - 3} more</li>
                 {/if}
               </ul>
-            {:else if a.preview.detail}
-              <p class="qdetail">{a.preview.detail}</p>
+            {:else if a.preview.detail || a.preview.targetFolder}
+              {#if a.preview.targetFolder && a.kind === "allowFolders"}
+                <p class="qdetail"><strong>Folders:</strong> {a.preview.targetFolder}</p>
+              {/if}
+              {#if a.preview.detail}
+                <p class="qdetail">{a.preview.detail}</p>
+              {/if}
             {/if}
             <span class="qtime">{shortDate(a.createdAt)}</span>
           </div>
@@ -392,26 +443,63 @@
       </label>
     </div>
 
-    {#if ui.accounts.length > 1}
-      <h3 class="subhead">By account</h3>
+    {#if ui.accounts.length > 0}
+      <h3 class="subhead">Accounts &amp; folders</h3>
       <div class="list-card">
         {#each ui.accounts as acc (acc.id)}
+          {@const allowed = isAccountAllowed(acc.id)}
           {@const override = access.accountModes[acc.id]}
-          {@const val = (override ?? "default") as "default" | AgentMode}
-          <div class="row acc-row">
-            <span class="acc-bar lg" style:background={acc.color || "var(--muted)"}></span>
-            <span class="text">
-              <span class="label">{accountLabel(acc)}</span>
-              <span class="detail">{acc.email}</span>
-            </span>
-            <Select
-              label={`Permissions for ${accountLabel(acc)}`}
-              value={val}
-              options={accountModeOptions}
-              onchange={(v) => pickAccountMode(acc.id, v)} />
+          {@const val = (!allowed ? "none" : (override ?? "default")) as AccountAccessChoice}
+          {@const accFolders = foldersForAccount(acc.id)}
+          {@const sharedCount = accFolders.filter((f) => isFolderAllowed(f)).length}
+          <div class="acc-block">
+            <div class="row acc-row" class:dim={!allowed}>
+              <span class="acc-bar lg" style:background={acc.color || "var(--muted)"}></span>
+              <span class="text">
+                <span class="label">{accountLabel(acc)}</span>
+                <span class="detail">{acc.email}</span>
+              </span>
+              <Select
+                label={`Permissions for ${accountLabel(acc)}`}
+                value={val}
+                options={accountModeOptions}
+                onchange={(v) => pickAccountMode(acc.id, v)} />
+            </div>
+            {#if allowed && accFolders.length > 0}
+              <div class="folder-bar">
+                <button
+                  type="button"
+                  class="folder-toggle"
+                  onclick={() => (expandedFolders[acc.id] = !expandedFolders[acc.id])}>
+                  <span class="fchev" class:open={!!expandedFolders[acc.id]}><Icon name="chevron" size={11} stroke={2.2} /></span>
+                  <span>Folders · {sharedCount} of {accFolders.length} shared</span>
+                </button>
+                {#if expandedFolders[acc.id]}
+                  <div class="folder-list">
+                    {#each accFolders as f (f.id)}
+                      {@const on = isFolderAllowed(f)}
+                      <div class="frow">
+                        <span class="fname">
+                          {f.name}
+                          {#if isSpamOrTrash(f)}
+                            <span class="ftag">Hidden by default</span>
+                          {/if}
+                        </span>
+                        <Switch
+                          checked={on}
+                          disabled={busy}
+                          label={`Share ${f.name} with agents`}
+                          onchange={(v) => toggleFolderAllowed(f, v)} />
+                      </div>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+            {/if}
           </div>
         {/each}
       </div>
+      <p class="hint">Spam and Trash stay hidden by default to protect against prompt injection. Agents can ask you to include them when needed.</p>
     {/if}
 
     {#if reconnectHint}
@@ -531,6 +619,36 @@
   .row + .row { border-top: 1px solid var(--line); }
   .row.interactive:hover { background: var(--hover); }
   .acc-row { padding: 9px 12px 9px 14px; }
+  .acc-row.dim .text { opacity: 0.55; }
+  .acc-block + .acc-block { border-top: 1px solid var(--line); }
+  .folder-bar { border-top: 1px solid var(--line); background: color-mix(in srgb, var(--hover) 45%, transparent); }
+  .folder-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    padding: 7px 14px;
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 500;
+    text-align: left;
+  }
+  .folder-toggle:hover { color: var(--text); }
+  .fchev { display: grid; transition: transform 0.14s; }
+  .fchev.open { transform: rotate(90deg); }
+  .folder-list { padding: 2px 14px 10px 28px; display: flex; flex-direction: column; gap: 6px; }
+  .frow { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 24px; }
+  .fname { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--text-2); min-width: 0; }
+  .ftag {
+    font-size: 10.5px;
+    font-weight: 500;
+    padding: 1px 6px;
+    border-radius: 99px;
+    background: var(--hover);
+    color: var(--muted);
+  }
   input[type="radio"] { margin: 0; accent-color: var(--accent); flex: none; }
 
   .text { flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 0; }

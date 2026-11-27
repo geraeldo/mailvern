@@ -93,12 +93,33 @@ export type Detail = Summary & {
   calendarInvite?: CalendarInvite | null;
 };
 
+export type DiscoveredServers = {
+  providerName: string | null;
+  imapHost: string;
+  imapPort: number;
+  smtpHost: string;
+  smtpPort: number;
+  source: string;
+  sourceLabel: string;
+  verified: boolean;
+};
+
+export type SavedSearch = {
+  id: number;
+  name: string;
+  query: string;
+  scope: SearchScope;
+  position: number;
+  unread: number;
+};
+
 export type SmartName = "flagged" | "unread";
 export type SmartCounts = { flagged: number; unread: number };
 export type BootstrapData = {
   accounts: Account[];
   folders: Folder[];
   smartCounts: SmartCounts;
+  savedSearches: SavedSearch[];
   messages: Summary[];
   outbox: OutboxItem[];
   pendingAgentActions: number;
@@ -194,6 +215,8 @@ export type AgentAccess = {
   error: string | null;
   mode: AgentMode;
   accountModes: Record<number, AgentMode>;
+  disabledAccounts: number[];
+  folderOverrides: Record<number, boolean>;
 };
 
 export type AgentMessagePreview = { id: number; subject: string; fromName: string; fromAddr: string };
@@ -315,6 +338,12 @@ export const api = {
   getSettings: (keys: string[]) => invoke<Record<string, string>>("get_settings", { keys }),
   accounts: () => invoke<Account[]>("accounts"),
   saveAccount: (account: Account, password: string | null) => invoke<Account>("save_account", { account, password }),
+  discoverServers: (email: string) => invoke<DiscoveredServers | null>("discover_servers", { email }),
+  savedSearches: () => invoke<SavedSearch[]>("saved_searches"),
+  saveSavedSearch: (id: number, name: string, query: string, scope: SearchScope) =>
+    invoke<SavedSearch>("save_saved_search", { id, name, query, scope }),
+  deleteSavedSearch: (id: number) => invoke<void>("delete_saved_search", { id }),
+  reorderSavedSearches: (ids: number[]) => invoke<void>("reorder_saved_searches", { ids }),
   deleteAccount: (id: number) => invoke<void>("delete_account", { id }),
   reorderAccounts: (ids: number[]) => invoke<void>("reorder_accounts", { ids }),
   setAccountAlerts: (accountId: number, notify: boolean, badgeMode: AccountBadgeMode) =>
@@ -392,6 +421,8 @@ export const api = {
   resetAgentToken: () => invoke<AgentAccess>("reset_agent_token"),
   setAgentMode: (mode: AgentMode) => invoke<AgentAccess>("set_agent_mode", { mode }),
   setAgentAccountMode: (accountId: number, mode: AgentMode | null) => invoke<AgentAccess>("set_agent_account_mode", { accountId, mode }),
+  setAgentAccountAllowed: (accountId: number, allowed: boolean) => invoke<AgentAccess>("set_agent_account_allowed", { accountId, allowed }),
+  setAgentFolderAllowed: (folderId: number, allowed: boolean | null) => invoke<AgentAccess>("set_agent_folder_allowed", { folderId, allowed }),
   agentActions: (limit = 30) => invoke<AgentAction[]>("agent_actions", { limit }),
   pendingAgentActionsCount: () => invoke<number>("pending_agent_actions_count"),
   approveAgentAction: (id: number) => invoke<AgentAction>("approve_agent_action", { id }),

@@ -1,6 +1,6 @@
 use mail_core::model::{
-    Account, AttachmentContent, BootstrapData, Folder, MailGroup, MailQuery, MessageDetail, MessageSummary, Outgoing, OutboxItem, Rule,
-    RuleActivity, RuleRun, RuleTest, SearchScope, SmartCounts, View,
+    Account, AttachmentContent, BootstrapData, DiscoveredServers, Folder, MailGroup, MailQuery, MessageDetail, MessageSummary, Outgoing,
+    OutboxItem, Rule, RuleActivity, RuleRun, RuleTest, SavedSearch, SearchScope, SmartCounts, View,
 };
 use mail_core::text::{quarantine_file, safe_filename};
 use mail_core::Engine;
@@ -35,6 +35,31 @@ fn accounts(engine: E) -> R<Vec<Account>> {
 #[tauri::command]
 async fn save_account(engine: E<'_>, account: Account, password: Option<String>) -> R<Account> {
     engine.save_account(account, password).await.map_err(err)
+}
+
+#[tauri::command]
+async fn discover_servers(engine: E<'_>, email: String) -> R<Option<DiscoveredServers>> {
+    Ok(engine.discover_servers(&email).await)
+}
+
+#[tauri::command(async)]
+fn saved_searches(engine: E) -> R<Vec<SavedSearch>> {
+    engine.saved_searches().map_err(err)
+}
+
+#[tauri::command(async)]
+fn save_saved_search(engine: E, id: i64, name: String, query: String, scope: SearchScope) -> R<SavedSearch> {
+    engine.save_saved_search(id, &name, &query, &scope).map_err(err)
+}
+
+#[tauri::command(async)]
+fn delete_saved_search(engine: E, id: i64) -> R<()> {
+    engine.delete_saved_search(id).map_err(err)
+}
+
+#[tauri::command(async)]
+fn reorder_saved_searches(engine: E, ids: Vec<i64>) -> R<()> {
+    engine.reorder_saved_searches(&ids).map_err(err)
 }
 
 #[tauri::command(async)]
@@ -1262,6 +1287,11 @@ pub fn run() {
             get_settings,
             accounts,
             save_account,
+            discover_servers,
+            saved_searches,
+            save_saved_search,
+            delete_saved_search,
+            reorder_saved_searches,
             delete_account,
             reorder_accounts,
             set_account_alerts,
@@ -1335,6 +1365,8 @@ pub fn run() {
             agents::reset_agent_token,
             agents::set_agent_mode,
             agents::set_agent_account_mode,
+            agents::set_agent_account_allowed,
+            agents::set_agent_folder_allowed,
             agents::agent_actions,
             agents::pending_agent_actions_count,
             agents::approve_agent_action,

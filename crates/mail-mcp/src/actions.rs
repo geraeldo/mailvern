@@ -307,6 +307,7 @@ fn validate_and_group(ctx: &Ctx, raw_ids: &[i64], refuse_trash: bool) -> Result<
     }
     let mut by_account: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
     for id in ids {
+        crate::tools::ensure_readable(ctx, id)?;
         let (acc_id, _, role) = ctx.engine.message_folder_role(id).map_err(|_| anyhow!("No message #{id}."))?;
         if refuse_trash && role.as_deref() == Some("trash") {
             bail!("Message #{id} is already in Trash. Agents can't permanently delete mail; empty Trash in Mailvern.");
@@ -447,6 +448,9 @@ fn move_messages(ctx: &Ctx, args: Value) -> Result<Out> {
         .iter()
         .find(|f| f.id == a.folder_id)
         .ok_or_else(|| anyhow!("No folder {}. Use list_folders to see folder ids.", a.folder_id))?;
+    if !names.perms.is_folder_allowed(folder) {
+        bail!("Folder {} ({}) is not shared with agents.", folder.id, folder.name);
+    }
     let by_account = validate_and_group(ctx, &a.ids, false)?;
     if by_account.keys().any(|&acc| acc != folder.account_id) {
         bail!("Messages can only be moved to a folder in their own account.");
@@ -523,6 +527,7 @@ fn delete_draft(ctx: &Ctx, args: Value) -> Result<Out> {
     let (msg_id, acc_id) = ctx.engine.find_draft(trimmed)?.ok_or_else(|| {
         anyhow!("No draft {trimmed} in any Drafts folder. Find drafts with search_mail (folder \"drafts\").")
     })?;
+    crate::tools::ensure_readable(ctx, msg_id)?;
     let canonical_id = if trimmed.starts_with('<') { trimmed.to_string() } else { format!("<{trimmed}>") };
     let names = Names::load(ctx)?;
     let previews = message_previews(ctx, &[msg_id]);
@@ -590,16 +595,25 @@ async fn send_mail(ctx: &Ctx, args: Value) -> Result<Out> {
         bail!("The message has no body. Write the message in body.");
     }
     let source = match a.reply_to {
-        Some(id) => Some(ctx.engine.message(id).await?),
+        Some(id) => {
+            crate::tools::ensure_readable(ctx, id)?;
+            Some(ctx.engine.message(id).await?)
+        }
         None => None,
     };
+    let perms = ctx.engine.agent_permissions()?;
     let accounts = ctx.engine.accounts()?;
-    let account_id = a.account_id.or(source.as_ref().map(|s| s.summary.account_id)).or(accounts.first().map(|x| x.id));
+    let account_id = a
+        .account_id
+        .or(source.as_ref().map(|s| s.summary.account_id))
+        .or(accounts.iter().find(|x| perms.is_account_allowed(x.id)).map(|x| x.id));
     let account = account_id
         .and_then(|id| accounts.iter().find(|x| x.id == id))
         .ok_or_else(|| anyhow!("No such account. Use list_folders to see the accounts."))?;
+    if !perms.is_account_allowed(account.id) {
+        bail!("Account {} is not shared with agents.", account.id);
+    }
 
-    let perms = ctx.engine.agent_permissions()?;
     if perms.for_account(account.id) != AgentMode::Auto {
         bail!(
             "Sending mail is disabled for {} (Ask before acting mode). Save a draft with create_draft instead so the user can review and send it in Mailvern.",
@@ -648,6 +662,7 @@ async fn send_draft(ctx: &Ctx, args: Value) -> Result<Out> {
     let (message_id, account_id) = ctx.engine.find_draft(&a.draft_id)?.ok_or_else(|| {
         anyhow!("No draft {} in any Drafts folder. Find drafts with search_mail (folder \"drafts\").", a.draft_id.trim())
     })?;
+    crate::tools::ensure_readable(ctx, message_id)?;
     let accounts = ctx.engine.accounts()?;
     let account = accounts.iter().find(|x| x.id == account_id).ok_or_else(|| anyhow!("The draft's account is gone."))?;
 

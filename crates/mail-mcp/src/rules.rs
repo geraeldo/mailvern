@@ -253,6 +253,11 @@ fn create_rule(ctx: &Ctx, args: Value) -> Result<Out> {
     rule.name = rule.name.trim().to_string();
     ctx.engine.check_rule(&rule)?;
     let names = Names::load(ctx)?;
+    if let Some(acc_id) = rule.account_id {
+        if !names.perms.is_account_allowed(acc_id) {
+            bail!("Account {acc_id} is not shared with agents.");
+        }
+    }
     let summary = format!("Add rule “{}”", rule.name);
     let preview = AgentActionPreview {
         messages: vec![],
@@ -386,8 +391,20 @@ fn test_rule(ctx: &Ctx, args: Value) -> Result<Out> {
             parse(Value::Object(a))?
         }
     };
-    let t = ctx.engine.test_rule(&rule, folder_id)?;
     let names = Names::load(ctx)?;
+    if let Some(acc_id) = folder_id.and_then(|fid| names.folders.iter().find(|f| f.id == fid)).map(|f| f.account_id).or(rule.account_id) {
+        if !names.perms.is_account_allowed(acc_id) {
+            bail!("Account {acc_id} is not shared with agents.");
+        }
+    }
+    if let Some(fid) = folder_id {
+        if let Some(f) = names.folders.iter().find(|f| f.id == fid) {
+            if !names.perms.is_folder_allowed(f) {
+                bail!("Folder {fid} is not shared with agents.");
+            }
+        }
+    }
+    let t = ctx.engine.test_rule(&rule, folder_id)?;
     let place = match folder_id {
         Some(f) => names.folder(f),
         None => "the Inbox".into(),

@@ -10,7 +10,7 @@ pub const AGENT_MODE_KEY: &str = "mcp_mode";
 const MAX_RESOLVED_HISTORY: usize = 200;
 
 impl Engine {
-    /// Current global default + per-account MCP permission overrides.
+    /// Current global default + per-account MCP permission overrides and account/folder allowlists.
     pub fn agent_permissions(&self) -> Result<AgentPermissions> {
         let default_mode = self
             .db
@@ -19,7 +19,14 @@ impl Engine {
             .map(AgentMode::parse)
             .unwrap_or_default();
         let account_modes = self.db.agent_account_modes()?;
-        Ok(AgentPermissions { default_mode, account_modes })
+        let disabled_accounts = self.db.agent_disabled_accounts()?;
+        let folder_overrides = self.db.agent_folder_overrides()?;
+        Ok(AgentPermissions {
+            default_mode,
+            account_modes,
+            disabled_accounts,
+            folder_overrides,
+        })
     }
 
     /// Sets the global default MCP permission mode.
@@ -32,6 +39,59 @@ impl Engine {
         // Ensure the account exists before inserting a foreign-key row.
         self.db.account(account_id)?;
         self.db.set_agent_account_mode(account_id, mode)
+    }
+
+    /// Enables or hides an entire account from MCP agents.
+    pub fn set_agent_account_allowed(&self, account_id: i64, allowed: bool) -> Result<()> {
+        self.db.account(account_id)?;
+        self.db.set_agent_account_allowed(account_id, allowed)
+    }
+
+    /// Overrides whether MCP agents can read a folder (`None` restores the default:
+    /// Spam/Trash hidden, all other folders readable).
+    pub fn set_agent_folder_allowed(&self, folder_id: i64, allowed: Option<bool>) -> Result<()> {
+        self.db.folder(folder_id)?;
+        self.db.set_agent_folder_allowed(folder_id, allowed)
+    }
+
+    /// Folder ids MCP agents are currently allowed to read.
+    pub fn agent_readable_folder_ids(&self) -> Result<Vec<i64>> {
+        let perms = self.agent_permissions()?;
+        let folders = self.db.folders()?;
+        Ok(perms.allowed_folder_ids(&folders))
+    }
+
+    /// Checks whether an MCP agent may read `message_id`.
+    /// Checks every folder copy of the same `(account_id, message_id)` so Gmail's All Mail
+    /// never exposes a message that also sits in Spam, Trash, or another hidden folder.
+    pub fn is_message_agent_readable(&self, message_id: i64) -> Result<MessageReadability> {
+        let copies = self.db.message_folder_copies(message_id)?;
+        if copies.is_empty() {
+            return Ok(MessageReadability::Denied);
+        }
+        let perms = self.agent_permissions()?;
+        let mut spam_trash_block: Option<(i64, i64, String)> = None;
+        for (account_id, folder_id, role) in copies {
+            if !perms.is_account_allowed(account_id) {
+                return Ok(MessageReadability::Denied);
+            }
+            let allowed = perms
+                .folder_overrides
+                .get(&folder_id)
+                .copied()
+                .unwrap_or(!AgentPermissions::is_spam_or_trash_role(role.as_deref()));
+            if !allowed {
+                if let Some(r) = role.filter(|r| r == "junk" || r == "trash") {
+                    spam_trash_block = Some((account_id, folder_id, r));
+                } else {
+                    return Ok(MessageReadability::Denied);
+                }
+            }
+        }
+        match spam_trash_block {
+            Some((account_id, folder_id, role)) => Ok(MessageReadability::HiddenSpamTrash { account_id, folder_id, role }),
+            None => Ok(MessageReadability::Allowed),
+        }
     }
 
     fn emit_agent_actions_changed(&self) {
@@ -246,6 +306,22 @@ impl Engine {
                 Ok(())
             }
             AgentActionSpec::DeleteRule { id } => self.delete_rule(*id),
+            AgentActionSpec::AllowFolders { folder_ids } => {
+                let perms = self.agent_permissions()?;
+                let mut granted = 0usize;
+                for &fid in folder_ids {
+                    if let Ok((acc_id, _, _)) = self.db.folder(fid) {
+                        if perms.is_account_allowed(acc_id) {
+                            self.db.set_agent_folder_allowed(fid, Some(true))?;
+                            granted += 1;
+                        }
+                    }
+                }
+                if granted == 0 {
+                    return Err(anyhow!("Those folders are no longer available"));
+                }
+                Ok(())
+            }
             AgentActionSpec::SendMail { .. } => Err(anyhow!("SendMail actions cannot be executed from the queue")),
         }
     }

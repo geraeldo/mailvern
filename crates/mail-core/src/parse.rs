@@ -571,7 +571,7 @@ fn mime_of(p: &mail_parser::MessagePart) -> String {
 /// Computes list/search fields after a full body download.
 pub fn body_info(raw: &[u8]) -> BodyInfo {
     let Some(m) = MessageParser::default().parse(raw) else {
-        return BodyInfo { snippet: String::new(), search_text: String::new(), has_attachments: false };
+        return BodyInfo { snippet: String::new(), search_text: String::new(), has_attachments: false, attachment_names: String::new() };
     };
     let html = html_body_ref(&m);
     let plain = plain_body_ref(&m);
@@ -589,10 +589,19 @@ pub fn body_info(raw: &[u8]) -> BodyInfo {
         (None, None) => m.body_text(0).as_deref().map(|t| clean_text_capped(t, 20_000)).unwrap_or_default(),
     };
     let snippet = search_text.chars().take(220).collect();
+    let atts = listed_attachments(&m, html);
+    let attachment_names = atts
+        .iter()
+        .filter_map(|(_, p)| p.attachment_name())
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
     BodyInfo {
         snippet,
         search_text,
-        has_attachments: !listed_attachments(&m, html).is_empty(),
+        has_attachments: !atts.is_empty(),
+        attachment_names,
     }
 }
 

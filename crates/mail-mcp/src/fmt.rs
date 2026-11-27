@@ -105,7 +105,12 @@ impl Names {
     /// A line for search results when some account's mail may be missing, so "nothing found"
     /// isn't taken for "no such mail".
     pub fn warning(&self) -> Option<String> {
-        let bad: Vec<String> = self.accounts.iter().filter_map(|a| self.trouble(a).map(|t| format!("{} ({t})", a.email))).collect();
+        let bad: Vec<String> = self
+            .accounts
+            .iter()
+            .filter(|a| self.perms.is_account_allowed(a.id))
+            .filter_map(|a| self.trouble(a).map(|t| format!("{} ({t})", a.email)))
+            .collect();
         (!bad.is_empty()).then(|| format!("Note: Mailvern's copy of the mail may be incomplete for {}. Results can be missing until it has synced; tell the user rather than concluding the mail doesn't exist.", bad.join(", ")))
     }
 
@@ -132,20 +137,35 @@ impl Names {
         if self.accounts.is_empty() {
             return "No mail accounts are set up in Mailvern yet.".into();
         }
-        self.accounts
-            .iter()
+        let allowed_accounts: Vec<&Account> = self.accounts.iter().filter(|a| self.perms.is_account_allowed(a.id)).collect();
+        if allowed_accounts.is_empty() {
+            return "No mail accounts are shared with agents. Enable accounts in Mailvern › Settings › Agent access.".into();
+        }
+        allowed_accounts
+            .into_iter()
             .map(|a| {
                 let label = [a.label.as_str(), a.name.as_str()].into_iter().find(|s| !s.is_empty()).unwrap_or("");
-                let folders: Vec<String> = self
-                    .folders
-                    .iter()
-                    .filter(|f| f.account_id == a.id)
-                    .map(|f| {
-                        let role = f.role.as_deref().map(|r| format!(" [{r}]")).unwrap_or_default();
-                        let unread = if f.unread > 0 { format!(" · {} unread", f.unread) } else { String::new() };
-                        format!("  folder {}: {}{role}{unread}", f.id, f.name)
-                    })
-                    .collect();
+                let mut hidden_spam_trash: Vec<&str> = Vec::new();
+                let mut folders: Vec<String> = Vec::new();
+                for f in self.folders.iter().filter(|f| f.account_id == a.id) {
+                    if !self.perms.is_folder_allowed(f) {
+                        match f.role.as_deref() {
+                            Some("junk") if !hidden_spam_trash.contains(&"Spam") => hidden_spam_trash.push("Spam"),
+                            Some("trash") if !hidden_spam_trash.contains(&"Trash") => hidden_spam_trash.push("Trash"),
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    let role = f.role.as_deref().map(|r| format!(" [{r}]")).unwrap_or_default();
+                    let unread = if f.unread > 0 { format!(" · {} unread", f.unread) } else { String::new() };
+                    folders.push(format!("  folder {}: {}{role}{unread}", f.id, f.name));
+                }
+                if !hidden_spam_trash.is_empty() {
+                    folders.push(format!(
+                        "  ({} hidden by default — call request_folder_access if the user asks to check)",
+                        hidden_spam_trash.join(" and ")
+                    ));
+                }
                 let label = if label.is_empty() { String::new() } else { format!("{label} ") };
                 let mode = match self.perms.for_account(a.id) {
                     AgentMode::Approval => "ask before acting",

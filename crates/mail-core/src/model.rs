@@ -445,8 +445,26 @@ pub struct SmartCounts {
     pub unread: i64,
 }
 
+/// Auto-discovered IMAP/SMTP settings for an email address.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredServers {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_name: Option<String>,
+    pub imap_host: String,
+    pub imap_port: u16,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    /// "autoconfig_https" | "ispdb" | "mx_provider" | "mx_ispdb" | "dns_srv"
+    pub source: String,
+    /// Short explanation of where the settings came from.
+    pub source_label: String,
+    /// True for HTTPS domain autoconfig or Mozilla ISPDB; false when inferred from DNS MX/SRV.
+    pub verified: bool,
+}
+
 /// Where a search looks.
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum SearchScope {
     /// Every folder of every account.
@@ -465,6 +483,23 @@ pub enum SearchScope {
     },
 }
 
+/// A user-saved search pinned in the sidebar.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedSearch {
+    #[serde(default)]
+    pub id: i64,
+    pub name: String,
+    pub query: String,
+    #[serde(default)]
+    pub scope: SearchScope,
+    #[serde(default)]
+    pub position: i64,
+    /// Unread messages matching this search locally.
+    #[serde(default)]
+    pub unread: i64,
+}
+
 /// A structured mail search: every field that is set must match. Used by the AI tools.
 #[derive(Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase", default)]
@@ -477,6 +512,12 @@ pub struct MailQuery {
     pub from: Option<String>,
     /// Part of a recipient's name or address (To or Cc).
     pub to: Option<String>,
+    /// Part of an attachment filename (e.g. "pdf", "invoice").
+    pub filename: Option<String>,
+    /// Minimum message size in bytes (inclusive).
+    pub larger: Option<i64>,
+    /// Maximum message size in bytes (exclusive).
+    pub smaller: Option<i64>,
     /// Unix seconds, inclusive.
     pub after: Option<i64>,
     /// Unix seconds, exclusive.
@@ -495,6 +536,10 @@ pub struct MailQuery {
     /// Messages the mail server matched; they count as matching `text`, `subject`, `from` and `to`.
     #[serde(skip)]
     pub server_hits: Vec<i64>,
+    /// When set (by MCP), restricts matches strictly to these folder ids and excludes messages
+    /// whose Message-ID also exists in any folder outside this allowlist (e.g. Spam/Trash vs All Mail).
+    #[serde(skip)]
+    pub allowed_folders: Option<Vec<i64>>,
 }
 
 /// One page of matches and how many there are in all.
@@ -617,12 +662,29 @@ impl AgentMode {
     }
 }
 
-/// Global default plus per-account MCP permission overrides.
+/// Global default plus per-account MCP permission overrides and account/folder allowlists.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentPermissions {
     pub default_mode: AgentMode,
     pub account_modes: std::collections::HashMap<i64, AgentMode>,
+    /// Account ids explicitly hidden from MCP agents.
+    #[serde(default)]
+    pub disabled_accounts: Vec<i64>,
+    /// Per-folder read visibility overrides (`true` = allowed, `false` = hidden).
+    /// When absent, Spam (`junk`) and Trash (`trash`) default to hidden; all other folders default to allowed.
+    #[serde(default)]
+    pub folder_overrides: std::collections::HashMap<i64, bool>,
+}
+
+/// Whether an MCP agent may read a specific message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MessageReadability {
+    Allowed,
+    /// Hidden because the message (or another copy of it) is in a Spam/Trash folder of an enabled account.
+    HiddenSpamTrash { account_id: i64, folder_id: i64, role: String },
+    /// Hidden because its account is disabled or a non-Spam/Trash folder was explicitly excluded by the user.
+    Denied,
 }
 
 impl AgentPermissions {
@@ -630,18 +692,47 @@ impl AgentPermissions {
         self.account_modes.get(&account_id).copied().unwrap_or(self.default_mode)
     }
 
-    /// True if at least one account resolves to Auto (or default is Auto when no accounts exist).
+    pub fn is_account_allowed(&self, account_id: i64) -> bool {
+        !self.disabled_accounts.contains(&account_id)
+    }
+
+    pub fn is_spam_or_trash_role(role: Option<&str>) -> bool {
+        matches!(role, Some("junk" | "trash"))
+    }
+
+    pub fn is_folder_allowed(&self, folder: &Folder) -> bool {
+        if !self.is_account_allowed(folder.account_id) {
+            return false;
+        }
+        self.folder_overrides
+            .get(&folder.id)
+            .copied()
+            .unwrap_or(!Self::is_spam_or_trash_role(folder.role.as_deref()))
+    }
+
+    pub fn allowed_folder_ids(&self, folders: &[Folder]) -> Vec<i64> {
+        folders.iter().filter(|f| self.is_folder_allowed(f)).map(|f| f.id).collect()
+    }
+
+    /// True if at least one enabled account resolves to Auto (or default is Auto when no accounts exist).
     pub fn any_auto(&self, account_ids: &[i64]) -> bool {
         if account_ids.is_empty() {
             self.default_mode == AgentMode::Auto
         } else {
-            account_ids.iter().any(|&id| self.for_account(id) == AgentMode::Auto)
+            account_ids
+                .iter()
+                .filter(|&&id| self.is_account_allowed(id))
+                .any(|&id| self.for_account(id) == AgentMode::Auto)
         }
     }
 
-    /// True only if default is Auto and every account resolves to Auto.
+    /// True only if default is Auto and every enabled account resolves to Auto.
     pub fn all_auto(&self, account_ids: &[i64]) -> bool {
-        self.default_mode == AgentMode::Auto && account_ids.iter().all(|&id| self.for_account(id) == AgentMode::Auto)
+        self.default_mode == AgentMode::Auto
+            && account_ids
+                .iter()
+                .filter(|&&id| self.is_account_allowed(id))
+                .all(|&id| self.for_account(id) == AgentMode::Auto)
     }
 }
 
@@ -672,6 +763,9 @@ pub enum AgentActionSpec {
     UpdateRule { rule: Rule },
     #[serde(rename_all = "camelCase")]
     DeleteRule { id: i64 },
+    /// Agent requests read access to currently hidden Spam/Trash folders (always requires approval).
+    #[serde(rename_all = "camelCase")]
+    AllowFolders { folder_ids: Vec<i64> },
     /// Recorded in Auto mode for the activity log (never queued as pending).
     #[serde(rename_all = "camelCase")]
     SendMail { to: Vec<String>, subject: String, send_at: Option<i64> },
@@ -695,6 +789,7 @@ impl AgentActionSpec {
             AgentActionSpec::CreateRule { .. } => "createRule",
             AgentActionSpec::UpdateRule { .. } => "updateRule",
             AgentActionSpec::DeleteRule { .. } => "deleteRule",
+            AgentActionSpec::AllowFolders { .. } => "allowFolders",
             AgentActionSpec::SendMail { .. } => "sendMail",
         }
     }
@@ -754,6 +849,7 @@ pub struct BootstrapData {
     pub accounts: Vec<Account>,
     pub folders: Vec<Folder>,
     pub smart_counts: SmartCounts,
+    pub saved_searches: Vec<SavedSearch>,
     pub messages: Vec<MessageSummary>,
     pub outbox: Vec<OutboxItem>,
     pub pending_agent_actions: usize,

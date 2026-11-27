@@ -34,6 +34,8 @@ pub struct AgentAccess {
     error: Option<String>,
     mode: AgentMode,
     account_modes: HashMap<i64, AgentMode>,
+    disabled_accounts: Vec<i64>,
+    folder_overrides: HashMap<i64, bool>,
 }
 
 fn setting(engine: &Engine, key: &str) -> Option<String> {
@@ -101,6 +103,8 @@ impl Agents {
             error: st.1.clone(),
             mode: perms.default_mode,
             account_modes: perms.account_modes,
+            disabled_accounts: perms.disabled_accounts,
+            folder_overrides: perms.folder_overrides,
         }
     }
 
@@ -116,6 +120,8 @@ impl Agents {
             error: st.1.clone(),
             mode: perms.default_mode,
             account_modes: perms.account_modes,
+            disabled_accounts: perms.disabled_accounts,
+            folder_overrides: perms.folder_overrides,
         }
     }
 }
@@ -159,6 +165,28 @@ pub async fn set_agent_account_mode(
     mode: Option<AgentMode>,
 ) -> R {
     engine.set_agent_account_mode(account_id, mode).map_err(|e| format!("{e:#}"))?;
+    Ok(agents.status(&engine).await)
+}
+
+#[tauri::command]
+pub async fn set_agent_account_allowed(
+    engine: State<'_, Arc<Engine>>,
+    agents: State<'_, Agents>,
+    account_id: i64,
+    allowed: bool,
+) -> R {
+    engine.set_agent_account_allowed(account_id, allowed).map_err(|e| format!("{e:#}"))?;
+    Ok(agents.status(&engine).await)
+}
+
+#[tauri::command]
+pub async fn set_agent_folder_allowed(
+    engine: State<'_, Arc<Engine>>,
+    agents: State<'_, Agents>,
+    folder_id: i64,
+    allowed: Option<bool>,
+) -> R {
+    engine.set_agent_folder_allowed(folder_id, allowed).map_err(|e| format!("{e:#}"))?;
     Ok(agents.status(&engine).await)
 }
 

@@ -1,5 +1,5 @@
 import { Menu } from "@tauri-apps/api/menu";
-import type { Account, Addr, Detail, MailView, Summary } from "./api";
+import type { Account, Addr, Detail, MailView, SavedSearch, Summary } from "./api";
 import { api } from "./api";
 import { formatAddr } from "./format";
 import { openRuleEditor, ruleFromAddress, ruleFromMessage, describeFromMessage, type FromMessage } from "./rules.svelte";
@@ -9,6 +9,7 @@ import {
   toast, setQuery, isSenderTrusted, trustSender, trustDomain, checkForMail, checkAccountForMail, copyThread, selectedRows, snoozeSelected, unsnoozeSelected, moveRows, moveSelected, roleOf, editDraft,
   folderById, emptyFolderView, promptCreateFolder, promptRenameFolder, deleteFolderConfirm,
   openRawSource, exportMessageEml, printOpenThread, forwardAsAttachment,
+  openSaveSearchModal, deleteSavedSearch,
 } from "./state.svelte";
 
 type Item = { text: string; action: () => void; enabled?: boolean } | { text: string; items: Item[] } | "-";
@@ -55,6 +56,14 @@ export function allAccountsMenu(fold: Fold) {
     { text: "Add Account…", action: () => openAccountSettings("new") },
     "-",
     ...foldItems(fold),
+  ]);
+}
+
+export function savedSearchMenu(s: SavedSearch) {
+  return popup([
+    { text: "Edit Saved Search…", action: () => openSaveSearchModal(s) },
+    "-",
+    { text: "Delete Saved Search", action: () => deleteSavedSearch(s) },
   ]);
 }
 

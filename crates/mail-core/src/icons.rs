@@ -393,7 +393,7 @@ impl Resolve for PublicOnly {
     }
 }
 
-fn is_public(ip: &IpAddr) -> bool {
+pub(crate) fn is_public(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();

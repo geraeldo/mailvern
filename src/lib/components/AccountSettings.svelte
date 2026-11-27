@@ -4,7 +4,7 @@
   import Editor from "./Editor.svelte";
   import MailFrame from "./MailFrame.svelte";
   import { ui, loadAccounts, loadFolders, setView, toast, checkAccountForMail } from "../state.svelte";
-  import { api, type Account } from "../api";
+  import { api, type Account, type DiscoveredServers } from "../api";
   import { accountColors } from "../format";
   import { detectProvider, guessServers } from "../providers";
   import { sanitize } from "../html";
@@ -71,8 +71,15 @@
   let newAliasName = $state("");
   let newAliasEmail = $state("");
   let aliasError = $state("");
-  let hostsTouched = false;
+  let hostsTouched = $state(false);
   let loadedTarget: number | "new" | null = null;
+  let discovering = $state(false);
+  let discovered = $state<DiscoveredServers | null>(null);
+  let dnsTrusted = $state(false);
+  let discoverTimer: ReturnType<typeof setTimeout> | undefined;
+  let discoverSeq = 0;
+
+  $effect(() => () => clearTimeout(discoverTimer));
 
   const provider = $derived(detectProvider(draft.email));
 
@@ -129,6 +136,11 @@
     sigHtml = next.signature;
     sigKey++;
     hostsTouched = next.id !== 0;
+    clearTimeout(discoverTimer);
+    discoverSeq++;
+    discovering = false;
+    discovered = null;
+    dnsTrusted = false;
     originSnapshot = snapshotOf(next, normalizeSignature(next.signature));
     loadedTarget = t;
   }
@@ -154,18 +166,59 @@
 
   function onEmail() {
     if (hostsTouched || draft.id) return;
+    clearTimeout(discoverTimer);
+    discoverSeq++;
+    discovering = false;
+    discovered = null;
+    dnsTrusted = false;
+
     const p = detectProvider(draft.email);
     if (p) {
       Object.assign(draft, p.servers);
       advanced = false;
       return;
     }
-    const s = guessServers(draft.email);
-    if (s) {
-      Object.assign(draft, s);
-      // Custom domain: reveal servers so the user can confirm/adjust.
-      advanced = true;
-    }
+
+    const email = draft.email.trim();
+    const dom = email.split("@")[1]?.trim() ?? "";
+    if (!dom || !dom.includes(".") || dom.endsWith(".")) return;
+
+    const seq = ++discoverSeq;
+    discoverTimer = setTimeout(async () => {
+      if (seq !== discoverSeq || hostsTouched || draft.id) return;
+      discovering = true;
+      try {
+        const found = await api.discoverServers(email);
+        if (seq !== discoverSeq || hostsTouched || draft.id) return;
+        if (found) {
+          discovered = found;
+          draft.imapHost = found.imapHost;
+          draft.imapPort = found.imapPort;
+          draft.smtpHost = found.smtpHost;
+          draft.smtpPort = found.smtpPort;
+          dnsTrusted = found.verified;
+          advanced = !found.verified;
+          return;
+        }
+      } catch {
+        if (seq !== discoverSeq || hostsTouched || draft.id) return;
+      } finally {
+        if (seq === discoverSeq) discovering = false;
+      }
+      const s = guessServers(email);
+      if (s && !hostsTouched && !draft.id) {
+        Object.assign(draft, s);
+        advanced = true;
+      }
+    }, 450);
+  }
+
+  function onHostEdit() {
+    hostsTouched = true;
+    clearTimeout(discoverTimer);
+    discoverSeq++;
+    discovering = false;
+    dnsTrusted = true;
   }
 
   function setSigMode(mode: "visual" | "html") {
@@ -189,6 +242,11 @@
     if (!draft.imapHost.trim() || !draft.smtpHost.trim()) {
       advanced = true;
       error = "Enter the incoming and outgoing servers";
+      return;
+    }
+    if (!draft.id && discovered && !discovered.verified && !hostsTouched && !dnsTrusted) {
+      advanced = true;
+      error = "Review the discovered servers and confirm you trust them before connecting";
       return;
     }
     if (!draft.id && !password) {
@@ -303,6 +361,28 @@
         <span class="detected-ok"><Icon name="check" size={13} stroke={2.4} /> {provider.name} servers configured</span>
         <button type="button" class="link" onclick={() => (advanced = !advanced)}>{advanced ? "Hide servers" : "Edit"}</button>
       </div>
+    {:else if !draft.id && discovering}
+      <div class="detected">
+        <span class="detected-busy"><span class="mini-spin"></span> Looking up mail servers…</span>
+      </div>
+    {:else if !draft.id && discovered}
+      <div class="detected">
+        {#if discovered.verified}
+          <span class="detected-ok">
+            <Icon name="check" size={13} stroke={2.4} />
+            {discovered.providerName ? `${discovered.providerName} servers configured` : "Mail servers configured"}
+          </span>
+        {:else}
+          <span class="detected-warn">
+            <Icon name="alert" size={13} />
+            {discovered.sourceLabel}
+          </span>
+        {/if}
+        <button type="button" class="link" onclick={() => (advanced = !advanced)}>{advanced ? "Hide servers" : "Edit"}</button>
+      </div>
+      {#if discovered.verified}
+        <p class="hint">{discovered.sourceLabel}</p>
+      {/if}
     {/if}
     {#if !draft.id && provider?.passwordHint}
       <p class="hint">{provider.passwordHint}</p>
@@ -420,7 +500,7 @@
         <div class="grid servers">
           <label>
             <span>Incoming (IMAP)</span>
-            <input class="field" bind:value={draft.imapHost} oninput={() => (hostsTouched = true)} placeholder="imap.example.com" spellcheck="false" />
+            <input class="field" bind:value={draft.imapHost} oninput={onHostEdit} placeholder="imap.example.com" spellcheck="false" />
           </label>
           <label class="port">
             <span>Port</span>
@@ -428,7 +508,7 @@
           </label>
           <label>
             <span>Outgoing (SMTP)</span>
-            <input class="field" bind:value={draft.smtpHost} oninput={() => (hostsTouched = true)} placeholder="smtp.example.com" spellcheck="false" />
+            <input class="field" bind:value={draft.smtpHost} oninput={onHostEdit} placeholder="smtp.example.com" spellcheck="false" />
           </label>
           <label class="port">
             <span>Port</span>
@@ -436,6 +516,12 @@
           </label>
         </div>
         <p class="hint">SSL on 993 and 465. STARTTLS on 587.</p>
+        {#if !draft.id && discovered && !discovered.verified && !hostsTouched}
+          <label class="trust-check">
+            <input type="checkbox" bind:checked={dnsTrusted} />
+            <span>I checked these servers and trust them</span>
+          </label>
+        {/if}
       </div>
     {/if}
   </section>
@@ -499,6 +585,27 @@
     font-size: 12.5px;
   }
   .detected-ok { display: inline-flex; align-items: center; gap: 6px; color: var(--success); font-weight: 500; }
+  .detected-warn { display: inline-flex; align-items: center; gap: 6px; color: var(--warn-text, var(--warn)); font-weight: 500; }
+  .detected-busy { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); }
+  .mini-spin {
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    border: 1.5px solid var(--line-strong);
+    border-top-color: var(--muted);
+    animation: spin 0.8s linear infinite;
+  }
+  .trust-check {
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--line);
+    cursor: pointer;
+  }
+  .trust-check input { margin: 0; accent-color: var(--accent); }
+  .trust-check span { font-size: 12.5px; color: var(--text); font-weight: 450; }
   .link { border: 0; padding: 0; background: none; color: var(--accent); font-size: 12.5px; font-weight: 500; cursor: pointer; }
   .link:hover { text-decoration: underline; }
   .swatches { display: flex; gap: 8px; margin-top: 4px; }
