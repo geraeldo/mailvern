@@ -6,6 +6,7 @@
   import { api, type Summary } from "../api";
   import { escapeHtml } from "../html";
   import { displayName, shortDate } from "../format";
+  import { overlayScroll } from "../scrollbar";
 
   let { s }: { s: AiSearch } = $props();
 
@@ -129,7 +130,8 @@
 
 <div class="answer-view">
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions, a11y_mouse_events_have_key_events -->
-  <div class="scroll body" bind:this={scroller} onclick={onClick} onmouseover={onOver} onmouseout={onOut}>
+  <div class="col-scroll-wrap">
+    <div class="col-scroll body" bind:this={scroller} onclick={onClick} onmouseover={onOver} onmouseout={onOut} use:overlayScroll>
     {#each s.turns as t, i (i)}
       <section class="turn" class:first={i === 0}>
         <div class="q">{t.question}</div>
@@ -185,6 +187,7 @@
         {/if}
       </section>
     {/each}
+    </div>
   </div>
 
   <div class="ask">

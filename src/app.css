@@ -156,23 +156,52 @@ input:focus-visible, textarea:focus-visible, [contenteditable="true"]:focus-visi
 .field::placeholder { color: var(--muted); }
 
 .scroll { overflow-y: auto; overscroll-behavior: contain; }
-.scroll::-webkit-scrollbar { width: 10px; height: 10px; }
-.scroll::-webkit-scrollbar-track,
-.scroll::-webkit-scrollbar-corner { background: transparent; }
-.scroll::-webkit-scrollbar-thumb {
-  background-color: transparent;
-  border-radius: 10px;
-  border: 2px solid transparent;
-  background-clip: padding-box;
+
+.col-scroll-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
-.scroll:hover::-webkit-scrollbar-thumb,
-.scroll.scrolling::-webkit-scrollbar-thumb,
-.scroll:active::-webkit-scrollbar-thumb {
-  background-color: var(--scrollbar);
+.col-scroll-wrap.hidden { display: none; }
+.col-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
 }
-.scroll::-webkit-scrollbar-thumb:hover,
-.scroll::-webkit-scrollbar-thumb:active {
-  background-color: var(--scrollbar-hover);
+.col-scroll::-webkit-scrollbar { display: none; }
+
+.osb-track {
+  position: absolute;
+  top: 2px;
+  right: 1px;
+  bottom: 2px;
+  width: 10px;
+  z-index: 12;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease;
+}
+.osb-track.visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+.osb-thumb {
+  position: absolute;
+  top: 0;
+  right: 2px;
+  width: 6px;
+  border-radius: 99px;
+  background: var(--scrollbar);
+  transition: background-color 0.12s ease;
+  will-change: transform;
+}
+.osb-thumb:hover,
+.osb-track.dragging .osb-thumb {
+  background: var(--scrollbar-hover);
 }
 
 .drag { -webkit-app-region: drag; }

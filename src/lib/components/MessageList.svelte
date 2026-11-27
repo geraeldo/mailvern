@@ -14,6 +14,7 @@
   import { addrOf } from "../avatars.svelte";
   import { api } from "../api";
   import { ai, searchReady } from "../ai/config.svelte";
+  import { overlayScroll } from "../scrollbar";
 
   type AiSearchMod = typeof import("../ai/search.svelte");
   let aiSearchMod: Promise<AiSearchMod> | null = null;
@@ -326,7 +327,8 @@
   {/if}
 
   {#if ui.view.kind === "outbox"}
-    <div class="scroll body">
+    <div class="col-scroll-wrap">
+      <div class="col-scroll body" use:overlayScroll>
       {#each ui.outbox as o (o.id)}
         <button type="button" class="row out" class:selected={o.id === ui.outboxSelected} onclick={() => (ui.outboxSelected = o.id)}>
           <span class="mark">{#if o.error}<span class="err-dot" title={o.error}></span>{/if}</span>
@@ -346,9 +348,11 @@
           <p class="empty-title">No scheduled mail</p>
         </div>
       {/each}
+      </div>
     </div>
   {:else}
-    <div class="scroll body" bind:this={scroller} bind:clientHeight={height} onscroll={onScroll}>
+    <div class="col-scroll-wrap">
+      <div class="col-scroll body" bind:this={scroller} bind:clientHeight={height} onscroll={onScroll} use:overlayScroll>
       {#if ui.listReady && !ui.list.length && !ui.searchingServer && !running}
         <div class="empty">
           {#if ui.ai}
@@ -422,6 +426,7 @@
             </span>
           </button>
         {/each}
+      </div>
       </div>
     </div>
   {/if}

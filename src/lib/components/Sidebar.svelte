@@ -5,6 +5,7 @@
     reorderAccounts, reorderFolders, reorderSavedSearches, openSavedSearch, unifiedRoles, toggleSidebar,
   } from "../state.svelte";
   import { sortable } from "../sortable";
+  import { overlayScroll } from "../scrollbar";
   import { accountMenu, allAccountsMenu, folderMenu, savedSearchMenu } from "../menus";
   import { hint } from "../shortcuts.svelte";
   import { api, type Folder, type MailView } from "../api";
@@ -88,7 +89,8 @@
     </button>
   </header>
 
-  <nav class="scroll">
+  <div class="col-scroll-wrap">
+    <nav class="col-scroll" use:overlayScroll>
     {#if showUnified}
       <div class="group all">
         <div class="head-row">
@@ -257,7 +259,8 @@
         <Icon name="plus" /> Add account
       </button>
     {/if}
-  </nav>
+    </nav>
+  </div>
 
   <footer>
     <button class="icon-btn" title={hint("Settings", "settings")} aria-label="Settings" onclick={() => openSettings()}>

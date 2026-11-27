@@ -10,6 +10,7 @@
   import { hint, keymap, display } from "../shortcuts.svelte";
   import { whenLabel } from "../when";
   import { readerPool, type ReaderPane } from "../mail-cache.svelte";
+  import { overlayScroll } from "../scrollbar";
 
   let aiAnswerPromise: Promise<typeof import("./AiAnswer.svelte").default> | null = null;
   const loadAiAnswer = () => (aiAnswerPromise ??= import("./AiAnswer.svelte").then((m) => m.default));
@@ -122,7 +123,8 @@
   {#if outboxItem}
     {@const o = outboxItem}
     {@const acc = accountById(o.accountId)}
-    <div class="scroll content">
+    <div class="col-scroll-wrap">
+      <div class="col-scroll content" use:overlayScroll>
       <article>
         <h2>{o.message.subject || "(no subject)"}</h2>
         <div class="queued" class:failed={!!o.error}>
@@ -145,6 +147,7 @@
           {/key}
         </div>
       </article>
+      </div>
     </div>
   {:else if answer && ui.ai}
     {#await loadAiAnswer() then AiAnswerComp}
@@ -189,7 +192,8 @@
     {@const active = showEmail && d?.id === pane.id}
     {@const paneIsDraft = roleOf(pane.detail) === "drafts"}
     {@const paneFocus = focusIdOf(pane)}
-    <div class="scroll content" class:hidden={!active} use:keepScroll={{ pane, active }}>
+    <div class="col-scroll-wrap" class:hidden={!active}>
+      <div class="col-scroll content" use:keepScroll={{ pane, active }} use:overlayScroll>
       <article class="pane-article">
         <h2>{pane.detail.subject || "(no subject)"}</h2>
         {#each pane.thread as m, i (m.id)}
@@ -220,6 +224,7 @@
           </div>
         {/if}
       </article>
+      </div>
     </div>
   {/each}
 </section>
@@ -261,7 +266,6 @@
   .sep { width: 1px; height: 18px; background: var(--line); margin: 0 6px; }
   .icon-btn.flagged { color: var(--flag); }
   .content { flex: 1; }
-  .content.hidden { display: none; }
   article { max-width: 860px; margin: 0 auto; padding: 14px 36px 48px; animation: fade 0.12s ease-out; }
   article.pane-article { animation: none; }
   h2 {
