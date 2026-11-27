@@ -914,6 +914,82 @@ fn open_url(app: tauri::AppHandle, url: String) -> R<()> {
     app.opener().open_url(parsed.as_str(), None::<&str>).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn hide_window(window: tauri::Window) {
+    if window.label() == "main" {
+        hide_main_window(&window);
+    }
+}
+
+const MENU_CLOSE_LAYER: &str = "close-layer";
+
+/// Builds the app menu with a custom ⌘W / Ctrl+W item instead of the predefined Close Window
+/// action so the frontend can dismiss open modal sheets before hiding the main window.
+fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+
+    let close_item = MenuItem::with_id(app, MENU_CLOSE_LAYER, "Close", true, Some("CmdOrCtrl+W"))?;
+    let file_menu = Submenu::with_items(app, "File", true, &[&close_item])?;
+
+    let edit_menu = Submenu::with_items(
+        app,
+        "Edit",
+        true,
+        &[
+            &PredefinedMenuItem::undo(app, None)?,
+            &PredefinedMenuItem::redo(app, None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::cut(app, None)?,
+            &PredefinedMenuItem::copy(app, None)?,
+            &PredefinedMenuItem::paste(app, None)?,
+            &PredefinedMenuItem::select_all(app, None)?,
+        ],
+    )?;
+
+    let view_menu = Submenu::with_items(
+        app,
+        "View",
+        true,
+        &[&PredefinedMenuItem::fullscreen(app, None)?],
+    )?;
+
+    let window_menu = Submenu::with_items(
+        app,
+        "Window",
+        true,
+        &[
+            &PredefinedMenuItem::minimize(app, None)?,
+            &PredefinedMenuItem::maximize(app, None)?,
+        ],
+    )?;
+
+    #[cfg(target_os = "macos")]
+    {
+        let pkg_name = app.package_info().name.clone();
+        let app_menu = Submenu::with_items(
+            app,
+            pkg_name,
+            true,
+            &[
+                &PredefinedMenuItem::about(app, None, None)?,
+                &PredefinedMenuItem::separator(app)?,
+                &PredefinedMenuItem::services(app, None)?,
+                &PredefinedMenuItem::separator(app)?,
+                &PredefinedMenuItem::hide(app, None)?,
+                &PredefinedMenuItem::hide_others(app, None)?,
+                &PredefinedMenuItem::show_all(app, None)?,
+                &PredefinedMenuItem::separator(app)?,
+                &PredefinedMenuItem::quit(app, None)?,
+            ],
+        )?;
+        Menu::with_items(app, &[&app_menu, &file_menu, &edit_menu, &view_menu, &window_menu])
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Menu::with_items(app, &[&file_menu, &edit_menu, &view_menu, &window_menu])
+    }
+}
+
 fn is_allowed_about_url(url: &tauri::Url) -> bool {
     url.scheme() == "about" && matches!(url.path(), "blank" | "srcdoc") && url.query().is_none()
 }
@@ -1151,6 +1227,7 @@ pub fn run() {
                 let _ = w.set_background_color(Some(bg));
             }
 
+            app.set_menu(build_app_menu(app.handle())?)?;
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mut rx = engine.subscribe();
@@ -1252,6 +1329,7 @@ pub fn run() {
             sender_icon,
             read_image,
             open_url,
+            hide_window,
             agents::agent_access,
             agents::set_agent_access,
             agents::reset_agent_token,
@@ -1275,27 +1353,20 @@ pub fn run() {
             undo_rule_activity,
             rule_facts,
         ])
-        // Like other Mac mail apps: closing the window (⌘W, red button) only hides it,
-        // so sync and notifications keep running. ⌘Q still quits.
+        .on_menu_event(|app, event| {
+            if event.id().as_ref() == MENU_CLOSE_LAYER {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.emit("close-requested", ());
+                }
+            }
+        })
+        // Like other Mac mail apps: closing the window (red button, or ⌘W with no modal open)
+        // only hides it, so sync and notifications keep running. ⌘Q still quits.
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
                     api.prevent_close();
-                    // Notify the frontend so it can drop hidden keep-alive iframes while hidden,
-                    // and prune stale temp files in the background during long sessions.
-                    let _ = window.emit("window-hidden", ());
-                    let engine = window.state::<Arc<Engine>>().inner().clone();
-                    tauri::async_runtime::spawn_blocking(move || {
-                        cleanup_temp_dir();
-                        engine.maintenance();
-                    });
-                    // On macOS hide the app rather than the window: ⌘Tab only activates
-                    // an app, it doesn't send Reopen, so a hidden window would stay gone.
-                    // A hidden app comes back on ⌘Tab and Dock clicks alike.
-                    #[cfg(target_os = "macos")]
-                    let _ = window.app_handle().hide();
-                    #[cfg(not(target_os = "macos"))]
-                    let _ = window.hide();
+                    hide_main_window(window);
                 }
             }
         })
@@ -1325,6 +1396,24 @@ pub fn run() {
             #[cfg(not(target_os = "macos"))]
             let _ = (app, event);
         });
+}
+
+fn hide_main_window(window: &tauri::Window) {
+    // Notify the frontend so it can drop hidden keep-alive iframes while hidden,
+    // and prune stale temp files in the background during long sessions.
+    let _ = window.emit("window-hidden", ());
+    let engine = window.state::<Arc<Engine>>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        cleanup_temp_dir();
+        engine.maintenance();
+    });
+    // On macOS hide the app rather than the window: ⌘Tab only activates
+    // an app, it doesn't send Reopen, so a hidden window would stay gone.
+    // A hidden app comes back on ⌘Tab and Dock clicks alike.
+    #[cfg(target_os = "macos")]
+    let _ = window.app_handle().hide();
+    #[cfg(not(target_os = "macos"))]
+    let _ = window.hide();
 }
 
 fn show_main(app: &tauri::AppHandle) {

@@ -385,6 +385,7 @@ export const api = {
   /** The sender's domain logo or website icon, null to show initials. */
   senderIcon: (email: string) => invoke<SenderIcon | null>("sender_icon", { email }),
   openUrl: (url: string) => invoke<void>("open_url", { url }),
+  hideWindow: () => invoke<void>("hide_window"),
   readImage: (path: string) => invoke<string>("read_image", { path }),
   agentAccess: () => invoke<AgentAccess>("agent_access"),
   setAgentAccess: (enabled: boolean) => invoke<AgentAccess>("set_agent_access", { enabled }),

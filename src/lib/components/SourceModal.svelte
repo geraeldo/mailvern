@@ -1,6 +1,7 @@
 <script lang="ts">
   import Icon from "./Icon.svelte";
   import { api } from "../api";
+  import { registerModal } from "../modal-stack";
   import { exportMessageEml, toast } from "../state.svelte";
 
   let {
@@ -14,6 +15,8 @@
     source: string;
     onclose: () => void;
   } = $props();
+
+  $effect(() => registerModal(onclose));
 
   async function copySource() {
     try {

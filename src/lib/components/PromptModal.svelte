@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { registerModal } from "../modal-stack";
 
   let {
     title,
@@ -20,6 +21,12 @@
   let value = $state("");
   let busy = $state(false);
   let inputEl: HTMLInputElement;
+
+  $effect(() =>
+    registerModal(() => {
+      if (!busy) onclose();
+    }),
+  );
 
   onMount(() => {
     value = initial;

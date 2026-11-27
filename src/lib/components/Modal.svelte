@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { Snippet } from "svelte";
   import { keymap } from "../shortcuts.svelte";
+  import { registerModal } from "../modal-stack";
 
   let { label, onclose, onkeydown, children, small = false, medium = false }: {
     label: string;
@@ -21,6 +22,12 @@
   $effect(() => {
     if (sheet && !sheet.contains(document.activeElement)) sheet.focus();
   });
+
+  $effect(() =>
+    registerModal(() => {
+      if (!keymap.recording) onclose();
+    }),
+  );
 
   function onKey(e: KeyboardEvent) {
     onkeydown?.(e);

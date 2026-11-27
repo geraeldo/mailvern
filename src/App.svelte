@@ -8,6 +8,7 @@
   import Reader from "./lib/components/Reader.svelte";
   import { api, type MailEvent } from "./lib/api";
   import { allowNativeMenu } from "./lib/menus";
+  import { closeTopModal } from "./lib/modal-stack";
   import { refreshBadge } from "./lib/badge.svelte";
   import { pruneBackgroundCaches } from "./lib/mail-cache.svelte";
   import {
@@ -175,6 +176,9 @@
     // Bringing the window forward counts as looking at your mail: clear "new" from the badge.
     const unMailto = listen<string>("open-mailto", ({ payload }) => openMailto(payload));
     const unHidden = listen("window-hidden", () => pruneBackgroundCaches(ui.selectedId));
+    const unClose = listen("close-requested", () => {
+      if (!closeTopModal()) api.hideWindow();
+    });
     const unFocus = getCurrentWindow().onFocusChanged(({ payload: focused }) => {
       windowFocused = focused;
       if (focused) refreshBadge();
@@ -188,6 +192,7 @@
       un.then((f) => f());
       unMailto.then((f) => f());
       unHidden.then((f) => f());
+      unClose.then((f) => f());
       unFocus.then((f) => f());
     };
   });
