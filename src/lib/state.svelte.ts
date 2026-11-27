@@ -87,6 +87,7 @@ const STARTUP_SETTING_KEYS = [
   "trusted_senders",
   "shortcuts",
   "badge_mode",
+  "ai_provider",
   "ai_search_model",
   "ai_write_model",
   "ai_private",

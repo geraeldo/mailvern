@@ -3,7 +3,7 @@
 // the Inbox, and proposes it. The rule opens in the editor for the user to check and save;
 // nothing is saved here.
 import { agentLoop, type AgentTool, type AgentMessage } from "@earendil-works/pi-agent-core";
-import { stream, Type, StringEnum, type Message } from "./llm";
+import { stream, Type, StringEnum, type Message, type SupportedApi } from "./llm";
 import type { Model } from "@earendil-works/pi-ai";
 import { api, type MailQuery, type Rule, type RuleAction, type RuleCondition, type RuleFacts } from "../api";
 import { ui, accountById, folderById } from "../state.svelte";
@@ -300,7 +300,7 @@ export async function describeRule(description: string, opts: DescribeOptions = 
       },
     },
     opts.signal,
-    (m, ctx, o) => stream(m as Model<"openai-completions">, ctx, { apiKey: o?.apiKey ?? key, signal: o?.signal, maxTokens: 4000 }),
+    (m, ctx, o) => stream(m as Model<SupportedApi>, ctx, { apiKey: o?.apiKey ?? key, signal: o?.signal, maxTokens: 4000 }),
   );
 
   let failure: string | null = null;

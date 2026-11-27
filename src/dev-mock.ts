@@ -453,16 +453,19 @@ export function installMock() {
       case "attachment_content":
         return { kind: "text", filename: "Q4-agenda.pdf", mime: "application/pdf", format: "pdf", text: "--- Page 1 ---\nINVOICE #2041\nAmount due: $1,240.00\nDue: 14 days from receipt", totalChars: 72, offset: 0, parts: 1 };
       case "ai_key": {
-        const k = settings.__ai_key ?? null;
+        const p = args?.provider || "openrouter";
+        const k = settings[`__ai_key_${p}`] ?? (p === "openrouter" ? settings.__ai_key : null) ?? null;
         settings.ai_configured = k ? "1" : "0";
         return k;
       }
       case "set_ai_key": {
+        const p = args?.provider || "openrouter";
         if (args.key) {
-          settings.__ai_key = args.key;
+          settings[`__ai_key_${p}`] = args.key;
           settings.ai_configured = "1";
         } else {
-          delete settings.__ai_key;
+          delete settings[`__ai_key_${p}`];
+          if (p === "openrouter") delete settings.__ai_key;
           settings.ai_configured = "0";
         }
         return null;

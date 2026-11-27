@@ -58,7 +58,7 @@
     }
     if (!ai.hasKey) {
       openSettings("ai");
-      toast("Add an OpenRouter key first");
+      toast("Add an AI API key first");
       return;
     }
     if (!writeReady()) {

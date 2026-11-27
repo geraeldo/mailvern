@@ -2,8 +2,21 @@
   import { onMount } from "svelte";
   import { ask } from "@tauri-apps/plugin-dialog";
   import ModelPicker from "./ModelPicker.svelte";
+  import Select from "./Select.svelte";
   import Switch from "./Switch.svelte";
-  import { ai, checkKey, saveKey, setModel, setPrivateOnly, apiKey, type KeyCheck } from "../ai/config.svelte";
+  import {
+    ai,
+    apiKey,
+    checkKey,
+    getProvider,
+    PROVIDERS,
+    saveKey,
+    setModel,
+    setPrivateOnly,
+    setProvider,
+    type KeyCheck,
+    type ProviderId,
+  } from "../ai/config.svelte";
   import { api } from "../api";
 
   let keyInput = $state("");
@@ -11,18 +24,40 @@
   let busy = $state(false);
   let status = $state<KeyCheck | null>(null);
 
-  onMount(async () => {
-    if (!ai.hasKey) return;
+  const provider = $derived(getProvider(ai.provider));
+  const providerOptions = PROVIDERS.map((p) => ({
+    value: p.id as ProviderId,
+    label: p.name,
+    detail: p.popular ? undefined : p.id,
+  }));
+
+  async function refreshOpenRouterStatus() {
+    if (!ai.hasKey || ai.provider !== "openrouter") {
+      status = null;
+      return;
+    }
     try {
-      status = await checkKey(await apiKey());
+      status = await checkKey("openrouter", await apiKey());
     } catch {}
+  }
+
+  onMount(() => {
+    refreshOpenRouterStatus();
   });
+
+  async function changeProvider(next: ProviderId) {
+    keyInput = "";
+    editing = false;
+    status = null;
+    await setProvider(next);
+    await refreshOpenRouterStatus();
+  }
 
   async function save() {
     const key = keyInput.trim();
     if (!key) return;
     busy = true;
-    status = await checkKey(key);
+    status = await checkKey(ai.provider, key);
     if (status.ok) {
       try {
         await saveKey(key);
@@ -36,12 +71,15 @@
   }
 
   async function remove() {
-    const ok = await ask("Remove your OpenRouter API key? AI search, rephrasing and rule generation will stop until you add a key again.", {
-      title: "Remove API key?",
-      kind: "warning",
-      okLabel: "Remove",
-      cancelLabel: "Cancel",
-    });
+    const ok = await ask(
+      `Remove your ${provider.name} API key? AI search, rephrasing and rule generation will stop until you add a key again.`,
+      {
+        title: "Remove API key?",
+        kind: "warning",
+        okLabel: "Remove",
+        cancelLabel: "Cancel",
+      },
+    );
     if (!ok) return;
     await saveKey("");
     status = null;
@@ -57,16 +95,29 @@
 </script>
 
 <div class="group">
-  <div class="gname">OpenRouter</div>
+  <div class="gname">Provider</div>
   <div class="card">
+    <div class="row">
+      <span class="text">
+        <span class="label">AI provider</span>
+        <span class="detail">Choose which provider's API key to use</span>
+      </span>
+      <Select value={ai.provider} options={providerOptions} label="AI provider" onchange={changeProvider} />
+    </div>
     <div class="row">
       <span class="text">
         <span class="label">API key</span>
         <span class="detail">
           {#if ai.hasKey && !editing}
-            {#if status && !status.ok}<span class="err">{status.error}</span>{:else}{status ? usage(status) : "Saved in Keychain"}{/if}
+            {#if status && !status.ok}
+              <span class="err">{status.error}</span>
+            {:else}
+              {status && usage(status) ? usage(status) : "Saved in Keychain"}
+            {/if}
+          {:else if provider.keyUrl}
+            Get one at <button type="button" class="link" onclick={() => api.openUrl(provider.keyUrl!)}>{provider.keyUrlLabel ?? provider.keyUrl}</button>
           {:else}
-            Get one at <button type="button" class="link" onclick={() => api.openUrl("https://openrouter.ai/keys")}>openrouter.ai/keys</button>
+            Enter your {provider.name} API key
           {/if}
         </span>
       </span>
@@ -81,13 +132,13 @@
           <input
             class="field"
             type="password"
-            placeholder="sk-or-…"
+            placeholder={provider.keyPlaceholder ?? "API key"}
             bind:value={keyInput}
             onkeydown={(e) => e.key === "Enter" && save()}
             spellcheck="false"
             autocomplete="off" />
           <button type="button" class="btn primary sm" disabled={busy || !keyInput.trim()} onclick={save}>{busy ? "Checking…" : "Save"}</button>
-          {#if editing}<button type="button" class="btn sm" onclick={() => { editing = false; keyInput = ""; }}>Cancel</button>{/if}
+          {#if editing}<button type="button" class="btn sm" onclick={() => { editing = false; keyInput = ""; status = null; }}>Cancel</button>{/if}
         </div>
         {#if status && !status.ok}<div class="err below">{status.error}</div>{/if}
       </div>
@@ -103,31 +154,33 @@
         <span class="label">Search &amp; rules</span>
         <span class="detail">Answers questions about your mail and drafts rules</span>
       </span>
-      <ModelPicker value={ai.search} needsTools onpick={(m) => setModel("search", m)} />
+      <ModelPicker provider={ai.provider} value={ai.search} needsTools onpick={(m) => setModel("search", m)} />
     </div>
     <div class="row">
       <span class="text">
         <span class="label">Writing</span>
         <span class="detail">Rephrases your drafts in the composer</span>
       </span>
-      <ModelPicker value={ai.write} onpick={(m) => setModel("write", m)} />
+      <ModelPicker provider={ai.provider} value={ai.write} onpick={(m) => setModel("write", m)} />
     </div>
   </div>
 </div>
 
 <div class="group" class:off={!ai.hasKey} inert={!ai.hasKey}>
-  <div class="gname">Privacy</div>
-  <div class="card">
-    <label class="row interactive">
-      <span class="text">
-        <span class="label">Skip providers that store or train on data</span>
-        <span class="detail">Fewer models available</span>
-      </span>
-      <Switch checked={ai.privateOnly} label="Skip providers that store or train on data" onchange={(v) => setPrivateOnly(v)} />
-    </label>
-  </div>
+  {#if ai.provider === "openrouter"}
+    <div class="gname">Privacy</div>
+    <div class="card">
+      <label class="row interactive">
+        <span class="text">
+          <span class="label">Skip providers that store or train on data</span>
+          <span class="detail">Fewer models available</span>
+        </span>
+        <Switch checked={ai.privateOnly} label="Skip providers that store or train on data" onchange={(v) => setPrivateOnly(v)} />
+      </label>
+    </div>
+  {/if}
   <p class="note">
-    Your questions, drafts and the mail the AI reads go to OpenRouter and the model's provider. The AI can't send, move or delete mail.
+    Your questions, drafts and the mail the AI reads go to {provider.name}{ai.provider === "openrouter" ? " and the model's provider" : ""}. The AI can't send, move or delete mail.
   </p>
 </div>
 

@@ -99,7 +99,7 @@
     if (!text || thinking) return;
     if (!searchReady()) {
       openSettings("ai");
-      toast("Add an OpenRouter key and search model first");
+      toast("Add an AI API key and search model first");
       return;
     }
     thinking = true;

@@ -338,8 +338,8 @@ export const api = {
   summaries: (ids: number[]) => invoke<Summary[]>("summaries", { ids }),
   attachmentContent: (id: number, index: number, offset = 0, maxChars = 20000) =>
     invoke<AttachmentContent>("attachment_content", { id, index, offset, maxChars }),
-  aiKey: () => invoke<string | null>("ai_key"),
-  setAiKey: (key: string) => invoke<void>("set_ai_key", { key }),
+  aiKey: (provider?: string) => invoke<string | null>("ai_key", { provider: provider ?? null }),
+  setAiKey: (key: string, provider?: string) => invoke<void>("set_ai_key", { key, provider: provider ?? null }),
   loadOlder: (view: MailView) => invoke<number>("load_older", { view }),
   badgeCount: () => invoke<number>("badge_count"),
   markBadgeSeen: () => invoke<void>("mark_badge_seen"),

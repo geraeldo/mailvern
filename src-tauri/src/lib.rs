@@ -12,6 +12,7 @@ use tauri::{Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
 mod agents;
+mod ai_http;
 #[cfg(target_os = "macos")]
 mod context_menu;
 
@@ -174,28 +175,41 @@ async fn attachment_content(engine: E<'_>, id: i64, index: usize, offset: Option
     engine.attachment_content(id, index, offset.unwrap_or(0), max).await.map_err(err)
 }
 
-/// The OpenRouter API key lives in the Keychain, like account passwords.
-const AI_KEY: &str = "openrouter-api-key";
+/// The legacy OpenRouter Keychain entry name (kept for backwards compatibility).
+const OPENROUTER_KEY: &str = "openrouter-api-key";
 /// Non-secret flag in SQLite settings so startup avoids a Keychain IPC lookup.
 const AI_CONFIGURED: &str = "ai_configured";
 
-#[tauri::command(async)]
-fn ai_key(engine: E) -> Option<String> {
-    let key = mail_core::secrets::get(AI_KEY).ok().filter(|k| !k.is_empty());
-    let _ = engine.set_setting(AI_CONFIGURED, if key.is_some() { "1" } else { "0" });
-    key
+fn ai_keychain_name(provider: Option<&str>) -> R<String> {
+    let p = provider.unwrap_or("openrouter").trim();
+    if p.is_empty() || p == "openrouter" {
+        return Ok(OPENROUTER_KEY.to_string());
+    }
+    if p.len() > 64 || !p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err("Invalid AI provider id".into());
+    }
+    Ok(format!("ai-api-key-{p}"))
 }
 
-/// Stores the key, or removes it when `key` is empty.
 #[tauri::command(async)]
-fn set_ai_key(engine: E, key: String) -> R<()> {
+fn ai_key(engine: E, provider: Option<String>) -> R<Option<String>> {
+    let name = ai_keychain_name(provider.as_deref())?;
+    let key = mail_core::secrets::get(&name).ok().filter(|k| !k.is_empty());
+    let _ = engine.set_setting(AI_CONFIGURED, if key.is_some() { "1" } else { "0" });
+    Ok(key)
+}
+
+/// Stores the key for a provider, or removes it when `key` is empty.
+#[tauri::command(async)]
+fn set_ai_key(engine: E, key: String, provider: Option<String>) -> R<()> {
+    let name = ai_keychain_name(provider.as_deref())?;
     let key = key.trim();
     if key.is_empty() {
-        mail_core::secrets::delete(AI_KEY);
+        mail_core::secrets::delete(&name);
         let _ = engine.set_setting(AI_CONFIGURED, "0");
         Ok(())
     } else {
-        mail_core::secrets::set(AI_KEY, key).map_err(err)?;
+        mail_core::secrets::set(&name, key).map_err(err)?;
         let _ = engine.set_setting(AI_CONFIGURED, "1");
         Ok(())
     }
@@ -217,6 +231,7 @@ const STARTUP_SETTING_KEYS: &[&str] = &[
     "trusted_senders",
     "shortcuts",
     "badge_mode",
+    "ai_provider",
     "ai_search_model",
     "ai_write_model",
     "ai_private",
@@ -1191,6 +1206,8 @@ pub fn run() {
             attachment_content,
             ai_key,
             set_ai_key,
+            ai_http::ai_fetch,
+            ai_http::ai_fetch_abort,
             move_to,
             snooze,
             unsnooze,

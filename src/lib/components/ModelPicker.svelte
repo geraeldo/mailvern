@@ -1,16 +1,18 @@
 <script lang="ts">
   import Icon from "./Icon.svelte";
-  import { listModels, price, type ModelInfo } from "../ai/config.svelte";
+  import { listModels, price, type ModelInfo, type ProviderId } from "../ai/config.svelte";
 
   let {
+    provider,
     value,
     onpick,
     needsTools = false,
-  }: { value: ModelInfo | null; onpick: (m: ModelInfo) => void; needsTools?: boolean } = $props();
+  }: { provider: ProviderId; value: ModelInfo | null; onpick: (m: ModelInfo) => void; needsTools?: boolean } = $props();
 
   let open = $state(false);
   let query = $state("");
   let models = $state<ModelInfo[]>([]);
+  let loadedProvider = $state<ProviderId | null>(null);
   let error = $state("");
   let loading = $state(false);
   let active = $state(0);
@@ -48,11 +50,17 @@
     query = "";
     active = 0;
     queueMicrotask(() => input?.focus());
-    if (models.length) return;
+    if (models.length && loadedProvider === provider) return;
     loading = true;
     error = "";
+    models = [];
+    const target = provider;
     try {
-      models = await listModels();
+      const list = await listModels(target);
+      if (target === provider) {
+        models = list;
+        loadedProvider = target;
+      }
     } catch (e) {
       error = `Couldn't load models: ${e}`;
     } finally {
