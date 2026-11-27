@@ -601,7 +601,7 @@ export function setView(v: View) {
     return;
   }
   ui.query = "";
-  ui.ai = null;
+  clearAiSession();
   ui.list = [];
   ui.listReady = false;
   remote = null;
@@ -610,9 +610,22 @@ export function setView(v: View) {
   loadList(true);
 }
 
+let onAiClose: (() => void) | null = null;
+function clearAiSession() {
+  const close = onAiClose;
+  onAiClose = null;
+  ui.ai = null;
+  close?.();
+}
+
 /** Shows an AI search's results (or its progress) in the list. */
-export function showAi(a: AiSearch | null) {
-  ui.ai = a;
+export function showAi(a: AiSearch | null, onClose?: () => void) {
+  if (!a) {
+    clearAiSession();
+  } else {
+    onAiClose = onClose ?? null;
+    ui.ai = a;
+  }
   ui.list = [];
   remote = null;
   ui.searchingServer = false;
@@ -628,7 +641,7 @@ export function refreshAi() {
 
 let serverTimer: ReturnType<typeof setTimeout> | undefined;
 export function setQuery(q: string, keepSavedId = false) {
-  ui.ai = null;
+  clearAiSession();
   ui.query = q;
   if (!keepSavedId) {
     const match = q.trim()

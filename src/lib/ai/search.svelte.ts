@@ -224,11 +224,34 @@ async function fitImage(data: string, mime: string): Promise<{ data: string; mim
   }
 }
 
-type Run = { turn: AiTurn; scope: SearchScope; seen: Map<number, Summary>; lastRows: number[]; vision: boolean };
+type Run = { turn: AiTurn; scope: SearchScope; seen: Map<number, Summary>; lastRows: number[]; vision: boolean; live: () => boolean };
+
+/** Rejects immediately if `signal` aborts while awaiting `promise`, avoiding unhandled rejections. */
+function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    promise.catch(() => {});
+    return Promise.reject(new DOMException("Stopped.", "AbortError"));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new DOMException("Stopped.", "AbortError"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (v) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(v);
+      },
+      (e) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(e);
+      },
+    );
+  });
+}
 
 /** While it works, what it has read shows as sources: one per conversation. */
 let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 function consider(run: Run, m: { id: number; threadId: string | null }) {
+  if (!run.live()) return;
   const t = run.turn;
   const known = t.sources.map((id) => run.seen.get(id)?.threadId ?? `#${id}`);
   if (t.sources.includes(m.id) || (m.threadId && known.includes(m.threadId))) return;
@@ -238,6 +261,7 @@ function consider(run: Run, m: { id: number; threadId: string | null }) {
 }
 
 async function runTool(call: ToolCall, run: Run, step: (s: AiStep) => AiStep): Promise<Out> {
+  if (!run.live()) return text("Stopped.", true);
   // Validated against the tool's schema before it gets here (validateToolCall).
   const a = call.arguments as Record<string, any>;
   const remember = (rows: Summary[]) => rows.forEach((r) => run.seen.set(r.id, r));
@@ -247,6 +271,7 @@ async function runTool(call: ToolCall, run: Run, step: (s: AiStep) => AiStep): P
       const q = queryOf(a, run.scope);
       q.limit = Math.min(q.limit ?? 20, 50);
       const r = await api.queryMail(q, !!a.server);
+      if (!run.live()) return text("Stopped.", true);
       remember(r.rows);
       run.lastRows = r.rows.map((m) => m.id);
       st.text = `Searched mail ${describe(a)}${a.server ? " on the server" : ""}: ${r.total} found`;
@@ -259,10 +284,12 @@ async function runTool(call: ToolCall, run: Run, step: (s: AiStep) => AiStep): P
       const q = queryOf(a, run.scope);
       if (!a.groupBy) {
         const r = await api.queryMail({ ...q, limit: 1 });
+        if (!run.live()) return text("Stopped.", true);
         st.text = `Counted mail ${describe(a)}: ${r.total}`;
         return text(`${r.total} messages match.`);
       }
       const r = await api.groupMail(q, a.groupBy);
+      if (!run.live()) return text("Stopped.", true);
       st.text = `Counted mail ${describe(a)} by ${a.groupBy}: ${r.total}`;
       const label = (key: string, l: string | null) =>
         a.groupBy === "folder" ? folderName(Number(key)) : a.groupBy === "account" ? (accountById(Number(key))?.email ?? key) : l ? `${l} <${key}>` : key;
@@ -278,6 +305,7 @@ async function runTool(call: ToolCall, run: Run, step: (s: AiStep) => AiStep): P
       }
       const st = step({ kind: "read", text: `Reading ${known ? `“${known.subject || "(no subject)"}”` : `message ${a.id}`}`, done: false });
       const d = await api.message(a.id);
+      if (!run.live()) return text("Stopped.", true);
       if (run.scope.kind === "account" && d.accountId !== run.scope.accountId) {
         st.error = true;
         return text("That message belongs to another account outside this search scope.", true);
@@ -314,6 +342,7 @@ async function runTool(call: ToolCall, run: Run, step: (s: AiStep) => AiStep): P
     case "read_conversation": {
       const st = step({ kind: "thread", text: "Reading the conversation", done: false });
       const rawThread = await api.thread(a.id);
+      if (!run.live()) return text("Stopped.", true);
       const scopedAcc = run.scope.kind === "account" ? run.scope.accountId : null;
       const thread = scopedAcc != null ? rawThread.filter((m) => m.accountId === scopedAcc) : rawThread;
       if (scopedAcc != null && !thread.length) {
@@ -325,6 +354,7 @@ async function runTool(call: ToolCall, run: Run, step: (s: AiStep) => AiStep): P
       const recent = thread.slice(-15);
       const parts = await Promise.all(
         recent.map(async (m) => {
+          if (!run.live()) return "";
           run.seen.set(m.id, m);
           try {
             const d = await api.message(m.id);
@@ -334,6 +364,7 @@ async function runTool(call: ToolCall, run: Run, step: (s: AiStep) => AiStep): P
           }
         }),
       );
+      if (!run.live()) return text("Stopped.", true);
       st.text = `Read a conversation of ${thread.length} message${thread.length === 1 ? "" : "s"}`;
       const skipped = thread.length - recent.length;
       return text(`${thread.length} messages, oldest first.${skipped ? ` The first ${skipped} are left out.` : ""}\n\n${parts.join("\n\n---\n\n")}`);
@@ -342,12 +373,14 @@ async function runTool(call: ToolCall, run: Run, step: (s: AiStep) => AiStep): P
       const st = step({ kind: "attachment", text: "Opening an attachment", done: false });
       if (run.scope.kind === "account") {
         const meta = run.seen.get(a.messageId) ?? (await api.summaries([a.messageId]))[0];
+        if (!run.live()) return text("Stopped.", true);
         if (!meta || meta.accountId !== run.scope.accountId) {
           st.error = true;
           return text("That attachment belongs to another account outside this search scope.", true);
         }
       }
       const c = await api.attachmentContent(a.messageId, a.index, a.offset ?? 0, 30000);
+      if (!run.live()) return text("Stopped.", true);
       st.text = `Opened ${c.filename}`;
       if (c.kind === "unsupported") {
         st.error = true;
@@ -356,6 +389,7 @@ async function runTool(call: ToolCall, run: Run, step: (s: AiStep) => AiStep): P
       if (c.kind === "image") {
         if (!run.vision) return text(`${c.filename} is an image, and the chosen search model can't see images.`);
         const img = await fitImage(c.data, c.mime);
+        if (!run.live()) return text("Stopped.", true);
         return { content: [{ type: "text", text: `Image ${c.filename}:` }, { type: "image", data: img.data, mimeType: img.mime }] };
       }
       // Rust offsets/totalChars count Unicode scalar values, not UTF-16 code units.
@@ -448,7 +482,7 @@ export function runAiSearch(question: string) {
     seen: new Map(),
     ctx: { systemPrompt: systemPrompt(scope), messages: [], tools: TOOLS },
   };
-  showAi(s);
+  showAi(s, stopAiSearch);
   runTurn(session, s.turns[0]);
 }
 
@@ -464,8 +498,8 @@ async function runTurn(sess: NonNullable<typeof session>, turn: AiTurn) {
   const my = new AbortController();
   controller = my;
   const model = ai.search!;
-  const run: Run = { turn, scope: sess.scope, seen: sess.seen, lastRows: [], vision: model.vision };
   const live = () => ui.ai === sess.s && !my.signal.aborted;
+  const run: Run = { turn, scope: sess.scope, seen: sess.seen, lastRows: [], vision: model.vision, live };
   const step = (x: AiStep): AiStep => {
     turn.steps.push(x);
     return turn.steps[turn.steps.length - 1];
@@ -474,21 +508,26 @@ async function runTurn(sess: NonNullable<typeof session>, turn: AiTurn) {
   ctx.messages.push({ role: "user", content: turn.question, timestamp: Date.now() });
   let finished = false;
   try {
-    const key = await apiKey();
+    const key = await raceAbort(apiKey(), my.signal);
     for (let n = 0; n < MAX_STEPS && !finished; n++) {
+      if (!live()) return;
       if (n === MAX_STEPS - 1) {
         ctx.messages.push({ role: "user", content: "You are out of steps. Call show_results now with what you have found.", timestamp: Date.now() });
       }
-      const res = await stream(piModel(model), ctx, { apiKey: key, signal: my.signal, maxTokens: 16000 });
+      const res = await raceAbort(stream(piModel(model), ctx, { apiKey: key, signal: my.signal, maxTokens: 16000 }), my.signal);
       let said = "";
-      for await (const ev of res) {
+      const iter = res[Symbol.asyncIterator]();
+      while (true) {
+        const next = await raceAbort(iter.next(), my.signal);
+        if (next.done) break;
         if (!live()) {
           my.abort();
           break;
         }
-        if (ev.type === "text_delta") said += ev.delta;
+        if (next.value.type === "text_delta") said += next.value.delta;
       }
-      const msg = await res.result();
+      if (!live()) return;
+      const msg = await raceAbort(res.result(), my.signal);
       if (!live()) return;
       turn.cost += msg.usage?.cost?.total ?? 0;
       if (msg.stopReason === "error") throw new Error(msg.errorMessage || "The model returned an error");
@@ -507,31 +546,37 @@ async function runTurn(sess: NonNullable<typeof session>, turn: AiTurn) {
         break;
       }
       if (said.trim()) step({ kind: "note", text: said.trim(), done: true });
-      const results = await Promise.all(
-        calls.map(async (call): Promise<ToolResultMessage> => {
-          let out: Out;
-          if (call.name === "show_results") {
-            try {
-              const a = validateToolCall(TOOLS, call);
-              turn.answer = String(a.answer ?? "").trim();
-              turn.details = String(a.details ?? "").trim();
-              turn.facts = (a.facts ?? []).filter((f: any) => f?.label && f?.value).slice(0, 8);
-              turn.sources = [...new Set<number>((a.sources ?? []).map(Number).filter(Number.isFinite))].slice(0, 12);
-              finished = true;
-              out = text("Shown.");
-            } catch (e) {
-              out = text(`Error: ${e instanceof Error ? e.message : e}`, true);
+      const results = await raceAbort(
+        Promise.all(
+          calls.map(async (call): Promise<ToolResultMessage> => {
+            if (!live()) {
+              return { role: "toolResult", toolCallId: call.id, toolName: call.name, content: text("Stopped.", true).content, isError: true, timestamp: Date.now() };
             }
-          } else {
-            try {
-              call.arguments = validateToolCall(TOOLS, call);
-              out = await runTool(call, run, step);
-            } catch (e) {
-              out = text(`Error: ${e instanceof Error ? e.message : e}`, true);
+            let out: Out;
+            if (call.name === "show_results") {
+              try {
+                const a = validateToolCall(TOOLS, call);
+                turn.answer = String(a.answer ?? "").trim();
+                turn.details = String(a.details ?? "").trim();
+                turn.facts = (a.facts ?? []).filter((f: any) => f?.label && f?.value).slice(0, 8);
+                turn.sources = [...new Set<number>((a.sources ?? []).map(Number).filter(Number.isFinite))].slice(0, 12);
+                finished = true;
+                out = text("Shown.");
+              } catch (e) {
+                out = text(`Error: ${e instanceof Error ? e.message : e}`, true);
+              }
+            } else {
+              try {
+                call.arguments = validateToolCall(TOOLS, call);
+                out = await runTool(call, run, step);
+              } catch (e) {
+                out = text(`Error: ${e instanceof Error ? e.message : e}`, true);
+              }
             }
-          }
-          return { role: "toolResult", toolCallId: call.id, toolName: call.name, content: out.content, isError: !!out.isError, timestamp: Date.now() };
-        }),
+            return { role: "toolResult", toolCallId: call.id, toolName: call.name, content: out.content, isError: !!out.isError, timestamp: Date.now() };
+          }),
+        ),
+        my.signal,
       );
       turn.steps.forEach((x) => (x.done = true));
       if (!live()) return;
@@ -546,6 +591,7 @@ async function runTurn(sess: NonNullable<typeof session>, turn: AiTurn) {
     turn.error = e instanceof Error ? e.message : String(e);
     if (!turn.sources.length) turn.sources = run.lastRows.slice(0, 10);
   } finally {
+    clearTimeout(refreshTimer);
     turn.steps.forEach((x) => (x.done = true));
     if (ui.ai === sess.s) {
       turn.running = false;

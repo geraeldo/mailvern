@@ -73,6 +73,10 @@ export const aiFetch: typeof globalThis.fetch = async (input, init) => {
   const rawBody = init?.body !== undefined ? init.body : req && method !== "GET" && method !== "HEAD" ? await req.arrayBuffer() : null;
   const { body, bodyBase64 } = await encodeBody(rawBody);
 
+  if (signal?.aborted) {
+    throw new DOMException("The operation was aborted.", "AbortError");
+  }
+
   const requestId = `ai-${Date.now()}-${nextId++}`;
   const channel = new Channel<AiFetchEvent>();
 
@@ -90,6 +94,7 @@ export const aiFetch: typeof globalThis.fetch = async (input, init) => {
       const err = new DOMException("The operation was aborted.", "AbortError");
       if (!settled) {
         settled = true;
+        closed = true;
         cleanupSignal();
         reject(err);
       } else if (!closed && streamCtrl) {
