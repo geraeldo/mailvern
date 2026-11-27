@@ -409,6 +409,68 @@
   {/if}
 </section>
 
+{#if access?.enabled && token}
+  <section>
+    <h3>Connect an agent</h3>
+    <div class="card" class:reset={wasReset} bind:this={card}>
+      {#if wasReset}
+        <div class="banner">
+          <Icon name="refresh" size={14} />
+          <span>New token. Rerun the command for each agent.</span>
+          <button type="button" class="btn ghost sm" onclick={() => (wasReset = false)}>Done</button>
+        </div>
+      {/if}
+
+      <div class="seg" role="tablist">
+        {#each tabs as t (t)}
+          <button type="button" role="tab" aria-selected={tab === t} class:on={tab === t} onclick={() => (tab = t)}>
+            {t}
+            {#if wasReset}
+              {#if redone.includes(t)}
+                <span class="mark ok"><Icon name="check" size={11} stroke={2.5} /></span>
+              {:else}
+                <span class="mark due"></span>
+              {/if}
+            {/if}
+          </button>
+        {/each}
+      </div>
+
+      {#if tab === "Other"}
+        <div class="field-row">
+          <span class="key">URL</span>
+          <code>{access.url}</code>
+          <button type="button" class="icon-btn" title="Copy URL" onclick={() => copy(access!.url, "url", "Other")}>
+            <Icon name={copied === "url" ? "check" : "copy"} size={14} />
+          </button>
+        </div>
+        <div class="field-row">
+          <span class="key">Header</span>
+          <code>{masked(header)}</code>
+          <button type="button" class="icon-btn" title="Copy header" onclick={() => copy(header, "header", "Other")}>
+            <Icon name={copied === "header" ? "check" : "copy"} size={14} />
+          </button>
+        </div>
+        <p class="hint">Add an HTTP MCP server with this URL and header.</p>
+      {:else}
+        <div class="cmd">
+          <code>{masked(commands[tab])}</code>
+          <button type="button" class="btn sm" onclick={() => copy(commands[tab], tab)}>
+            <Icon name={copied === tab ? "check" : "copy"} size={13} />
+            {copied === tab ? "Copied" : "Copy"}
+          </button>
+        </div>
+        <p class="hint">Paste into Terminal and run.</p>
+      {/if}
+
+      <div class="foot">
+        <span class="detail">Access token <code class="inline">{masked(token)}</code></span>
+        <button type="button" class="btn ghost sm danger" disabled={busy} onclick={reset}>Reset token</button>
+      </div>
+    </div>
+  </section>
+{/if}
+
 {#if access?.enabled}
   <section>
     <h3>{ui.accounts.length > 1 ? "Permissions · Default for accounts" : "Permissions"}</h3>
@@ -505,68 +567,6 @@
     {#if reconnectHint}
       <p class="hint">Reconnect already-running agents if you want them to discover the sending tools.</p>
     {/if}
-  </section>
-{/if}
-
-{#if access?.enabled && token}
-  <section>
-    <h3>Connect an agent</h3>
-    <div class="card" class:reset={wasReset} bind:this={card}>
-      {#if wasReset}
-        <div class="banner">
-          <Icon name="refresh" size={14} />
-          <span>New token. Rerun the command for each agent.</span>
-          <button type="button" class="btn ghost sm" onclick={() => (wasReset = false)}>Done</button>
-        </div>
-      {/if}
-
-      <div class="seg" role="tablist">
-        {#each tabs as t (t)}
-          <button type="button" role="tab" aria-selected={tab === t} class:on={tab === t} onclick={() => (tab = t)}>
-            {t}
-            {#if wasReset}
-              {#if redone.includes(t)}
-                <span class="mark ok"><Icon name="check" size={11} stroke={2.5} /></span>
-              {:else}
-                <span class="mark due"></span>
-              {/if}
-            {/if}
-          </button>
-        {/each}
-      </div>
-
-      {#if tab === "Other"}
-        <div class="field-row">
-          <span class="key">URL</span>
-          <code>{access.url}</code>
-          <button type="button" class="icon-btn" title="Copy URL" onclick={() => copy(access!.url, "url", "Other")}>
-            <Icon name={copied === "url" ? "check" : "copy"} size={14} />
-          </button>
-        </div>
-        <div class="field-row">
-          <span class="key">Header</span>
-          <code>{masked(header)}</code>
-          <button type="button" class="icon-btn" title="Copy header" onclick={() => copy(header, "header", "Other")}>
-            <Icon name={copied === "header" ? "check" : "copy"} size={14} />
-          </button>
-        </div>
-        <p class="hint">Add an HTTP MCP server with this URL and header.</p>
-      {:else}
-        <div class="cmd">
-          <code>{masked(commands[tab])}</code>
-          <button type="button" class="btn sm" onclick={() => copy(commands[tab], tab)}>
-            <Icon name={copied === tab ? "check" : "copy"} size={13} />
-            {copied === tab ? "Copied" : "Copy"}
-          </button>
-        </div>
-        <p class="hint">Paste into Terminal and run.</p>
-      {/if}
-
-      <div class="foot">
-        <span class="detail">Access token <code class="inline">{masked(token)}</code></span>
-        <button type="button" class="btn ghost sm danger" disabled={busy} onclick={reset}>Reset token</button>
-      </div>
-    </div>
   </section>
 {/if}
 
