@@ -4,7 +4,6 @@ use mail_core::model::{
 };
 use mail_core::text::{quarantine_file, safe_filename};
 use mail_core::Engine;
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -341,12 +340,6 @@ fn bootstrap(
 }
 
 #[tauri::command(async)]
-fn get_settings(engine: E, keys: Vec<String>) -> R<HashMap<String, String>> {
-    let allowed: Vec<&str> = keys.iter().map(String::as_str).filter(|k| !is_restricted_setting(k)).collect();
-    engine.settings_many(&allowed).map_err(err)
-}
-
-#[tauri::command(async)]
 fn badge_count(engine: E) -> R<i64> {
     engine.badge_count().map_err(err)
 }
@@ -513,14 +506,6 @@ fn sync_view(engine: E, view: View) -> R<()> {
 
 fn is_restricted_setting(key: &str) -> bool {
     matches!(key, agents::ENABLED | agents::MODE | agents::LEGACY_TOKEN)
-}
-
-#[tauri::command(async)]
-fn get_setting(engine: E, key: String) -> R<Option<String>> {
-    if is_restricted_setting(&key) {
-        return Err("That setting can only be managed from Agent Settings".into());
-    }
-    engine.setting(&key).map_err(err)
 }
 
 #[tauri::command(async)]
@@ -1284,7 +1269,6 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             bootstrap,
-            get_settings,
             accounts,
             save_account,
             discover_servers,
@@ -1343,7 +1327,6 @@ pub fn run() {
             sync_now,
             sync_view,
             sync_account,
-            get_setting,
             set_setting,
             open_attachment,
             save_attachment,

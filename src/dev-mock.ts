@@ -516,14 +516,6 @@ export function installMock() {
         const icon = senderIcons[args.email.split("@").pop()];
         return icon ? { url: `data:image/svg+xml,${encodeURIComponent(icon.svg)}`, logo: icon.logo } : null;
       }
-      case "get_setting": return settings[args.key] ?? null;
-      case "get_settings": {
-        const out: Record<string, string> = {};
-        for (const k of (args.keys as string[]) ?? []) {
-          if (settings[k] !== undefined) out[k] = settings[k];
-        }
-        return out;
-      }
       case "bootstrap": {
         const order = (id: number) => accounts.findIndex((a) => a.id === id);
         const sortedFolders = [...folders].sort((x, y) => order(x.accountId) - order(y.accountId) || (x.position ?? 99) - (y.position ?? 99));

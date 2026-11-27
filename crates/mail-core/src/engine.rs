@@ -1307,10 +1307,6 @@ impl Engine {
         self.db.setting(key)
     }
 
-    pub fn settings_many(&self, keys: &[&str]) -> Result<HashMap<String, String>> {
-        self.db.settings_many(keys)
-    }
-
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         self.db.set_setting(key, value)
     }

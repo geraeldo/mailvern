@@ -130,10 +130,6 @@ impl Compiled {
         })
     }
 
-    pub fn needs_body(&self) -> bool {
-        self.conds.iter().chain(&self.except).any(|c| c.field == RuleField::Body)
-    }
-
     fn is_mine(&self, addr: &str) -> bool {
         self.mine.iter().any(|m| m.eq_ignore_ascii_case(addr))
     }
@@ -484,7 +480,6 @@ mod tests {
         let f = facts();
         let body = cond(RuleField::Body, RuleOp::Contains, "invoice");
         let r = rule(vec![cond(RuleField::From, RuleOp::Contains, "github"), body.clone()]);
-        assert!(Compiled::new(&r, &mine()).unwrap().needs_body());
         assert_eq!(check(&r, &f, None), Verdict::NeedBody);
         assert_eq!(check(&r, &f, Some("Your INVOICE is ready")), Verdict::Yes);
         assert_eq!(check(&r, &f, Some("hello")), Verdict::No);

@@ -295,14 +295,6 @@ function applyPrefs(settings: Record<string, string>) {
   ui.autoTrustSent = settings["auto_trust_sent"] !== "off";
 }
 
-export async function loadPrefs() {
-  const settings = await api.getSettings([
-    "undo_send", "threads", "sender_icons", "side_width",
-    "list_width", "sidebar_collapsed", "remote_images", "auto_trust_sent",
-  ]);
-  applyPrefs(settings);
-}
-
 let bootPromise: Promise<void> | null = null;
 
 /** Loads all initial UI state in a single IPC round-trip (consuming Rust's parallel preboot snapshot). */
@@ -1604,15 +1596,6 @@ export function isSenderTrusted(email: string): boolean {
 
 export function shouldStripTrackers(email: string): boolean {
   return ui.remoteImages === "strip_trackers" && !isExplicitlyTrusted(email);
-}
-
-export async function loadTrusted() {
-  try {
-    ui.trustedSenders = JSON.parse((await api.getSetting("trusted_senders")) || "[]");
-  } catch {
-    ui.trustedSenders = [];
-  }
-  if (ui.autoTrustSent) await loadSentRecipients();
 }
 
 export async function trustSender(entry: string): Promise<TrustEntryResult> {

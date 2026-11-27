@@ -54,13 +54,6 @@ impl Engine {
         self.db.set_agent_folder_allowed(folder_id, allowed)
     }
 
-    /// Folder ids MCP agents are currently allowed to read.
-    pub fn agent_readable_folder_ids(&self) -> Result<Vec<i64>> {
-        let perms = self.agent_permissions()?;
-        let folders = self.db.folders()?;
-        Ok(perms.allowed_folder_ids(&folders))
-    }
-
     /// Checks whether an MCP agent may read `message_id`.
     /// Checks every folder copy of the same `(account_id, message_id)` so Gmail's All Mail
     /// never exposes a message that also sits in Spam, Trash, or another hidden folder.

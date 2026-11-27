@@ -2,7 +2,6 @@
   --bg: #ffffff;
   --side: #f6f5f2;
   --panel: #ffffff;
-  --surface: #faf9f6;
   --line: #ebe9e4;
   --line-strong: #dedbd4;
   --sheet-border: rgba(20, 18, 14, 0.08);
@@ -35,7 +34,6 @@
     --bg: #1b1b1a;
     --side: #222221;
     --panel: #1b1b1a;
-    --surface: #232322;
     --line: #2d2c2a;
     --line-strong: #3a3936;
     --sheet-border: rgba(255, 255, 255, 0.1);

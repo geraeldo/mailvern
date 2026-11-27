@@ -17,11 +17,6 @@ export function hydrateBadgeMode(settings: Record<string, string>) {
   if (v === "all" || v === "off" || v === "new") badge.mode = v;
 }
 
-export async function loadBadgeMode() {
-  const v = await api.getSetting("badge_mode");
-  if (v === "all" || v === "off" || v === "new") badge.mode = v;
-}
-
 export async function setBadgeMode(mode: BadgeMode) {
   badge.mode = mode;
   await api.setSetting("badge_mode", mode);

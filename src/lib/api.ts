@@ -335,7 +335,6 @@ export type MailEvent =
 export const api = {
   bootstrap: (view: MailView, limit: number, settingKeys: string[]) =>
     invoke<BootstrapData>("bootstrap", { view, limit, settingKeys }),
-  getSettings: (keys: string[]) => invoke<Record<string, string>>("get_settings", { keys }),
   accounts: () => invoke<Account[]>("accounts"),
   saveAccount: (account: Account, password: string | null) => invoke<Account>("save_account", { account, password }),
   discoverServers: (email: string) => invoke<DiscoveredServers | null>("discover_servers", { email }),
@@ -398,7 +397,6 @@ export const api = {
   syncNow: () => invoke<void>("sync_now"),
   syncView: (view: MailView) => invoke<void>("sync_view", { view }),
   syncAccount: (accountId: number) => invoke<void>("sync_account", { accountId }),
-  getSetting: (key: string) => invoke<string | null>("get_setting", { key }),
   setSetting: (key: string, value: string) => invoke<void>("set_setting", { key, value }),
   openAttachment: (id: number, index: number) => invoke<void>("open_attachment", { id, index }),
   saveAttachment: (id: number, index: number) => invoke<string>("save_attachment", { id, index }),

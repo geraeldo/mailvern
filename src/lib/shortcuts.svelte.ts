@@ -148,15 +148,6 @@ export function hydrateShortcuts(settings: Record<string, string>) {
   }
 }
 
-export async function loadShortcuts() {
-  try {
-    const raw = await api.getSetting("shortcuts");
-    hydrateShortcuts(raw ? { shortcuts: raw } : {});
-  } catch {
-    keymap.bindings = structuredClone(DEFAULTS);
-  }
-}
-
 export function labelOf(a: Action): string {
   return ACTIONS.find((x) => x.id === a)?.label ?? a;
 }

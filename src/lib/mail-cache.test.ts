@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import type { Detail, Summary } from "./api";
+import type { Detail } from "./api";
 import {
   cacheStats,
   cachedDetailsFor,

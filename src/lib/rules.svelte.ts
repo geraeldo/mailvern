@@ -1,6 +1,6 @@
 // Rules: what the Rules settings show and edit, and the words used to describe a rule.
 import { api, type Detail, type Rule, type RuleAction, type RuleCondition, type RuleFacts, type RuleField, type RuleOp, type SnoozeUntil } from "./api";
-import { accountById, accountLabel, folderById, openSettings, toast, ui } from "./state.svelte";
+import { folderById, openSettings, toast, ui } from "./state.svelte";
 
 export const rulesUi = $state({
   rules: [] as Rule[],
@@ -134,15 +134,6 @@ export function actionsSummary(r: Rule): string {
       return i === 0 ? t.replace(/^./, (c) => c.toUpperCase()) : t;
     })
     .join(", ");
-}
-
-/** One line for the list: "If from contains “github”: archive, mark as read". */
-export function ruleSummary(r: Rule): string {
-  const when = r.conditions.length ? r.conditions.map(condText).join(r.matchAll ? " and " : " or ") : "any new mail";
-  const except = r.exceptions.length ? `, except ${r.exceptions.map(condText).join(" or ")}` : "";
-  const where = r.accountId != null ? ` in ${(accountById(r.accountId) && accountLabel(accountById(r.accountId)!)) ?? "an account"}` : "";
-  const what = r.actions.map(actionText).join(", ");
-  return `If ${when}${except}${where}: ${what}`;
 }
 
 /** Opens Settings › Rules on the editor, on `draft` or a blank rule. */

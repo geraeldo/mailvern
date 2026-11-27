@@ -112,15 +112,6 @@ export function hydrateAi(settings: Record<string, string>) {
   }
 }
 
-export async function loadAi() {
-  try {
-    const settings = await api.getSettings([KEYS.provider, KEYS.search, KEYS.write, KEYS.private, KEYS.configured]);
-    hydrateAi(settings);
-  } catch {
-    ai.loaded = true;
-  }
-}
-
 let cachedKey: string | null = null;
 let cachedProvider: ProviderId | null = null;
 
