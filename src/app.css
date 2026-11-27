@@ -23,6 +23,8 @@
   --flag: #e0882a;
   --success: #2f8f4e;
   --field: #ffffff;
+  --scrollbar: rgba(29, 28, 26, 0.2);
+  --scrollbar-hover: rgba(29, 28, 26, 0.36);
   --shadow: 0 1px 2px rgba(20, 18, 14, 0.06), 0 12px 40px rgba(20, 18, 14, 0.14);
   --radius: 10px;
   --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
@@ -54,6 +56,8 @@
     --flag: #f2a046;
     --success: #52c275;
     --field: #252524;
+    --scrollbar: rgba(255, 255, 255, 0.2);
+    --scrollbar-hover: rgba(255, 255, 255, 0.36);
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.35), 0 16px 48px rgba(0, 0, 0, 0.55);
   }
 }
@@ -152,7 +156,24 @@ input:focus-visible, textarea:focus-visible, [contenteditable="true"]:focus-visi
 .field::placeholder { color: var(--muted); }
 
 .scroll { overflow-y: auto; overscroll-behavior: contain; }
-/* No custom scrollbar styling: macOS draws native overlay scrollbars that appear while scrolling. */
+.scroll::-webkit-scrollbar { width: 10px; height: 10px; }
+.scroll::-webkit-scrollbar-track,
+.scroll::-webkit-scrollbar-corner { background: transparent; }
+.scroll::-webkit-scrollbar-thumb {
+  background-color: transparent;
+  border-radius: 10px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+.scroll:hover::-webkit-scrollbar-thumb,
+.scroll.scrolling::-webkit-scrollbar-thumb,
+.scroll:active::-webkit-scrollbar-thumb {
+  background-color: var(--scrollbar);
+}
+.scroll::-webkit-scrollbar-thumb:hover,
+.scroll::-webkit-scrollbar-thumb:active {
+  background-color: var(--scrollbar-hover);
+}
 
 .drag { -webkit-app-region: drag; }
 

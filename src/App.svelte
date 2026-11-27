@@ -186,10 +186,23 @@
     });
     const onUnload = () => commitPending();
     window.addEventListener("beforeunload", onUnload);
+    const scrollTimers = new WeakMap<HTMLElement, ReturnType<typeof setTimeout>>();
+    const onAnyScroll = (e: Event) => {
+      const el = e.target;
+      if (!(el instanceof HTMLElement) || !el.classList.contains("scroll")) return;
+      el.classList.add("scrolling");
+      clearTimeout(scrollTimers.get(el));
+      scrollTimers.set(el, setTimeout(() => {
+        el.classList.remove("scrolling");
+        scrollTimers.delete(el);
+      }, 800));
+    };
+    document.addEventListener("scroll", onAnyScroll, { capture: true, passive: true });
     return () => {
       clearTimeout(postBootTimer);
       commitPending();
       window.removeEventListener("beforeunload", onUnload);
+      document.removeEventListener("scroll", onAnyScroll, { capture: true });
       un.then((f) => f());
       unMailto.then((f) => f());
       unHidden.then((f) => f());
