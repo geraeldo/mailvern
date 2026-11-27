@@ -101,30 +101,358 @@ fn automated(auto_submitted: Option<&str>, precedence: Option<&str>) -> Option<S
     value(precedence).filter(|p| matches!(p.as_str(), "bulk" | "list" | "junk"))
 }
 
+fn is_invisible_padding(ch: char) -> bool {
+    matches!(ch, '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' | '\u{00AD}' | '\u{034F}')
+}
+
 /// Single-pass whitespace normalization and quote-stripping capped at `max_chars`
 /// so huge plain-text emails never allocate unbounded intermediate vectors/strings.
 fn clean_text_capped(t: &str, max_chars: usize) -> String {
     let mut out = String::with_capacity(t.len().min(max_chars));
     let mut count = 0usize;
+    let mut pending_space = false;
     for line in t.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('>') {
             continue;
         }
-        for word in trimmed.split_whitespace() {
-            if count > 0 {
+        for ch in trimmed.chars() {
+            if is_invisible_padding(ch) {
+                continue;
+            }
+            if ch.is_whitespace() {
+                if count > 0 {
+                    pending_space = true;
+                }
+                continue;
+            }
+            if pending_space {
                 if count >= max_chars {
                     return out;
                 }
                 out.push(' ');
                 count += 1;
+                pending_space = false;
             }
-            for ch in word.chars() {
-                if count >= max_chars {
+            if count >= max_chars {
+                return out;
+            }
+            out.push(ch);
+            count += 1;
+        }
+        if count > 0 {
+            pending_space = true;
+        }
+    }
+    out
+}
+
+/// Strictly detects whether a `text/plain` part actually contains an HTML document/fragment,
+/// avoiding false positives on prose with angle brackets (`<div>`, `Vec<String>`, `<a@b.com>`).
+fn looks_like_html(t: &str) -> bool {
+    let trimmed = t.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}');
+    if let Some(after_lt) = trimmed.strip_prefix('<') {
+        let after_lt_bytes = after_lt.as_bytes();
+        // Leading HTML comment (`<!-- ...`)
+        if after_lt_bytes.starts_with(b"!--") {
+            return true;
+        }
+        // Leading document/wrapper tag (`<!doctype`, `<html`, `<head`, `<body`, `<meta`, `<style`, `<table`, `<div`, `<center`)
+        let name_end = after_lt_bytes
+            .iter()
+            .position(|b| !(b.is_ascii_alphanumeric() || *b == b'!'))
+            .unwrap_or(after_lt_bytes.len());
+        let name = &after_lt[..name_end];
+        let next_ok = after_lt_bytes
+            .get(name_end)
+            .is_none_or(|b| b.is_ascii_whitespace() || matches!(*b, b'>' | b'/'));
+        if next_ok
+            && (name.eq_ignore_ascii_case("!doctype")
+                || name.eq_ignore_ascii_case("html")
+                || name.eq_ignore_ascii_case("head")
+                || name.eq_ignore_ascii_case("body")
+                || name.eq_ignore_ascii_case("meta")
+                || name.eq_ignore_ascii_case("style")
+                || name.eq_ignore_ascii_case("table")
+                || name.eq_ignore_ascii_case("div")
+                || name.eq_ignore_ascii_case("center"))
+        {
+            return true;
+        }
+    }
+    // Check for document-level closing tags in the leading window (avoids scanning huge plain texts).
+    let scan_limit = trimmed.floor_char_boundary(trimmed.len().min(8192));
+    let head_window = &trimmed[..scan_limit];
+    let lower = head_window.to_ascii_lowercase();
+    lower.contains("</html>")
+        || lower.contains("</body>")
+        || lower.contains("</head>")
+        || lower.contains("</style>")
+}
+
+fn is_skipped_html_tag(tag: &str) -> bool {
+    matches!(tag, "head" | "style" | "script" | "title" | "noscript" | "template" | "svg")
+}
+
+fn is_block_html_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "br" | "p"
+            | "div"
+            | "tr"
+            | "td"
+            | "th"
+            | "li"
+            | "ul"
+            | "ol"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "hr"
+            | "table"
+            | "thead"
+            | "tbody"
+            | "tfoot"
+            | "section"
+            | "article"
+            | "header"
+            | "footer"
+            | "nav"
+            | "aside"
+            | "blockquote"
+            | "pre"
+            | "dt"
+            | "dd"
+            | "figcaption"
+            | "figure"
+            | "address"
+            | "main"
+            | "form"
+            | "option"
+    )
+}
+
+fn decode_html_entity(entity: &str) -> Option<char> {
+    if let Some(num) = entity.strip_prefix('#') {
+        let code = if let Some(hex) = num.strip_prefix('x').or_else(|| num.strip_prefix('X')) {
+            u32::from_str_radix(hex, 16).ok()?
+        } else {
+            num.parse::<u32>().ok()?
+        };
+        return char::from_u32(code);
+    }
+    match entity {
+        "nbsp" | "ensp" | "emsp" | "thinsp" => Some(' '),
+        "amp" | "AMP" => Some('&'),
+        "lt" | "LT" => Some('<'),
+        "gt" | "GT" => Some('>'),
+        "quot" | "QUOT" => Some('"'),
+        "apos" => Some('\''),
+        "ndash" => Some('–'),
+        "mdash" => Some('—'),
+        "lsquo" => Some('‘'),
+        "rsquo" => Some('’'),
+        "ldquo" => Some('“'),
+        "rdquo" => Some('”'),
+        "hellip" => Some('…'),
+        "copy" | "COPY" => Some('©'),
+        "reg" | "REG" => Some('®'),
+        "trade" => Some('™'),
+        "bull" => Some('•'),
+        "middot" => Some('·'),
+        "laquo" => Some('«'),
+        "raquo" => Some('»'),
+        "zwnj" => Some('\u{200C}'),
+        "zwj" => Some('\u{200D}'),
+        "shy" => Some('\u{00AD}'),
+        _ => None,
+    }
+}
+
+/// Single-pass, bounded HTML-to-text extractor for snippets and FTS indexing.
+/// Skips non-content subtrees (`<head>`, `<style>`, `<script>`, etc.), preserves word
+/// boundaries across block/break tags, decodes HTML entities, and strips invisible padding.
+fn html_to_clean_text_capped(html: &str, max_chars: usize) -> String {
+    let bytes = html.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len.min(max_chars));
+    let mut count = 0usize;
+    let mut pending_space = false;
+    let mut skip_until: Option<&'static str> = None;
+    let mut i = 0usize;
+
+    let push_char = |out: &mut String, count: &mut usize, pending_space: &mut bool, ch: char| -> bool {
+        if is_invisible_padding(ch) {
+            return true;
+        }
+        if ch.is_whitespace() {
+            if *count > 0 {
+                *pending_space = true;
+            }
+            return true;
+        }
+        if *pending_space {
+            if *count >= max_chars {
+                return false;
+            }
+            out.push(' ');
+            *count += 1;
+            *pending_space = false;
+        }
+        if *count >= max_chars {
+            return false;
+        }
+        out.push(ch);
+        *count += 1;
+        true
+    };
+
+    while i < len {
+        match bytes[i] {
+            b'<' => {
+                // HTML comment: <!-- ... -->
+                if bytes[i..].starts_with(b"<!--") {
+                    if let Some(end) = html[i + 4..].find("-->") {
+                        i = i + 4 + end + 3;
+                    } else {
+                        break;
+                    }
+                    continue;
+                }
+                // CDATA: <![CDATA[ ... ]]>
+                if bytes[i..].starts_with(b"<![CDATA[") {
+                    if let Some(end) = html[i + 9..].find("]]>") {
+                        i = i + 9 + end + 3;
+                    } else {
+                        break;
+                    }
+                    continue;
+                }
+                // Declaration / processing instruction: <!DOCTYPE ...> or <?xml ...?>
+                if bytes.get(i + 1).is_some_and(|b| matches!(*b, b'!' | b'?')) {
+                    if let Some(end) = bytes[i + 2..].iter().position(|&b| b == b'>') {
+                        i = i + 2 + end + 1;
+                    } else {
+                        break;
+                    }
+                    continue;
+                }
+
+                // Regular opening/closing tag.
+                let mut j = i + 1;
+                while j < len && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                let is_close = j < len && bytes[j] == b'/';
+                if is_close {
+                    j += 1;
+                    while j < len && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                }
+                let name_start = j;
+                while j < len && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'-' || bytes[j] == b':') {
+                    j += 1;
+                }
+                if j == name_start {
+                    // Bare '<' not starting a valid tag (e.g. "a < b").
+                    if skip_until.is_none() && !push_char(&mut out, &mut count, &mut pending_space, '<') {
+                        return out;
+                    }
+                    i += 1;
+                    continue;
+                }
+
+                let mut tag_buf = [0u8; 16];
+                let tag_len = (j - name_start).min(tag_buf.len());
+                for (dst, &src) in tag_buf[..tag_len].iter_mut().zip(&bytes[name_start..name_start + tag_len]) {
+                    *dst = src.to_ascii_lowercase();
+                }
+                let tag = std::str::from_utf8(&tag_buf[..tag_len]).unwrap_or("");
+
+                // Advance to closing '>', respecting quoted attributes.
+                let mut quote: Option<u8> = None;
+                let mut end_pos = None;
+                let mut k = j;
+                while k < len {
+                    let b = bytes[k];
+                    if let Some(q) = quote {
+                        if b == q {
+                            quote = None;
+                        }
+                    } else if b == b'"' || b == b'\'' {
+                        quote = Some(b);
+                    } else if b == b'>' {
+                        end_pos = Some(k);
+                        break;
+                    }
+                    k += 1;
+                }
+                let Some(gt) = end_pos else {
+                    break;
+                };
+                let self_closing = !is_close && gt > i && bytes[gt - 1] == b'/';
+
+                if let Some(target) = skip_until {
+                    if is_close && tag == target {
+                        skip_until = None;
+                        if count > 0 {
+                            pending_space = true;
+                        }
+                    }
+                } else if !is_close && !self_closing && is_skipped_html_tag(tag) {
+                    skip_until = match tag {
+                        "head" => Some("head"),
+                        "style" => Some("style"),
+                        "script" => Some("script"),
+                        "title" => Some("title"),
+                        "noscript" => Some("noscript"),
+                        "template" => Some("template"),
+                        "svg" => Some("svg"),
+                        _ => None,
+                    };
+                } else if is_block_html_tag(tag) && count > 0 {
+                    pending_space = true;
+                }
+
+                i = gt + 1;
+            }
+            b'&' if skip_until.is_none() => {
+                let rest = &html[i + 1..];
+                let max_entity = rest.len().min(12);
+                if let Some(semi) = rest.as_bytes()[..max_entity].iter().position(|&b| b == b';') {
+                    let entity = &rest[..semi];
+                    if let Some(decoded) = decode_html_entity(entity) {
+                        if !push_char(&mut out, &mut count, &mut pending_space, decoded) {
+                            return out;
+                        }
+                        i = i + 1 + semi + 1;
+                        continue;
+                    }
+                }
+                if !push_char(&mut out, &mut count, &mut pending_space, '&') {
                     return out;
                 }
-                out.push(ch);
-                count += 1;
+                i += 1;
+            }
+            _ => {
+                if skip_until.is_some() {
+                    // Fast-forward to next '<' while skipping non-content subtrees.
+                    if let Some(next_lt) = bytes[i..].iter().position(|&b| b == b'<') {
+                        i += next_lt;
+                    } else {
+                        break;
+                    }
+                    continue;
+                }
+                let ch = html[i..].chars().next().unwrap();
+                if !push_char(&mut out, &mut count, &mut pending_space, ch) {
+                    return out;
+                }
+                i += ch.len_utf8();
             }
         }
     }
@@ -245,14 +573,34 @@ pub fn body_info(raw: &[u8]) -> BodyInfo {
     let Some(m) = MessageParser::default().parse(raw) else {
         return BodyInfo { snippet: String::new(), search_text: String::new(), has_attachments: false };
     };
-    let text = m.body_text(0);
-    let search_text = text.as_deref().map(|t| clean_text_capped(t, 20_000)).unwrap_or_default();
-    let snippet = search_text.chars().take(220).collect();
     let html = html_body_ref(&m);
+    let plain = plain_body_ref(&m);
+    let search_text = match (plain, html) {
+        (Some(p), _) if !looks_like_html(p) => {
+            let cleaned = clean_text_capped(p, 20_000);
+            if cleaned.is_empty() {
+                html.map(|h| html_to_clean_text_capped(h, 20_000)).unwrap_or_default()
+            } else {
+                cleaned
+            }
+        }
+        (_, Some(h)) => html_to_clean_text_capped(h, 20_000),
+        (Some(p), None) => html_to_clean_text_capped(p, 20_000),
+        (None, None) => m.body_text(0).as_deref().map(|t| clean_text_capped(t, 20_000)).unwrap_or_default(),
+    };
+    let snippet = search_text.chars().take(220).collect();
     BodyInfo {
         snippet,
         search_text,
         has_attachments: !listed_attachments(&m, html).is_empty(),
+    }
+}
+
+fn plain_body_ref<'a>(m: &'a Message<'a>) -> Option<&'a str> {
+    let part = m.text_part(0)?;
+    match &part.body {
+        PartType::Text(t) => Some(t.as_ref()),
+        _ => None,
     }
 }
 
@@ -491,5 +839,57 @@ mod tests {
         assert_eq!(parts[1], (1, "image/png".to_string(), vec![4, 5, 6]));
         assert_eq!(inline_cid_image(raw, 0), Some(("image/png".to_string(), vec![1, 2, 3])));
         assert_eq!(inline_cid_image(raw, 2), None); // SVG refused
+    }
+
+    #[test]
+    fn snippet_strips_html_in_text_plain_and_preserves_block_spacing() {
+        // Broken sender puts full HTML document inside text/plain.
+        let html_in_plain = concat!(
+            "From: Redhub <redhub@mail.redcomm.co.id>\r\n",
+            "Subject: Reminder\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n\r\n",
+            "<!DOCTYPE html><html lang=\"en\" xmlns=\"http://www.w3.org/1999/xhtml\">",
+            "<head><title>Reminder</title><style>.btn { color: red; }</style></head>",
+            "<body><!-- header --><div><p>Dear Semangat!,</p>",
+            "<p>Hari ini merupakan jadwal pembayaran terakhir &amp; upload dokumen.</p>",
+            "</div></body></html>",
+        )
+        .as_bytes();
+        let info = body_info(html_in_plain);
+        assert_eq!(
+            info.snippet,
+            "Dear Semangat!, Hari ini merupakan jadwal pembayaran terakhir & upload dokumen."
+        );
+        assert!(!info.search_text.contains("DOCTYPE"));
+        assert!(!info.search_text.contains("color: red"));
+
+        // HTML-only email preserves spaces across block elements & strips invisible preheader padding.
+        let html_only = concat!(
+            "From: Anthropic <no-reply@anthropic.com>\r\n",
+            "Subject: Sign in\r\n",
+            "Content-Type: text/html; charset=utf-8\r\n\r\n",
+            "<html><head><style>body{margin:0}</style></head><body>",
+            "<h1>Sign in to Claude</h1>",
+            "<p>Click the button below to continue&zwnj;&nbsp;&zwnj;.</p>",
+            "</body></html>",
+        )
+        .as_bytes();
+        let info = body_info(html_only);
+        assert_eq!(info.snippet, "Sign in to Claude Click the button below to continue .");
+
+        // Genuine text/plain with intentional HTML tags, generics, and angle-bracket addresses stays untouched.
+        let code_plain = concat!(
+            "From: Dev <dev@example.com>\r\n",
+            "Subject: Code review\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n\r\n",
+            "Can you change <div class=\"card\"> to <section> and return Vec<String>?\r\n",
+            "cc: Alice <alice@example.com>\r\n",
+        )
+        .as_bytes();
+        let info = body_info(code_plain);
+        assert_eq!(
+            info.snippet,
+            "Can you change <div class=\"card\"> to <section> and return Vec<String>? cc: Alice <alice@example.com>"
+        );
     }
 }

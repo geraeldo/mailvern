@@ -788,7 +788,62 @@ impl Db {
         read.execute_batch(READ_PRAGMAS)?;
         let db = Db { conn: Mutex::new(conn), read: Mutex::new(read) };
         db.assign_threads()?;
+        db.repair_html_snippets()?;
         Ok(db)
+    }
+
+    /// One-time repair for cached messages whose stored snippet contains raw HTML tags
+    /// (e.g., from senders that placed HTML inside a `text/plain` part).
+    fn repair_html_snippets(&self) -> Result<()> {
+        const KEY: &str = "snippets_html_repaired_v1";
+        let already_done: bool = self
+            .r()
+            .query_row("SELECT EXISTS(SELECT 1 FROM settings WHERE key = ?)", [KEY], |r| r.get(0))?;
+        if already_done {
+            return Ok(());
+        }
+        let candidates: Vec<(i64, String, Vec<u8>)> = {
+            let r = self.r();
+            let mut st = r.prepare(
+                "SELECT m.id, m.snippet, CASE WHEN b.blob_id IS NOT NULL THEN rb.raw ELSE b.raw END
+                 FROM messages m
+                 JOIN bodies b ON b.message_id = m.id
+                 LEFT JOIN raw_blobs rb ON rb.id = b.blob_id
+                 WHERE m.has_body = 1 AND m.snippet LIKE '%<%'",
+            )?;
+            let rows = st
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            rows
+        };
+        let updates: Vec<(i64, String, String)> = candidates
+            .into_iter()
+            .filter_map(|(id, old_snippet, stored_raw)| {
+                let raw = decompress_raw(&stored_raw);
+                let info = crate::parse::body_info(&raw);
+                if info.snippet != old_snippet {
+                    Some((id, info.snippet, info.search_text))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        if !updates.is_empty() {
+            let mut upd_msg = tx.prepare_cached("UPDATE messages SET snippet = ? WHERE id = ?")?;
+            let mut upd_fts = tx.prepare_cached("UPDATE messages_fts SET body = ? WHERE rowid = ?")?;
+            for (id, snippet, search_text) in updates {
+                upd_msg.execute(params![snippet, id])?;
+                upd_fts.execute(params![search_text, id])?;
+            }
+        }
+        tx.execute(
+            "INSERT INTO settings (key, value) VALUES (?, '1') ON CONFLICT(key) DO UPDATE SET value = '1'",
+            [KEY],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Reclaims freed pages (when incremental auto_vacuum is active), updates SQLite planner
@@ -3813,5 +3868,69 @@ mod tests {
 
         db.delete_folder_local(sub).unwrap();
         assert!(db.folder(sub).is_err());
+    }
+
+    #[test]
+    fn repair_html_snippets_fixes_cached_html_and_preserves_plain_code() {
+        let path = temp_db();
+        let html_raw = concat!(
+            "From: Redhub <redhub@example.com>\r\n",
+            "Subject: Reminder\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n\r\n",
+            "<!DOCTYPE html><html><head><style>p{color:red}</style></head>",
+            "<body><p>Dear Semangat!,</p><p>Upload dokumen hari ini.</p></body></html>",
+        )
+        .as_bytes();
+        let code_raw = concat!(
+            "From: Dev <dev@example.com>\r\n",
+            "Subject: Review\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n\r\n",
+            "Use Vec<String> instead of <div>.\r\n",
+        )
+        .as_bytes();
+
+        let (inbox, id_html, id_code) = {
+            let db = Db::open(&path).unwrap();
+            let acc = db.save_account(&account()).unwrap();
+            let inbox = db.upsert_folder(acc, "INBOX", "Inbox", Some("inbox")).unwrap();
+            let ids = db.insert_messages(acc, inbox, &[msg(1, false), msg(2, false)]).unwrap();
+            // Simulate legacy stored snippets before the fix (raw HTML in snippet + FTS).
+            db.store_body(
+                inbox,
+                1,
+                html_raw,
+                &BodyInfo {
+                    snippet: "<!DOCTYPE html><html><head><style>p{color:red}</style></head>".into(),
+                    search_text: "<!DOCTYPE html><html>".into(),
+                    has_attachments: false,
+                },
+            )
+            .unwrap();
+            db.store_body(
+                inbox,
+                2,
+                code_raw,
+                &BodyInfo {
+                    snippet: "Use Vec<String> instead of <div>.".into(),
+                    search_text: "Use Vec<String> instead of <div>.".into(),
+                    has_attachments: false,
+                },
+            )
+            .unwrap();
+            // Clear the one-time repair marker to simulate upgrading from an older version.
+            db.delete_setting("snippets_html_repaired_v1").unwrap();
+            (inbox, ids[0], ids[1])
+        };
+
+        // Reopening runs the one-time repair pass.
+        let db = Db::open(&path).unwrap();
+        let list = db.list(&View::Folder { folder_id: inbox }, None, 0, 10).unwrap();
+        let by_id = |id| list.iter().find(|m| m.id == id).unwrap().snippet.clone();
+        assert_eq!(by_id(id_html), "Dear Semangat!, Upload dokumen hari ini.");
+        assert_eq!(by_id(id_code), "Use Vec<String> instead of <div>.");
+        // FTS body was updated too.
+        let fts_hits = db.search("Semangat", &SearchScope::Folder { folder_id: inbox }, 10).unwrap();
+        assert_eq!(fts_hits.len(), 1);
+        assert_eq!(fts_hits[0].id, id_html);
     }
 }
