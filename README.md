@@ -1,6 +1,13 @@
-# Mailvern
+<p align="center">
+  <img src="src-tauri/icons/icon.png" width="128" height="128" alt="Mailvern icon">
+</p>
 
-A fast IMAP mail client for macOS.
+<h1 align="center">Mailvern</h1>
+
+<p align="center">
+  A fast IMAP mail client for macOS.<br>
+  <a href="https://github.com/geraeldo/mailvern/releases/latest"><b>Download for macOS</b></a>
+</p>
 
 - **Local first.** Your mail is cached on your Mac, so lists and search never wait on the network.
 - **AI search.** Ask a question about your mail and get an answer with sources, using your own API key from OpenRouter, Anthropic, OpenAI, Google Gemini and many more.

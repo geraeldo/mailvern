@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+  <defs>
+    <linearGradient id="page" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F5F8FF"/>
+      <stop offset="1" stop-color="#DDE7FF"/>
+    </linearGradient>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#EEF3FF"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="640" fill="url(#page)"/>
+  <g transform="translate(110 150) scale(0.33)">
+    <rect x="100" y="100" width="824" height="824" rx="190" fill="url(#bg)" stroke="#C9D7FF" stroke-width="6"/>
+    <g transform="translate(0 50)" stroke-linejoin="round">
+      <path d="M512 470 L740 260 L640 545 Z" fill="#9DB9FF"/>
+      <path d="M830 380 L704 600 L650 560 Z" fill="#1D4FD8"/>
+      <path d="M320 600 L512 470 L704 600 Z" fill="#2459E0"/>
+      <path d="M320 600 L512 700 L704 600 Z" fill="#183FB0"/>
+      <path d="M470 500 L620 210 L612 575 Z" fill="#5D87FF"/>
+      <path d="M470 500 L620 210 L560 545 Z" fill="#7D9EFF"/>
+      <path d="M320 600 L250 350 L385 565 Z" fill="#1D4FD8"/>
+      <path d="M250 350 L190 405 L272 392 Z" fill="#1D4FD8"/>
+    </g>
+  </g>
+  <g font-family="SF Pro Display, Helvetica Neue, Helvetica, Arial, sans-serif">
+    <text x="510" y="320" font-size="112" font-weight="700" fill="#0F2A78" letter-spacing="-2">Mailvern</text>
+    <text x="514" y="390" font-size="38" fill="#3A4F8F">A fast IMAP mail client for macOS</text>
+  </g>
+</svg>
